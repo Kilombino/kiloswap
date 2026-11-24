@@ -115,9 +115,15 @@ en él.
    - **Cloudflare:** en el túnel, una regla de entrada
      `swap.kilombino.com → http://127.0.0.1:3260` y el CNAME del
      subdominio.
-   - **Tor:** en el Tor del sistema (no en el de Ammanaya), un servicio
-     onion → `127.0.0.1:3261`. Su dirección va a `VITE_TOR_URL` en la
-     siguiente compilación de la web.
+   - **Tor:** en el Tor del sistema (`/etc/tor/torrc`, junto a los de
+     MercaSats o MiniBolt; no en el de Ammanaya), añadir:
+     ```
+     HiddenServiceDir /var/lib/tor/kiloswap-onion/
+     HiddenServicePort 80 127.0.0.1:3261
+     ```
+     Después, `systemctl reload tor` (recarga, no reinicio). La dirección
+     va a `VITE_TOR_URL` en la siguiente compilación de la web y a `ONION`
+     en `kiloswap.js` del bridge.
    - **bridge.kilombino.com:** pestaña "Kiloswap", en la rama local
      `kiloswap-tab` de kilobridge. Es una tarjeta con comisiones, límites y
      un botón que abre swap.kilombino.com (en el .onion del bridge, el
