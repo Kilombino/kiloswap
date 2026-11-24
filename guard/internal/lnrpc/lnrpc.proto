@@ -1,0 +1,174 @@
+// The parts of lnd's RPC the Kiloswap guard reads, copied field for field
+// from lnd's lnrpc/lightning.proto, lnrpc/invoicesrpc/invoices.proto and
+// lnrpc/routerrpc/router.proto (Lightning Fork 0.21.8). Every field of the
+// requests it judges is declared, so a request carrying a field it does not
+// know shows up as unknown and is refused. Embedded messages it only needs
+// to see set are declared as bytes: an embedded message has the same wire
+// form. The middleware messages follow the donations guard of
+// paulscode/lightning-fork-swap. Generate with:
+//
+//   protoc --go_out=. --go_opt=paths=source_relative lnrpc.proto
+syntax = "proto3";
+
+package lnrpc;
+
+option go_package = "github.com/Kilombino/kiloswap/guard/internal/lnrpc";
+
+service Lightning {
+    rpc RegisterRPCMiddleware (stream RPCMiddlewareResponse)
+        returns (stream RPCMiddlewareRequest);
+    rpc WalletBalance (WalletBalanceRequest) returns (WalletBalanceResponse);
+    rpc LookupInvoice (PaymentHash) returns (Invoice);
+}
+
+message RPCMiddlewareRequest {
+    uint64 request_id = 1;
+    bytes raw_macaroon = 2;
+    string custom_caveat_condition = 3;
+    oneof intercept_type {
+        StreamAuth stream_auth = 4;
+        RPCMessage request = 5;
+        RPCMessage response = 6;
+        bool reg_complete = 8;
+    }
+    uint64 msg_id = 7;
+    map<string, MetadataValues> metadata_pairs = 9;
+}
+
+message MetadataValues {
+    repeated string values = 1;
+}
+
+message StreamAuth {
+    string method_full_uri = 1;
+}
+
+message RPCMessage {
+    string method_full_uri = 1;
+    bool stream_rpc = 2;
+    string type_name = 3;
+    bytes serialized = 4;
+    bool is_error = 5;
+}
+
+message RPCMiddlewareResponse {
+    uint64 ref_msg_id = 1;
+    oneof middleware_message {
+        MiddlewareRegistration register = 2;
+        InterceptFeedback feedback = 3;
+    }
+}
+
+message MiddlewareRegistration {
+    string middleware_name = 1;
+    string custom_macaroon_caveat_name = 2;
+    bool read_only_mode = 3;
+}
+
+message InterceptFeedback {
+    string error = 1;
+    bool replace_response = 2;
+    bytes replacement_serialized = 3;
+}
+
+// lnrpc
+message SendCoinsRequest {
+    string addr = 1;
+    int64 amount = 2;
+    int32 target_conf = 3;
+    uint64 sat_per_vbyte = 4;
+    int64 sat_per_byte = 5;
+    bool send_all = 6;
+    string label = 7;
+    int32 min_confs = 8;
+    bool spend_unconfirmed = 9;
+    int32 coin_selection_strategy = 10;
+    repeated bytes outpoints = 11;
+}
+
+message WalletBalanceRequest {
+    string account = 1;
+    int32 min_confs = 2;
+}
+
+message WalletBalanceResponse {
+    int64 total_balance = 1;
+    int64 confirmed_balance = 2;
+    int64 unconfirmed_balance = 3;
+    repeated bytes account_balance = 4;
+    int64 locked_balance = 5;
+    int64 reserved_balance_anchor_chan = 6;
+    int64 immature_coinbase_balance = 1001;
+}
+
+message PaymentHash {
+    string r_hash_str = 1;
+    bytes r_hash = 2;
+}
+
+// Only what the guard reads of an invoice; the rest is skipped.
+message Invoice {
+    bytes r_hash = 4;
+    int64 value = 5;
+    int64 value_msat = 23;
+    int64 amt_paid_sat = 19;
+    int64 amt_paid_msat = 20;
+    // OPEN = 0, SETTLED = 1, CANCELED = 2, ACCEPTED = 3
+    int32 state = 21;
+}
+
+// A payment update of SendPaymentV2; only its status is read
+// (IN_FLIGHT 1, SUCCEEDED 2, FAILED 3, INITIATED 4).
+message Payment {
+    int32 status = 10;
+}
+
+// invoicesrpc
+message AddHoldInvoiceRequest {
+    string memo = 1;
+    bytes hash = 2;
+    int64 value = 3;
+    bytes description_hash = 4;
+    int64 expiry = 5;
+    string fallback_addr = 6;
+    uint64 cltv_expiry = 7;
+    repeated bytes route_hints = 8;
+    bool private = 9;
+    int64 value_msat = 10;
+}
+
+message CancelInvoiceMsg {
+    bytes payment_hash = 1;
+}
+
+message SettleInvoiceMsg {
+    bytes preimage = 1;
+}
+
+// routerrpc
+message SendPaymentRequest {
+    bytes dest = 1;
+    int64 amt = 2;
+    bytes payment_hash = 3;
+    int32 final_cltv_delta = 4;
+    string payment_request = 5;
+    int32 timeout_seconds = 6;
+    int64 fee_limit_sat = 7;
+    int32 cltv_limit = 9;
+    repeated bytes route_hints = 10;
+    map<uint64, bytes> dest_custom_records = 11;
+    int64 amt_msat = 12;
+    int64 fee_limit_msat = 13;
+    bytes last_hop_pubkey = 14;
+    bool allow_self_payment = 15;
+    repeated int32 dest_features = 16;
+    uint32 max_parts = 17;
+    bool no_inflight_updates = 18;
+    repeated uint64 outgoing_chan_ids = 19;
+    bytes payment_addr = 20;
+    uint64 max_shard_size_msat = 21;
+    bool amp = 22;
+    double time_pref = 23;
+    bool cancelable = 24;
+    map<uint64, bytes> first_hop_custom_records = 25;
+}

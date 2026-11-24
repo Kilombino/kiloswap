@@ -1,0 +1,8 @@
+[Unit]
+Description=Kiloswap: daily encrypted backup
+[Timer]
+OnCalendar=*-*-* 04:20:00
+RandomizedDelaySec=10m
+Persistent=true
+[Install]
+WantedBy=timers.target

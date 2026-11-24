@@ -1,0 +1,98 @@
+# Kiloswap backend (boltz-backend, Lightning Fork fork). setup.sh writes
+# ${KILOSWAP_ROOT}/boltz/boltz.conf from this template; secrets come from
+# ${KILOSWAP_ROOT}/secrets and never enter the repository.
+network = "mainnet"
+loglevel = "info"
+datadir = "/boltz"
+mnemonicpath = "/boltz/seed.dat"
+mnemonicpathEvm = "/boltz/seed.dat"
+
+[api]
+host = "0.0.0.0"
+port = 9001
+
+[grpc]
+host = "127.0.0.1"
+port = 9000
+
+[postgres]
+host = "postgres"
+port = 5432
+database = "boltz"
+username = "boltz"
+password = "@POSTGRES_PASSWORD@"
+
+[sidecar]
+dataDir = "/boltz/sidecar"
+
+  [sidecar.grpc]
+  host = "127.0.0.1"
+  port = 9003
+
+  [sidecar.ws]
+  host = "0.0.0.0"
+  port = 9004
+
+  [sidecar.api]
+  host = "0.0.0.0"
+  port = 9005
+
+[swap]
+# Claim each submarine swap on its own (one unclaimable lockup must not
+# hold up the others' claims)
+deferredClaimSymbols = []
+# Blocks between a submarine swap's Lightning payment timing out and its
+# on-chain refund (lnd's sweeper.nodeadlineconftarget = 144 matches)
+cltvDelta = 144
+
+[routing]
+# The most we pay to route a submarine swap's payment: 0.01 % (the guard
+# enforces the same, with the backend's 121 sat floor)
+default = 0.0001
+
+[[pairs]]
+base = "BTC"
+quote = "BTC"
+rate = 1
+swapTypes = ["submarine", "reverse"]
+# Lightning → on-chain (reverse): 0.15 %
+fee = 0.15
+# On-chain → Lightning (submarine): 0.01 %
+swapInFee = 0.01
+minSwapAmount = 10000
+maxSwapAmount = 100000000
+
+  [pairs.timeoutDelta]
+  # in minutes; chain swaps are off (swapTypes), the sidecar wants the key
+  chain = 1440
+  reverse = 1440
+  swapMinimal = 1440
+  swapMaximal = 2880
+  swapTaproot = 4320
+
+[[currencies]]
+symbol = "BTC"
+network = "bitcoinMainnet"
+# The swap's on-chain funds are the operator's lnd wallet (guarded)
+preferredWallet = "lnd"
+minWalletBalance = 0
+minSwapAmount = 10000
+maxSwapAmount = 100000000
+maxZeroConfAmount = 0
+# A lockup is paid against only once this deep
+requiredConfirmations = 3
+
+  [currencies.chain]
+  host = "shim"
+  port = 8332
+  user = "kiloswap"
+  password = "@NODE_RPC_PASSWORD@"
+  # an empty wallet on the node for the backend's rare wallet paths
+  wallet = "kiloswap-empty"
+  feeFloor = 1
+
+  [[currencies.lnds]]
+  host = "@LND_HOST@"
+  port = 10009
+  certpath = "/lnd/tls.cert"
+  macaroonpath = "/lnd/kiloswap.macaroon"

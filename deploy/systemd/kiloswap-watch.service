@@ -1,0 +1,13 @@
+# User service (systemctl --user): swap messages and alerts on Telegram,
+# the guard's refusals on ALERT_PORT, a backup after swaps change.
+[Unit]
+Description=Kiloswap watch (Telegram)
+After=default.target
+[Service]
+Environment=STATE_FILE=%h/.config/kiloswap-watch/state.json
+EnvironmentFile=%h/.config/kiloswap-watch/watch.env
+ExecStart=/usr/bin/node /opt/kiloswap/watch/kiloswap-watch.mjs
+Restart=always
+RestartSec=10
+[Install]
+WantedBy=default.target

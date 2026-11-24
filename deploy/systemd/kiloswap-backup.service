@@ -1,0 +1,7 @@
+[Unit]
+Description=Kiloswap: encrypted backup to the router's disk
+After=docker.service
+[Service]
+Type=oneshot
+Environment=COMPOSE_DIR=/opt/kiloswap/deploy
+ExecStart=/opt/kiloswap/deploy/backup/kiloswap-backup.sh full

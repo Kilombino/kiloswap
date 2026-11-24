@@ -1,0 +1,129 @@
+# Kiloswap on the operator's host, next to the node and lnd it uses:
+#   - the BLAKE2b node (Knots) runs on the host; the backend reaches its
+#     RPC and ZMQ through the host's address with a whitelisted RPC user;
+#   - lnd is the operator's own (container "lnd-blake2b" on the external
+#     network lnd-net); the backend talks to it only with a macaroon that
+#     carries the "kiloswap" caveat, so lnd hands every call to the guard
+#     and refuses them all while the guard is down;
+#   - nothing is published but the web front on 127.0.0.1 (a tunnel and an
+#     onion service in front of it).
+#
+# Paths and secrets come from .env (see .env.example and setup.sh). Data
+# lives under KILOSWAP_ROOT.
+name: kiloswap
+
+x-logging: &logging
+  driver: json-file
+  options: {max-size: 20m, max-file: "5"}
+
+networks:
+  default:
+    ipam:
+      config: [{subnet: "${KILOSWAP_SUBNET:-172.30.91.0/24}"}]
+  lnd:
+    name: ${LND_NETWORK:-lnd-net}
+    external: true
+  explorer:
+    name: ${EXPLORER_NETWORK:-mempool-deploy_default}
+    external: true
+
+services:
+  postgres:
+    image: postgres:18-alpine@sha256:77f585114c32fbca283dc835b0596f4e52b51b4c6662d7810b2f4084f60a1873
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: boltz
+      POSTGRES_USER: boltz
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=40"]
+    volumes:
+      - ${KILOSWAP_ROOT:?}/postgres:/var/lib/postgresql
+      - ${KILOSWAP_ROOT:?}/secrets/postgres_password:/run/secrets/postgres_password:ro
+    logging: *logging
+    mem_limit: 256m
+
+  # Paul's txindex shim between the backend and the node: the node keeps a
+  # txindex, the shim also forwards ZMQ, as the backend expects it
+  shim:
+    image: kiloswap/txindex-shim:${SHIM_TAG:-dev}
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    environment:
+      SHIM_UPSTREAM: http://${NODE_HOST:?}:${NODE_RPC_PORT:-8332}/
+      SHIM_RPCUSER: kiloswap
+      SHIM_RPCPASSWORD: ${NODE_RPC_PASSWORD:?run setup.sh}
+      SHIM_DB: /data/txindex.db
+      SHIM_WINDOW: "8640"
+      SHIM_FORWARD: 28332=${NODE_HOST}:28332,28333=${NODE_HOST}:28333
+    volumes:
+      - ${KILOSWAP_ROOT:?}/shim:/data
+    logging: *logging
+    mem_limit: 128m
+
+  guard:
+    image: kiloswap/guard:${GUARD_TAG:-dev}
+    build: ../guard
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    depends_on: [postgres]
+    networks: [default, lnd]
+    environment:
+      LND_GRPC: ${LND_HOST:-lnd-blake2b}:10009
+      LND_TLSCERT: /lnd/tls.cert
+      LND_MACAROON: /lnd/kiloswap-guard.macaroon
+      DATABASE_URL_FILE: /run/secrets/guard_db_url
+      CHAIN_RPC_URL: http://${NODE_HOST}:${NODE_RPC_PORT:-8332}/
+      CHAIN_RPC_USER: kiloswap
+      CHAIN_RPC_PASSWORD_FILE: /run/secrets/node_rpc_password
+      LSP_STATE: /lsp/state.json
+      LEDGER: /state/ledger.json
+      ALERT_URL: ${ALERT_URL:-}
+      MAX_PER_OP_SAT: ${MAX_PER_OP_SAT:-100000000}
+      DAILY_SAT: ${DAILY_SAT:-200000000}
+      RESERVE_SAT: ${RESERVE_SAT:-50000000}
+      MAX_PENDING_REVERSE: ${MAX_PENDING_REVERSE:-5}
+      FEE_RATIO: ${FEE_RATIO:-0.0001}
+      REQUIRED_CONFS: ${REQUIRED_CONFS:-3}
+    volumes:
+      - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
+      - ${KILOSWAP_ROOT:?}/macaroons/kiloswap-guard.macaroon:/lnd/kiloswap-guard.macaroon:ro
+      - ${LSP_STATE:?}:/lsp/state.json:ro
+      - ${KILOSWAP_ROOT:?}/guard:/state
+      - ${KILOSWAP_ROOT:?}/secrets/guard_db_url:/run/secrets/guard_db_url:ro
+      - ${KILOSWAP_ROOT:?}/secrets/node_rpc_password:/run/secrets/node_rpc_password:ro
+    logging: *logging
+    mem_limit: 64m
+
+  boltz:
+    image: kiloswap/backend:${BACKEND_TAG:-dev}
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    stop_grace_period: 1m
+    depends_on: [postgres, shim, guard]
+    networks: [default, lnd]
+    environment:
+      NODE_OPTIONS: --max-old-space-size=384
+    command: ["--configpath", "/boltz/boltz.conf", "--datadir", "/boltz"]
+    volumes:
+      - ${KILOSWAP_ROOT:?}/boltz:/boltz
+      - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
+      - ${KILOSWAP_ROOT:?}/macaroons/kiloswap.macaroon:/lnd/kiloswap.macaroon:ro
+    logging: *logging
+    mem_limit: 1024m
+
+  web:
+    image: nginx:1.31.9-alpine
+    security_opt: [no-new-privileges:true]
+    restart: unless-stopped
+    depends_on: [boltz]
+    networks: [default, explorer]
+    ports:
+      - "127.0.0.1:${WEB_PORT:-3260}:8080"   # Cloudflare tunnel
+      - "127.0.0.1:${ONION_PORT:-3261}:8081" # onion service
+    volumes:
+      - ./nginx/kiloswap.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${KILOSWAP_ROOT:?}/webapp:/srv/webapp:ro
+    logging: *logging
+    mem_limit: 64m
