@@ -53,6 +53,8 @@ allowed() {
 }
 restore() {
 	docker rm -f $GUARD >/dev/null 2>&1 || true
+	[ -f "$work/override.yml" ] && docker compose -f docker-compose.yml -f "$work/override.yml" rm -sf lnd-proxy >/dev/null 2>&1 || true
+	sudo -n rm -f "$LAB/data/lnd-swap/kiloswap-proxy.crt"
 	if [ -f "$work/seed.orig" ]; then
 		sudo -n cp "$work/seed.orig" "$LAB/data/boltz/seed.dat"
 	fi
@@ -67,6 +69,7 @@ trap '[ -n "${KEEP:-}" ] || restore' EXIT
 log "guard binary"
 ( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/kiloswap-guard" ./cmd/kiloswap-guard )
 ( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/bigreq" ./test/bigreq )
+( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/slowloris" ./test/slowloris )
 ok "built"
 
 log "macaroons"
@@ -129,7 +132,7 @@ ok "the backend's seed.dat is now an unrelated mnemonic (the old one only in the
 
 start_guard() {
 	docker rm -f $GUARD >/dev/null 2>&1 || true
-	docker run -d --name $GUARD --network "$NET" \
+	docker run -d --name $GUARD --network "$NET" --memory 160m --memory-swap 160m -e GOMEMLIMIT=100MiB \
 		-v "$work/kiloswap-guard:/kiloswap-guard:ro" -v "$work/seed:/seed:ro" \
 		-v "$LAB/data/lnd-swap/tls.cert:/lnd/tls.cert:ro" \
 		-v "$LAB/data/lnd-swap/kiloswap-guard.macaroon:/lnd/kiloswap-guard.macaroon:ro" \
@@ -157,12 +160,29 @@ allowed "GetInfo through the guard" KS getinfo
 
 log "backend on the guarded macaroon and the xpub: the e2e scenarios"
 cp boltz.conf "$work/boltz.conf.orig"
+# lnd-proxy as in production: nginx's gRPC proxy capping requests at 256 KiB
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 \
+	-subj /CN=lnd-proxy -addext subjectAltName=DNS:lnd-proxy \
+	-keyout "$work/proxy.key" -out "$work/proxy.crt" 2>/dev/null
+chmod 644 "$work/proxy.key"
+sudo -n cp "$work/proxy.crt" "$LAB/data/lnd-swap/kiloswap-proxy.crt"
+sed 's/LND_HOST/lnd-swap/g' "$here/../deploy/lnd-proxy/nginx.conf" >"$work/lnd-proxy.conf"
+sed -i 's#^  host = "lnd-swap"#  host = "lnd-proxy"#; s#certpath = "/lnd/tls.cert"#certpath = "/lnd/kiloswap-proxy.crt"#' boltz.conf
 sed -i 's#macaroonpath = "/lnd/boltz.macaroon"#macaroonpath = "/lnd/kiloswap.macaroon"#' boltz.conf
 # hold invoices within the hour, as the guard asks (deploy/boltz.conf.template)
 grep -q '^invoiceExpiry' boltz.conf || sed -i '0,/^swapTypes = .*/s//&\ninvoiceExpiry = 3600/' boltz.conf
 grep -q kiloswap.macaroon boltz.conf || { bad "boltz.conf not switched"; exit 1; }
 cat >"$work/override.yml" <<YML
 services:
+  lnd-proxy:
+    image: nginx:1.27-alpine
+    command: ["nginx", "-c", "/etc/lnd-proxy.conf", "-g", "daemon off;"]
+    tmpfs: [/tmp]
+    volumes:
+      - $work/lnd-proxy.conf:/etc/lnd-proxy.conf:ro
+      - $work/proxy.crt:/certs/proxy.crt:ro
+      - $work/proxy.key:/certs/proxy.key:ro
+      - $LAB/data/lnd-swap/tls.cert:/lnd/tls.cert:ro
   boltz:
     image: kiloswap-lab/boltz:guard
     environment:
@@ -170,7 +190,7 @@ services:
       KILOSWAP_GUARD_URL: http://$GUARD:8091
       KILOSWAP_GUARD_TOKEN: labtoken
 YML
-docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null
+docker compose -f docker-compose.yml -f "$work/override.yml" up -d lnd-proxy boltz >/dev/null
 for _ in $(seq 1 60); do r=$(curl -s http://127.0.0.1:29001/v2/swap/submarine || true); [ -n "$r" ] && [ "$r" != "{}" ] && break; sleep 3; done
 [ "$r" != "{}" ] || { docker compose logs --tail 30 boltz >&2; bad "backend not up on the guarded macaroon"; exit 1; }
 ok "backend up on kiloswap.macaroon"
@@ -347,6 +367,34 @@ grep -q "request of" <<<"$out" && ok "a 5 MB DecodePayReq refused by size: ${out
 sleep 2
 [ "$(docker logs $GUARD 2>&1 | grep -c "stream ended" || true)" = "$ends" ] && ok "the guard's stream did not end" || bad "the stream ended after the huge request"
 allowed "GetInfo right after" KS getinfo
+
+log "the fifth review: huge requests through lnd-proxy, memory, slow clients"
+restarts() { docker inspect -f '{{.RestartCount}} {{.State.OOMKilled}} {{.State.Running}}' $GUARD; }
+before=$(restarts)
+proxy=$(docker compose -f docker-compose.yml -f "$work/override.yml" ps -q lnd-proxy)
+pnet=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$proxy" | awk '{print $1}')
+out=$(docker run --rm --network "$pnet" -v "$work/bigreq:/bigreq:ro" -v "$work/proxy.crt:/lnd/tls.cert:ro" \
+	-v "$LAB/data/lnd-swap/kiloswap.macaroon:/lnd/kiloswap.macaroon:ro" \
+	alpine:3.22 /bigreq lnd-proxy:10009 /lnd/tls.cert /lnd/kiloswap.macaroon 40000000 2>&1 || true)
+grep -q -i -E "413|too large|resourceexhausted|ResourceExhausted|RST_STREAM|unexpected HTTP status" <<<"$out" \
+	&& ok "a 40 MB request stops at lnd-proxy: ${out:0:140}" || bad "40 MB through the proxy: $out"
+out=$(docker run --rm --network "$NET" -v "$work/bigreq:/bigreq:ro" \
+	-v "$LAB/data/lnd-swap/tls.cert:/lnd/tls.cert:ro" -v "$LAB/data/lnd-swap/kiloswap.macaroon:/lnd/kiloswap.macaroon:ro" \
+	alpine:3.22 /bigreq lnd-swap:10009 /lnd/tls.cert /lnd/kiloswap.macaroon 40000000 2>&1 || true)
+sleep 5
+after=$(restarts)
+[ "$after" = "$before" ] && [[ $after == *" false true" ]] && ok "40 MB straight to lnd (no proxy): the guard in 160 MB was not killed ($after)" || bad "guard restarted or OOM: $before -> $after"
+for _ in $(seq 1 30); do docker logs $GUARD 2>&1 | tail -5 | grep -q registered && break; sleep 1; done
+allowed "GetInfo after the huge requests" KS getinfo
+gip=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' $GUARD)
+docker run --rm --network "$NET" -v "$work/slowloris:/slowloris:ro" alpine:3.22 sh -c "ulimit -n 10000; /slowloris $gip:8091 4500 15" >"$work/slow.out" 2>&1 &
+sleep 8
+mid=$(restarts)
+wait
+sleep 4
+code=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null -w '%{http_code}' -X POST "http://$gip:8091/v1/health" 2>/dev/null || true)
+[ "$(restarts)" = "$before" ] && [ "$mid" = "$before" ] && ok "4500 slow connections ($(cat "$work/slow.out")): the guard stayed up" || bad "the guard went down under slow connections: $(restarts)"
+[ "$code" = 204 ] && ok "the API answers again after them" || bad "API after slowloris: $code"
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
