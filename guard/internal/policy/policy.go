@@ -180,6 +180,9 @@ type Chain interface {
 	FeeRate(ctx context.Context) (float64, error) // sat/vB
 	Broadcast(ctx context.Context, rawHex string) (string, error)
 	Confirmations(ctx context.Context, txid string) (int64, error)
+	// FindOutput finds a transaction paying sat to pkScript in the mempool
+	// or in the blocks from fromHeight on; "" if none.
+	FindOutput(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) (string, uint32, error)
 }
 
 // Keys are the swaps' server keys, held by the guard alone.

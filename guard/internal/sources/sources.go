@@ -388,8 +388,8 @@ func (c Chain) Spender(ctx context.Context, txid string, vout uint32, fromHeight
 	if err != nil {
 		return nil, err
 	}
-	if fromHeight < 1 || tip-fromHeight > 5000 {
-		fromHeight = tip - 5000
+	if fromHeight < 1 || tip-fromHeight > maxScan {
+		fromHeight = tip - maxScan
 	}
 	for h := tip; h >= fromHeight; h-- {
 		var hash string
@@ -411,6 +411,65 @@ func (c Chain) Spender(ctx context.Context, txid string, vout uint32, fromHeight
 	return nil, nil
 }
 
+// maxScan bounds how many blocks one search reads.
+const maxScan = 1500
+
+// FindOutput finds a transaction paying sat to pkScript, in the mempool or
+// in the blocks from fromHeight on (at most maxScan of them): a lockup lnd
+// sent although its answer never reached the guard.
+func (c Chain) FindOutput(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) (string, uint32, error) {
+	want := hex.EncodeToString(pkScript)
+	match := func(t rawTx) (uint32, bool) {
+		for _, o := range t.Vout {
+			v, err := sats(o.Value)
+			if err == nil && v == sat && strings.EqualFold(o.ScriptPubKey.Hex, want) {
+				return o.N, true
+			}
+		}
+		return 0, false
+	}
+	var mp []string
+	if err := c.rpc(ctx, "getrawmempool", []any{}, &mp); err == nil {
+		if len(mp) > 5000 {
+			mp = mp[:5000]
+		}
+		for _, id := range mp {
+			var t rawTx
+			if err := c.rpc(ctx, "getrawtransaction", []any{id, 1}, &t); err != nil {
+				continue
+			}
+			if n, ok := match(t); ok {
+				return t.Txid, n, nil
+			}
+		}
+	}
+	tip, err := c.Height(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	if fromHeight < 1 || tip-fromHeight > maxScan {
+		fromHeight = tip - maxScan
+	}
+	for h := fromHeight; h <= tip; h++ {
+		var hash string
+		if err := c.rpc(ctx, "getblockhash", []any{h}, &hash); err != nil {
+			return "", 0, err
+		}
+		var b struct {
+			Tx []rawTx `json:"tx"`
+		}
+		if err := c.rpc(ctx, "getblock", []any{hash, 2}, &b); err != nil {
+			return "", 0, err
+		}
+		for _, t := range b.Tx {
+			if n, ok := match(t); ok {
+				return t.Txid, n, nil
+			}
+		}
+	}
+	return "", 0, nil
+}
+
 // LSP reads the LSP's state file. Requests waiting for payment or paid
 // hold their amount until the channel's funding transaction is out (then
 // the coins are gone from the confirmed balance anyway).
@@ -423,18 +482,34 @@ func (l LSP) Reserved() (int64, error) {
 	}
 	var st struct {
 		Orders map[string]struct {
-			Sats   int64  `json:"sats"`
-			Status string `json:"status"`
+			Sats     int64  `json:"sats"`
+			Status   string `json:"status"`
+			Expires  int64  `json:"expires"` // unix seconds
+			Unsigned bool   `json:"unsigned"`
 		} `json:"orders"`
 	}
 	if err := json.Unmarshal(b, &st); err != nil {
 		return 0, fmt.Errorf("LSP state: %w", err)
 	}
-	var s int64
+	now := time.Now().Unix()
+	var s, anon int64
 	for _, o := range st.Orders {
-		if o.Status == "waiting_payment" || o.Status == "paid" {
+		switch {
+		case o.Status == "paid":
 			s += o.Sats
+		case o.Status == "waiting_payment" && (o.Expires == 0 || now <= o.Expires):
+			// anyone can ask the public LSP for a quote: those not signed by
+			// a node count up to a cap, so quotes alone cannot stop swaps
+			if o.Unsigned {
+				anon += o.Sats
+			} else {
+				s += o.Sats
+			}
 		}
 	}
-	return s, nil
+	return s + min(anon, MaxAnonymousReserve), nil
 }
+
+// MaxAnonymousReserve caps what unsigned LSP quotes waiting for payment
+// hold back.
+const MaxAnonymousReserve = 20_000_000

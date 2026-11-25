@@ -126,11 +126,29 @@ func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
 	}
 	c.mu.Lock()
 	c.broadcast = append(c.broadcast, &tx)
+	// as a node does: the transaction is in the mempool, its input spent
+	for _, in := range tx.TxIn {
+		op := fmt.Sprintf("%s:%d", in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index)
+		c.spent[op] = true
+		c.spenders[op] = &Spend{TxID: tx.TxHash().String(), Witness: in.Witness}
+	}
 	c.mu.Unlock()
 	return tx.TxHash().String(), nil
 }
 func (c *fakeChain) Confirmations(_ context.Context, txid string) (int64, error) {
 	return c.confs[txid], nil
+}
+func (c *fakeChain) FindOutput(_ context.Context, pk []byte, sat int64, _ int64) (string, uint32, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for id, outs := range c.txs {
+		for i, o := range outs {
+			if bytes.Equal(o.PkScript, pk) && o.Sat == sat {
+				return id, uint32(i), nil
+			}
+		}
+	}
+	return "", 0, nil
 }
 
 type fakeSwaps struct {
@@ -645,6 +663,11 @@ func TestRefundAfterTimeout(t *testing.T) {
 	e.chain.spent[txid+":1"] = true
 	e.chain.spenders[txid+":1"] = &Spend{TxID: tx.TxHash().String(), Witness: tx.TxIn[0].Witness, Confirmations: 1}
 	e.p.Tick(context.Background())
+	if e.ln.invoices[hex.EncodeToString(hash)].State == InvoiceCanceled {
+		t.Fatal("cancelled at 1 confirmation: a reorg could undo the refund")
+	}
+	e.chain.spenders[txid+":1"].Confirmations = 3
+	e.p.Tick(context.Background())
 	if e.ln.invoices[hex.EncodeToString(hash)].State != InvoiceCanceled {
 		t.Fatal("the guard did not cancel the hold invoice after its refund confirmed")
 	}
@@ -733,7 +756,7 @@ func TestClaimBumped(t *testing.T) {
 	}
 	// the first one confirms after all: done, no more replacements
 	e.chain.spent[op] = true
-	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 1}
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 3}
 	e.chain.height += 10
 	e.p.Tick(ctx)
 	e.p.Tick(ctx)
@@ -796,7 +819,7 @@ func TestRefundBumped(t *testing.T) {
 		!bytes.Equal(second.TxOut[0].PkScript, first.TxOut[0].PkScript) {
 		t.Fatal("the replacement changed the lock time or address, or did not raise the fee")
 	}
-	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 1}
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 3}
 	e.p.Tick(ctx)
 	_, hash := preimage(62)
 	if e.ln.invoices[hex.EncodeToString(hash)].State != InvoiceCanceled {
@@ -817,5 +840,80 @@ func TestReplacementRate(t *testing.T) {
 	}
 	if _, ok := replacementRate(Bump{Rate: 25, Height: 100}, 200, true, 25); ok {
 		t.Fatal("bumped past the cap")
+	}
+}
+
+// lnd's answer to an allowed lockup never reaches the guard (a stalled
+// stream): the guard finds the lockup on chain by its output and amount and
+// still settles from the user's claim.
+func TestApprovedLockupFoundWithoutAnswer(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	r, pre, user := e.reverse(63, 1_000_000, 63)
+	_, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err) // no answer from lnd follows
+	txid := strings.Repeat("63", 32)
+	pk, _ := e.p.addrScript(r.LockupAddress)
+	e.chain.txs[txid] = []Output{{PkScript: []byte{0x51}, Sat: 1}, {PkScript: pk, Sat: r.OnchainAmount, Confirmations: 1}}
+	_, hash := preimage(63)
+	l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]
+	e.p.Tick(context.Background())
+	if l.State != LockApproved {
+		t.Fatal("looked for the lockup before giving lnd time to answer")
+	}
+	at = at.Add(3 * time.Minute)
+	e.p.Tick(context.Background())
+	if l.State != LockSent || l.TxID != txid || l.Vout != 1 {
+		t.Fatalf("lockup not found on chain: %+v", l)
+	}
+	server, _ := e.keys.Public(63)
+	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
+	cb, _ := out.ControlBlock(out.ClaimLeaf)
+	e.chain.spent[txid+":1"] = true
+	e.chain.spenders[txid+":1"] = &Spend{TxID: "claim", Witness: [][]byte{make([]byte, 64), pre, out.ClaimLeaf.Script, cb}}
+	e.p.Tick(context.Background())
+	if len(e.ln.settled) != 1 || !bytes.Equal(e.ln.settled[0], pre) {
+		t.Fatal("not settled from the claim of a lockup found without lnd's answer")
+	}
+}
+
+// A judgment refused for coming late leaves nothing behind.
+func TestForgetUndoesALateJudgment(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(64, 1_000_000, 64)
+	id, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	_, hash := preimage(64)
+	if e.p.Ledger.Lockups[hex.EncodeToString(hash)] == nil {
+		t.Fatal("no lockup recorded")
+	}
+	e.p.Forget(id)
+	if e.p.Ledger.Lockups[hex.EncodeToString(hash)] != nil || e.p.Ledger.since(time.Time{}) != 0 {
+		t.Fatal("a refused-late lockup stays recorded")
+	}
+	inv, s, _ := e.submarine(65, 100_000, 200_000, 65)
+	id, err = e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.p.Forget(id)
+	if e.p.Ledger.Payments[s.PreimageHash] != nil || len(e.p.Ledger.Outpoints) != 0 {
+		t.Fatal("a refused-late payment stays recorded")
+	}
+}
+
+// A payment whose stream still looks open is asked about anyway after two
+// minutes: a stalled stream must not hide a success that has to be claimed.
+func TestInflightTrackedEvenWithStreamOpen(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	inv, s, pre := e.submarine(66, 100_000, 200_000, 66)
+	_, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.ln.tracks[s.PreimageHash] = [2]string{"2", hex.EncodeToString(pre)}
+	at = at.Add(3 * time.Minute)
+	e.p.Tick(context.Background())
+	if len(e.chain.broadcast) != 1 {
+		t.Fatalf("a payment that succeeded behind an open stream was not claimed: %v %+v", e.notes, e.p.Ledger.Payments[s.PreimageHash])
 	}
 }

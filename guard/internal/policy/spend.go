@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -51,9 +52,8 @@ func (p *Policy) reconcilePayments(ctx context.Context) {
 	}
 	p.Ledger.Unlock()
 	for _, x := range check {
-		if _, live := p.livePayment(x); live {
-			continue // its stream is still open: lnd will answer there
-		}
+		// asked even while its stream looks open: a stalled stream must not
+		// hide a payment that succeeded (and must be claimed in time)
 		h, _ := hex.DecodeString(x.Hash)
 		status, pre, err := p.LN.TrackPayment(ctx, h)
 		if err != nil {
@@ -73,10 +73,6 @@ func (p *Policy) reconcilePayments(ctx context.Context) {
 		}
 		p.Ledger.Unlock()
 	}
-}
-
-func (p *Policy) livePayment(x *Payment) (pendingReq, bool) {
-	return p.pendingFor(x.Request)
 }
 
 func (p *Policy) claimPaid(ctx context.Context) {
@@ -263,16 +259,28 @@ func (p *Policy) broadcast(ctx context.Context, tx *wire.MsgTx) (string, error) 
 func (p *Policy) watchLockups(ctx context.Context) {
 	p.Ledger.Lock()
 	var todo []*Lockup
+	var approved []*Lockup
 	for _, l := range p.Ledger.Lockups {
 		switch l.State {
 		case LockSent, LockClaimed, LockRefunding:
 			todo = append(todo, l)
+		case LockApproved:
+			if p.now().Sub(l.At) > 2*time.Minute {
+				approved = append(approved, l)
+			}
 		}
 	}
 	p.Ledger.Unlock()
 	height, err := p.Chain.Height(ctx)
 	if err != nil {
 		return
+	}
+	for _, l := range approved {
+		// lnd's answer never reached the guard (a stalled stream): look for
+		// the lockup on chain by its rebuilt output and amount
+		if p.findApproved(ctx, l) {
+			todo = append(todo, l)
+		}
 	}
 	for _, l := range todo {
 		if err := p.watchLockup(ctx, l, height); err != nil && !errors.Is(err, ErrNotYet) {
@@ -286,6 +294,28 @@ func (p *Policy) watchLockups(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// findApproved looks for an allowed lockup whose send lnd never confirmed
+// to the guard; once found it is followed like any other (claims settle,
+// the timeout refunds).
+func (p *Policy) findApproved(ctx context.Context, l *Lockup) bool {
+	pk, err := p.addrScript(l.Address)
+	if err != nil {
+		return false
+	}
+	txid, vout, err := p.Chain.FindOutput(ctx, pk, l.Sat, l.SentAt-1)
+	if err != nil || txid == "" {
+		return false
+	}
+	p.Ledger.Lock()
+	if l.State == LockApproved {
+		l.State, l.TxID, l.Vout = LockSent, txid, int32(vout)
+		_ = p.Ledger.save()
+	}
+	p.Ledger.Unlock()
+	p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": txid, "found": true})
+	return true
 }
 
 func (p *Policy) lockupOutput(ctx context.Context, l *Lockup) (*swapscript.Output, *Output, uint32, error) {
@@ -352,7 +382,7 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 			if sp.Confirmations < 1 {
 				return p.bumpRefund(ctx, l, out, o, vout, height, true)
 			}
-			if sp.Confirmations >= 1 {
+			if sp.Confirmations >= finalConfs {
 				p.Ledger.Lock()
 				l.State = LockRefunded
 				_ = p.Ledger.save()
@@ -474,6 +504,11 @@ func (p *Policy) refund(ctx context.Context, l *Lockup, out *swapscript.Output, 
 	return txid, fee, nil
 }
 
+// finalConfs is how deep one of the guard's own spends must be before it is
+// taken as done (a reorg can undo a shallow one; until then it is watched
+// and broadcast again if it falls out).
+const finalConfs = 3
+
 // bumpEvery is how many blocks one of the guard's own spends may stay
 // unconfirmed before the guard replaces it with a higher fee.
 const bumpEvery = 3
@@ -588,13 +623,16 @@ func (p *Policy) watchClaim(ctx context.Context, x *Payment, height int64) error
 			p.Ledger.Unlock()
 			return fmt.Errorf("lockup %s:%d spent by %s, not our claim", x.LockupTx, x.Vout, sp.TxID)
 		}
-		if sp.Confirmations >= 1 {
+		if sp.Confirmations >= finalConfs {
 			p.Ledger.Lock()
 			x.Bump.Done, x.ClaimTx = true, sp.TxID
 			_ = p.Ledger.save()
 			p.Ledger.Unlock()
 			p.notify("claim_confirmed", map[string]any{"swap": x.SwapID, "txid": sp.TxID})
 			return nil
+		}
+		if sp.Confirmations >= 1 {
+			return nil // in a block: wait until it is deep enough
 		}
 		inMempool = true
 	}
