@@ -150,7 +150,7 @@ refused "GetInfo without the guard" KS getinfo
 log "guard up"
 # The lab carries big swaps of earlier runs that pay now: the daily limit
 # (unit-tested) is raised for the e2e part and back to default after it
-start_guard -e DAILY_SAT=10000000000
+start_guard -e DAILY_SAT=10000000000 -e LAUNCH_MODE=0
 ok "registered with lnd-swap ($(docker logs $GUARD 2>&1 | grep -c registered)x)"
 allowed "GetInfo through the guard" KS getinfo
 
@@ -307,6 +307,33 @@ sleep 25
 h3=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
 refused "a hold invoice asking a cltv_expiry over the cap" KS addholdinvoice "$h3" --amt 20000 --cltv_expiry_delta 1000
 refused "a lockup paying the miners 20x the estimate" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 20 --force
+
+log "the third review: a cancel and a lockup of one hold invoice at once"
+# real reverse swaps, the backend stopped once each is paid, then the
+# backend's macaroon asks to cancel the invoice and to send the lockup at
+# the same moment: never both
+race_ok=0
+for i in 1 2 3; do
+	pre=$(openssl rand -hex 32); ph=$(printf %s "$pre" | xxd -r -p | sha256sum | cut -d' ' -f1)
+	cpk=$(openssl ecparam -name secp256k1 -genkey 2>/dev/null | openssl ec -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | xxd -p -c 99)
+	sw=$(curl -s -X POST http://127.0.0.1:29001/v2/swap/reverse -H 'content-type: application/json' \
+		-d "{\"from\":\"BTC\",\"to\":\"BTC\",\"invoiceAmount\":30000,\"preimageHash\":\"$ph\",\"claimPublicKey\":\"$cpk\"}")
+	inv=$(jq -r .invoice <<<"$sw"); la=$(jq -r .lockupAddress <<<"$sw"); oa=$(jq -r .onchainAmount <<<"$sw")
+	[ "$inv" != null ] || { bad "race $i: no reverse swap: ${sw:0:200}"; continue; }
+	docker compose stop boltz >/dev/null 2>&1
+	( timeout 120 docker compose exec -T lnd-user lncli --network=regtest payinvoice --force "$inv" >/dev/null 2>&1 & )
+	for _ in $(seq 1 30); do [ "$(LS lookupinvoice "$ph" | jq -r .state)" = ACCEPTED ] && break; sleep 1; done
+	( KS cancelinvoice "$ph" >"$work/c$i" 2>&1; echo $? >"$work/cx$i" ) &
+	( KS sendcoins --addr "$la" --amt "$oa" --sat_per_vbyte 1 --force >"$work/s$i" 2>&1; echo $? >"$work/sx$i" ) &
+	wait
+	c=$(cat "$work/cx$i"); sx=$(cat "$work/sx$i"); st=$(LS lookupinvoice "$ph" | jq -r .state)
+	if [ "$c" = 0 ] && [ "$sx" = 0 ]; then bad "race $i: both the cancel and the lockup went through"
+	elif [ "$sx" = 0 ] && [ "$st" != ACCEPTED ]; then bad "race $i: lockup sent and the invoice is $st"
+	else race_ok=$((race_ok + 1)); fi
+	docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1
+	for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done
+done
+[ "$race_ok" = 3 ] && ok "cancel vs lockup: never both, 3 of 3 (cancel/send exits: $(cat "$work"/cx* | tr '\n' ' ')/ $(cat "$work"/sx* | tr '\n' ' '))"
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
