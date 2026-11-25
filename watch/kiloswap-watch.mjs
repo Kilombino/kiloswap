@@ -200,6 +200,10 @@ if (ALERT_PORT) {
         settled: () => `💰 Kiloswap: factura liquidada ${sat(j.sat)} sats (swap ${j.swap})`,
         guard_claim_failed: () => `🚨 Kiloswap: el guardián no ha podido cobrar (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
         guard_lockup_error: () => `🚨 Kiloswap: depósito con problemas (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
+        claim_bumped: () => `⏫ Kiloswap: cobro sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
+        refund_bumped: () => `⏫ Kiloswap: reembolso sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
+        claim_confirmed: () => `✔️ Kiloswap: cobro confirmado (swap ${j.swap})`,
+        refund_confirmed: () => `✔️ Kiloswap: reembolso confirmado (swap ${j.swap})`,
       };
       if (moves[j.event]) { try { await send(moves[j.event]()); } catch { /* next one */ } return; }
       if (j.event !== 'guard_refusal') return;
