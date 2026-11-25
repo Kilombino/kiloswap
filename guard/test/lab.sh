@@ -66,6 +66,7 @@ trap '[ -n "${KEEP:-}" ] || restore' EXIT
 
 log "guard binary"
 ( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/kiloswap-guard" ./cmd/kiloswap-guard )
+( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/bigreq" ./test/bigreq )
 ok "built"
 
 log "macaroons"
@@ -334,6 +335,16 @@ for i in 1 2 3; do
 	for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done
 done
 [ "$race_ok" = 3 ] && ok "cancel vs lockup: never both, 3 of 3 (cancel/send exits: $(cat "$work"/cx* | tr '\n' ' ')/ $(cat "$work"/sx* | tr '\n' ' '))"
+
+log "the fourth review: a huge request must not end the guard's stream"
+ends=$(docker logs $GUARD 2>&1 | grep -c "stream ended" || true)
+out=$(docker run --rm --network "$NET" -v "$work/bigreq:/bigreq:ro" \
+	-v "$LAB/data/lnd-swap/tls.cert:/lnd/tls.cert:ro" -v "$LAB/data/lnd-swap/kiloswap.macaroon:/lnd/kiloswap.macaroon:ro" \
+	alpine:3.22 /bigreq lnd-swap:10009 /lnd/tls.cert /lnd/kiloswap.macaroon 5000000 2>&1 || true)
+grep -q "request of" <<<"$out" && ok "a 5 MB DecodePayReq refused by size: ${out:0:120}" || bad "5 MB request: $out"
+sleep 2
+[ "$(docker logs $GUARD 2>&1 | grep -c "stream ended" || true)" = "$ends" ] && ok "the guard's stream did not end" || bad "the stream ended after the huge request"
+allowed "GetInfo right after" KS getinfo
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
