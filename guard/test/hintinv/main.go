@@ -46,11 +46,11 @@ func main() {
 	inv, err := zpay32.NewInvoice(&chaincfg.RegressionNetParams, hash, time.Now(),
 		zpay32.Amount(lnwire.MilliSatoshi(sat*1000)),
 		zpay32.Description("hint"),
-		zpay32.CLTVExpiry(80),
+		zpay32.CLTVExpiry(18),
 		zpay32.Expiry(time.Hour),
 		zpay32.PaymentAddr(secret),
 		zpay32.Features(lnwire.NewFeatureVector(fv, lnwire.Features)),
-		zpay32.RouteHint([]zpay32.HopHint{{NodeID: hint, ChannelID: 1<<40 | 1<<16 | 1, FeeBaseMSat: uint32(fee), FeeProportionalMillionths: uint32(ppm), CLTVExpiryDelta: 40}}),
+		zpay32.RouteHint([]zpay32.HopHint{{NodeID: hint, ChannelID: 1<<40 | 1<<16 | 1, FeeBaseMSat: uint32(fee), FeeProportionalMillionths: uint32(ppm), CLTVExpiryDelta: 9}}),
 	)
 	if err != nil {
 		panic(err)

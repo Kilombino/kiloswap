@@ -552,13 +552,19 @@ if subswap "$inv1"; then
 		&& ok "a 5000 sat fee limit through the attacker's 60 sat hop: lowered by the guard, no route, nothing sent ($st1)" \
 		|| bad "attacker route: $st1 $(head -c 200 "$work/r1")"
 	upb
-	for _ in $(seq 1 6); do K generatetoaddress 1 "$(K getnewaddress)" >/dev/null; sleep 6; done
-	sst=$(curl -s "http://127.0.0.1:29001/v2/swap/$sid")
+	# the backend retries every 15 s; the third "no route" gives the swap up
+	for _ in $(seq 1 24); do
+		sst=$(curl -s "http://127.0.0.1:29001/v2/swap/$sid"); grep -q "invoice.failedToPay" <<<"$sst" && break
+		K generatetoaddress 1 "$(K getnewaddress)" >/dev/null; sleep 5
+	done
 	grep -q "invoice.failedToPay" <<<"$sst" && grep -q "routing fee limit" <<<"$sst" \
 		&& ok "the backend gives the swap up cleanly: $(jq -c . <<<"$sst" | cut -c1-200)" || bad "backend after no route: ${sst:0:240}"
-	docker logs $GUARD 2>&1 | grep -q 'payment_failed' && ok "the guard released the payment on lnd's FAILED" || bad "no payment_failed in the guard's log"
+	docker logs $GUARD >"$work/glog" 2>&1
+	grep -q 'payment_failed' "$work/glog" && ok "the guard released the payment on lnd's FAILED" || bad "no payment_failed in the guard's log"
 else bad "attacker swap not created"; upb; fi
-# a free hop is tried within the same rewritten limit (its fake end fails it)
+# a free hop (the same 9-block hint, no fee) is tried within the same
+# rewritten limit (its fake end fails it): the attacker's hop failed on its
+# fee, not on the route's length
 read -r inv2 ph2 < <("$work/hintinv" 20000 "$upk" 0 0 | paste -sd' ')
 if subswap "$inv2"; then
 	st2=$(paystate "$ph2")
