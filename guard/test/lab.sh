@@ -522,6 +522,7 @@ log "option A: the routing fee paid from the lockup's surplus (10 sat floor), re
 # an attacker's invoice: the payment must go through their node (a route
 # hint through lnd-user, a 60 sat fee) to a key of theirs
 upk=$(LU getinfo | jq -r .identity_pubkey)
+start_guard -e DAILY_SAT=10000000000 # the e2e part filled the launch daily limit
 subswap() { # invoice -> creates the swap and pays its lockup; the backend pays once it is confirmed
 	local cpk sw
 	cpk=$(openssl ecparam -name secp256k1 -genkey 2>/dev/null | openssl ec -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | xxd -p -c 99)
@@ -542,7 +543,7 @@ upb() { docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz
 read -r inv1 ph1 < <("$work/hintinv" 20000 "$upk" 60000 0 | paste -sd' ')
 if subswap "$inv1"; then
 	stb=$(paystate "$ph1")
-	grep -q '"htlcs":0' <<<"$stb" && ok "the backend's own payment through the 60 sat hop: nothing sent ($stb)" || bad "backend payment through the attacker's hop: $stb"
+	grep -q '"status":"FAILED"' <<<"$stb" && grep -q '"htlcs":0' <<<"$stb" && ok "the backend's own payment through the 60 sat hop: rewritten limit, no route, nothing sent ($stb)" || bad "backend payment through the attacker's hop: $stb"
 	# the backend taken over asks a 5000 sat limit: the guard lowers it
 	docker compose stop boltz >/dev/null 2>&1
 	KS payinvoice --pay_req "$inv1" --force --fee_limit 5000 --cltv_limit 40 >"$work/r1" 2>&1 || true
@@ -564,6 +565,7 @@ if subswap "$inv2"; then
 	[ -n "$st2" ] && ! grep -q '"htlcs":0' <<<"$st2" && [ "$st2" != null ] \
 		&& ok "a free hop is tried within the rewritten limit: $st2" || bad "the cheap route was not tried: $st2"
 else bad "cheap swap not created"; fi
+start_guard
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
