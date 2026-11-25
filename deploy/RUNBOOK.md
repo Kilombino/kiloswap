@@ -85,6 +85,10 @@ en los 15 minutos siguientes.
    ```
    [rpcmiddleware]
    rpcmiddleware.enable=true
+   # lnd waits up to 10 s for the guard's answer (default 2 s): a slow
+   # moment must not fail calls; the guard answers within 1.5 s anyway and
+   # resolves anything unanswered from lnd's own records
+   rpcmiddleware.intercepttimeout=10s
 
    [sweeper]
    sweeper.nodeadlineconftarget=144
