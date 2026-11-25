@@ -191,7 +191,7 @@ type Chain interface {
 	Confirmations(ctx context.Context, txid string) (int64, error)
 	// FindOutputs lists the outputs paying sat to pkScript in the blocks
 	// from fromHeight on.
-	FindOutputs(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) ([]Found, error)
+	FindOutputs(ctx context.Context, pkScript []byte, sat int64, fromHeight, toHeight int64) ([]Found, error)
 }
 
 // Found is an output FindOutputs found.
@@ -275,6 +275,8 @@ type Policy struct {
 	ReverseMarginBlocks int64
 	// MaxHoldCltv is the most cltv_expiry a hold invoice may ask.
 	MaxHoldCltv uint64
+	// MaxUnresolved caps lockups allowed and not seen on chain yet.
+	MaxUnresolved int
 	// HoldSlotTime is how long an unpaid hold invoice counts against
 	// MaxPendingReverse.
 	HoldSlotTime time.Duration
@@ -308,6 +310,7 @@ type Policy struct {
 	pending     map[uint64]pendingReq
 	claimErr    map[string]string // last claim error per payment hash
 	calls       map[string][]time.Time
+	epoch       uint64 // bumped on each registration with lnd (ids start over)
 	lastSaveErr string
 	confCache   map[string]confAt
 	replace     map[uint64][]byte
@@ -404,6 +407,7 @@ func (p *Policy) cachedConfs(ctx context.Context, txid string, height int64, use
 const ClaimVbytes = 151
 
 type pendingReq struct {
+	epoch  uint64 // the registration with lnd it belongs to
 	method string
 	hash   string
 	sat    int64
@@ -648,6 +652,12 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 		return refuse("exactly one positive fee rate is required")
 	case r.SatPerVbyte > uint64(p.MaxFeeRate) || r.SatPerByte > p.MaxFeeRate:
 		return refuse("fee rate over %d sat/vB", p.MaxFeeRate)
+	case len(r.Label) > 100:
+		return refuse("label over 100 characters")
+	case r.MinConfs > 6:
+		return refuse("min_confs over 6")
+	case r.CoinSelectionStrategy != 0:
+		return refuse("the default coin selection only")
 	}
 	if p.LockupFeeFactor > 0 {
 		rate := float64(r.SatPerVbyte) + float64(r.SatPerByte)
@@ -779,6 +789,15 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 	}
 	if h := p.Ledger.Holds[l.Hash]; h == nil || h.State != "open" {
 		return refuse("the hold invoice is no longer open (being cancelled?)")
+	}
+	unresolved := 0
+	for _, x := range p.Ledger.Lockups {
+		if x.State == LockApproved {
+			unresolved++
+		}
+	}
+	if p.MaxUnresolved > 0 && unresolved >= p.MaxUnresolved {
+		return refuse("%d lockups allowed and not seen on chain yet, the limit is %d", unresolved, p.MaxUnresolved)
 	}
 	// and lnd still holds it paid, asked again under the lock
 	hb, _ := hex.DecodeString(l.Hash)
@@ -1073,7 +1092,10 @@ func (p *Policy) ownLookup(hash []byte) error {
 	h := hex.EncodeToString(hash)
 	p.Ledger.Lock()
 	defer p.Ledger.Unlock()
-	if _, ok := p.Ledger.Holds[h]; ok {
+	if x, ok := p.Ledger.Holds[h]; ok {
+		if x.State == HoldCreating {
+			return refuse("the hold invoice is not confirmed yet")
+		}
 		return nil
 	}
 	if _, ok := p.Ledger.Invoices[h]; ok {
@@ -1087,6 +1109,17 @@ func (p *Policy) cancel(requestID uint64, hash []byte) error {
 		return refuse("a 32-byte payment hash is required")
 	}
 	h := hex.EncodeToString(hash)
+	// lnd's invoice must be the guard's own (its memo nonce), asked before
+	// taking the locks
+	p.Ledger.Lock()
+	var memo string
+	if x := p.Ledger.Holds[h]; x != nil {
+		memo = x.Memo
+	}
+	p.Ledger.Unlock()
+	if err := p.memoMatches(hash, memo); err != nil {
+		return err
+	}
 	// the same lock as allowSend: a cancel and a lockup of one invoice can
 	// never both be allowed (lnd would drop the HTLCs and the coins would go)
 	p.mu.Lock()
@@ -1096,6 +1129,14 @@ func (p *Policy) cancel(requestID uint64, hash []byte) error {
 	hold, ok := p.Ledger.Holds[h]
 	if !ok {
 		return refuse("not a Kiloswap hold invoice")
+	}
+	if hold.State == "canceled" {
+		return nil // the guard cancelled it already: lnd's answer is a no-op
+	}
+	if hold.State != "open" {
+		// a hold lnd has not confirmed making ('creating') may carry another
+		// service's hash: never cancel it
+		return refuse("the hold invoice is %s, not open", hold.State)
 	}
 	if l, ok := p.Ledger.Lockups[h]; ok && l.State != LockRefunded && l.State != LockExpired {
 		// (an allowed lockup never seen is not "expired" until lnd itself
@@ -1116,10 +1157,23 @@ func (p *Policy) cancel(requestID uint64, hash []byte) error {
 func (p *Policy) settle(requestID uint64, hash []byte) error {
 	h := hex.EncodeToString(hash)
 	p.Ledger.Lock()
-	defer p.Ledger.Unlock()
-	if _, ok := p.Ledger.Holds[h]; !ok {
+	hold, ok := p.Ledger.Holds[h]
+	var state, memo string
+	if ok {
+		state, memo = hold.State, hold.Memo
+	}
+	p.Ledger.Unlock()
+	if !ok {
 		return refuse("not a Kiloswap hold invoice")
 	}
+	if state != "open" && state != HoldCanceling {
+		return refuse("the hold invoice is %s", state)
+	}
+	if err := p.memoMatches(hash, memo); err != nil {
+		return err
+	}
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
 	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/SettleInvoice", hash: h})
 	return nil
 }
@@ -1131,6 +1185,7 @@ func (p *Policy) track(requestID uint64, r pendingReq) {
 		p.pending = map[uint64]pendingReq{}
 	}
 	r.at = p.now()
+	r.epoch = p.epoch
 	p.pending[requestID] = r
 	// streams that never got a final answer are forgotten after a day
 	cut := r.at.Add(-24 * time.Hour)
@@ -1317,6 +1372,7 @@ func (p *Policy) ResetPending() {
 	p.pmu.Lock()
 	old := p.pending
 	p.pending = map[uint64]pendingReq{}
+	p.epoch++
 	p.pmu.Unlock()
 	_ = old // holds, lockups and payments of those calls are on the ledger:
 	// closeHolds, watchLockups and reconcilePayments resolve them from lnd
@@ -1338,8 +1394,9 @@ func (p *Policy) judgeGetTransactions(ctx context.Context, m *lnrpc.RPCMessage) 
 	switch {
 	case r.Account != "":
 		return refuse("the default account only")
-	case r.MaxTransactions == 0 || r.MaxTransactions > 500:
-		return refuse("max_transactions must be 1..500")
+	case r.MaxTransactions == 0 || r.MaxTransactions > 50:
+		// a page must stay far under the guard's message limit
+		return refuse("max_transactions must be 1..50")
 	case int64(r.StartHeight) < tip-4320:
 		return refuse("start_height %d is too old (at most 4320 blocks back)", r.StartHeight)
 	case r.EndHeight != -1 && r.EndHeight < r.StartHeight:
@@ -1435,6 +1492,31 @@ func (p *Policy) Replacement(requestID uint64) []byte {
 	return b
 }
 
+// memoMatches checks that lnd's invoice for hash carries the guard's own
+// memo nonce: the invoice is the one the guard had made, no other service's.
+func (p *Policy) memoMatches(hash []byte, memo string) error {
+	if memo == "" {
+		return nil // a hold from before nonces were kept
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	inv, err := p.LN.LookupInvoice(ctx, hash)
+	if err != nil {
+		return refuse("lnd invoice: %v", err)
+	}
+	if inv == nil || inv.Memo != memo {
+		return refuse("lnd's invoice with that hash is not the guard's (memo)")
+	}
+	return nil
+}
+
+// ReportLimits tells the operator the limits in force (a deployment that
+// forgot the launch limits shows here, not after a large swap).
+func (p *Policy) ReportLimits() {
+	p.notify("guard_limits", map[string]any{"per_op_sat": p.MaxPerOpSat, "daily_sat": p.DailySat,
+		"reserve_sat": p.ReserveSat, "pending_reverse": p.MaxPendingReverse, "unresolved": p.MaxUnresolved})
+}
+
 // Lifecycle reports the guard starting, registering with lnd or losing its
 // stream (the operator's bot alerts on starts and lost streams).
 func (p *Policy) Lifecycle(event string) { p.notify(event, map[string]any{}) }
@@ -1449,9 +1531,20 @@ func (p *Policy) Stall(why string) {
 // Forget undoes what an allowed judgment recorded when lnd was told no
 // after all (its judgment came too late): lnd never runs the call, so
 // nothing may stay counted or reserved for it.
-func (p *Policy) Forget(requestID uint64) {
+func (p *Policy) Forget(requestID uint64) { p.ForgetIn(requestID, p.Epoch()) }
+
+// Epoch is the current registration with lnd.
+func (p *Policy) Epoch() uint64 {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	return p.epoch
+}
+
+// ForgetIn is Forget for a judgment begun in registration epoch: a request
+// id reused after lnd restarted belongs to another call, never undone.
+func (p *Policy) ForgetIn(requestID, epoch uint64) {
 	r, ok := p.pendingFor(requestID)
-	if !ok {
+	if !ok || r.epoch != epoch {
 		return
 	}
 	p.done(requestID)

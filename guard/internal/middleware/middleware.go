@@ -169,7 +169,8 @@ type Judge interface {
 	Intercept(ctx context.Context, condition string, requestID uint64, m *lnrpc.RPCMessage) error
 	Answered(requestID uint64, m *lnrpc.RPCMessage)
 	Stall(why string)
-	Forget(requestID uint64)
+	Epoch() uint64
+	ForgetIn(requestID, epoch uint64)
 	Replacement(requestID uint64) []byte
 }
 
@@ -187,6 +188,7 @@ func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger
 			logger.Printf("refused %s: %s", t.Request.GetMethodFullUri(), feedback.Error)
 			return feedback
 		}
+		epoch := p.Epoch()
 		jctx, cancel := context.WithTimeout(ctx, JudgeTimeout)
 		defer cancel()
 		done := make(chan error, 1)
@@ -198,7 +200,7 @@ func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger
 			err = fmt.Errorf("kiloswap guard: no judgment within %v", JudgeTimeout)
 			p.Stall(fmt.Sprintf("%s took over %v", t.Request.GetMethodFullUri(), JudgeTimeout))
 			// the late judgment, whatever it says, must not stay recorded
-			go func() { <-done; p.Forget(req.RequestId) }()
+			go func() { <-done; p.ForgetIn(req.RequestId, epoch) }()
 		}
 		if err != nil {
 			feedback.Error = err.Error()

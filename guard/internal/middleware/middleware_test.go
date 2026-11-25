@@ -32,7 +32,8 @@ func (j *slowJudge) Stall(why string) {
 	j.stalls = append(j.stalls, why)
 	j.mu.Unlock()
 }
-func (j *slowJudge) Forget(id uint64) {
+func (j *slowJudge) Epoch() uint64 { return 0 }
+func (j *slowJudge) ForgetIn(id, _ uint64) {
 	j.mu.Lock()
 	j.forgot = append(j.forgot, id)
 	j.mu.Unlock()

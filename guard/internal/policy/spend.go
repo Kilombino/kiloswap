@@ -310,13 +310,9 @@ func (p *Policy) watchLockups(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	for _, l := range approved {
-		// lnd's answer never reached the guard (a stalled stream): look for
-		// the lockup on chain by its rebuilt output and amount
-		if p.findApproved(ctx, l, height) {
-			todo = append(todo, l)
-		}
-	}
+	// the lockups on chain first: settling, refunding and claiming must
+	// never wait behind the search for approvals lnd did not confirm
+	defer p.searchApproved(ctx, approved, height)
 	for _, l := range todo {
 		err := p.watchLockup(ctx, l, height)
 		// a lockup not confirmed, or a step that keeps saying "not yet",
@@ -349,17 +345,47 @@ func (p *Policy) watchLockups(ctx context.Context) {
 	}
 }
 
+// searchApproved looks for the lockups allowed whose send lnd never
+// confirmed to the guard, within a budget of its own (after the real
+// lockups' work), each from where its last search stopped.
+func (p *Policy) searchApproved(ctx context.Context, approved []*Lockup, height int64) {
+	ctx, cancel := context.WithTimeout(ctx, ApprovedBudget)
+	defer cancel()
+	for _, l := range approved {
+		if ctx.Err() != nil {
+			return
+		}
+		if p.findApproved(ctx, l, height) {
+			_ = p.watchLockup(ctx, l, height)
+		}
+		p.Ledger.Lock()
+		if l.State == LockApproved && height-l.SentAt > 6 && !l.StuckAlerted {
+			l.StuckAlerted = true
+			p.notify("guard_lockup_stuck", map[string]any{"swap": l.SwapID, "blocks": height - l.SentAt, "approved": true})
+		}
+		p.Ledger.Unlock()
+	}
+}
+
+// ApprovedBudget is what one round may spend on approvals; ScanStep how
+// many blocks one approval's chain search reads per round.
+const (
+	ApprovedBudget = 30 * time.Second
+	ScanStep       = 144
+)
+
 // findApproved looks for an allowed lockup whose send lnd never confirmed
-// to the guard: on chain, by its rebuilt output and amount in the blocks
-// since it was allowed, taking only an output of a transaction lnd's own
-// wallet sent (asked block by block, so nothing can push it out); a decoy
-// paying the same address is not ours. Once found it is followed like any
-// other (claims settle, the timeout refunds).
+// to the guard. Only positive evidence moves it: an output paying its
+// rebuilt script and amount in a transaction lnd's own wallet sent (found
+// on chain block by block, or in lnd's wallet history, unconfirmed too).
+// Outputs to the script that lnd's wallet did not send are decoys and count
+// for nothing.
 //
-// One never found is NOT given up while its hold invoice may still be paid
-// out: its reserve, daily share and the block on cancelling stay until lnd
-// itself shows the invoice cancelled or settled and the timeout is well
-// past (then nothing of ours can be at stake).
+// An approval is given up only on complete proof that nothing of ours is at
+// stake: lnd released the HTLCs, the timeout is long past, lnd's wallet
+// history (read in full) shows no payment to the script, and the chain was
+// scanned from the approval up to the tip without one lnd-owned output.
+// Until then its reserve, daily share and the block on cancelling stay.
 func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool {
 	adopt := func(txid string, vout uint32) bool {
 		p.Ledger.Lock()
@@ -371,66 +397,85 @@ func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool
 		p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": txid, "found": true})
 		return true
 	}
-	if txid, vout, ok := p.findOwnLockup(ctx, l, height); ok {
+	pk, err := p.addrScript(l.Address)
+	if err != nil {
+		return false
+	}
+	if txid, vout, ok := p.scanOwn(ctx, l, pk, height); ok {
 		return adopt(txid, vout)
 	}
-	// lnd's own wallet history (every page, unconfirmed too): positive
-	// evidence only. An approval is never dropped for lack of evidence.
-	pk, perr := p.addrScript(l.Address)
-	if perr == nil {
-		if txid, vout, _, found, err := p.LN.WalletPaid(ctx, pk, l.Sat, l.SentAt-1); err == nil && found {
-			return adopt(txid, vout)
-		}
+	txid, vout, _, found, werr := p.LN.WalletPaid(ctx, pk, l.Sat, l.SentAt-1)
+	if werr == nil && found {
+		return adopt(txid, vout)
 	}
-	if p.ApprovedExpireBlocks > 0 && height-l.SentAt > p.ApprovedExpireBlocks && height > int64(l.Timeout)+p.ReverseMarginBlocks+p.HoldExpiryDelta {
-		// given up only on proof that nothing of ours is at stake: lnd
-		// released the HTLCs, the timeout is long past, and a full scan of
-		// the chain from the approval finds no output to the lockup script
-		hash, _ := hex.DecodeString(l.Hash)
-		inv, err := p.LN.LookupInvoice(ctx, hash)
-		released := err == nil && (inv == nil || inv.State == InvoiceCanceled || inv.State == InvoiceSettled)
-		empty := false
-		if released && perr == nil {
-			found, ferr := p.Chain.FindOutputs(ctx, pk, l.Sat, l.SentAt-1)
-			empty = ferr == nil && len(found) == 0
-		}
-		if released && empty {
-			p.Ledger.Lock()
-			if l.State == LockApproved {
-				l.State = LockExpired
-				delete(p.Ledger.Entries, "send:"+l.Hash)
-				_ = p.Ledger.save()
-			}
-			p.Ledger.Unlock()
-			p.notify("guard_lockup_expired", map[string]any{"swap": l.SwapID, "sat": l.Sat})
-		}
+	if werr != nil || p.ApprovedExpireBlocks <= 0 || height-l.SentAt <= p.ApprovedExpireBlocks ||
+		height <= int64(l.Timeout)+p.ReverseMarginBlocks+p.HoldExpiryDelta {
+		return false
 	}
+	p.Ledger.Lock()
+	scanned := l.ScanFrom
+	p.Ledger.Unlock()
+	if scanned <= height {
+		return false // the chain is not scanned up to the tip yet
+	}
+	hash, _ := hex.DecodeString(l.Hash)
+	inv, err := p.LN.LookupInvoice(ctx, hash)
+	if err != nil || !(inv == nil || inv.State == InvoiceCanceled || inv.State == InvoiceSettled) {
+		return false // lnd still holds (or may hold) the HTLCs
+	}
+	p.Ledger.Lock()
+	if l.State == LockApproved {
+		l.State = LockExpired
+		delete(p.Ledger.Entries, "send:"+l.Hash)
+		_ = p.Ledger.save()
+	}
+	p.Ledger.Unlock()
+	p.notify("guard_lockup_expired", map[string]any{"swap": l.SwapID, "sat": l.Sat})
 	return false
 }
 
-// findOwnLockup scans the blocks since l was allowed for an output paying
-// its rebuilt script and amount, sent by lnd's wallet.
+// scanOwn reads the next ScanStep blocks of l's chain search (from where it
+// stopped, from the approval on, never skipping any) for an output paying
+// its script and amount that lnd's wallet sent. l.ScanFrom is the next
+// height to read; past the tip, the scan is complete (new blocks extend it).
+func (p *Policy) scanOwn(ctx context.Context, l *Lockup, pk []byte, height int64) (string, uint32, bool) {
+	p.Ledger.Lock()
+	from := l.ScanFrom
+	if from < l.SentAt-1 {
+		from = l.SentAt - 1
+	}
+	p.Ledger.Unlock()
+	if from > height {
+		from = max(height-1, l.SentAt-1) // keep an eye on the newest blocks
+	}
+	to := min(height, from+ScanStep-1)
+	found, err := p.Chain.FindOutputs(ctx, pk, l.Sat, from, to)
+	if err != nil {
+		return "", 0, false
+	}
+	for _, f := range found {
+		if own, err := p.LN.WalletOwns(ctx, f.TxID, f.Height); err == nil && own {
+			return f.TxID, f.Vout, true
+		}
+	}
+	p.Ledger.Lock()
+	if to+1 > l.ScanFrom {
+		l.ScanFrom = to + 1
+	}
+	p.Ledger.Unlock()
+	return "", 0, false
+}
+
+// findOwnLockup finds l's lockup sent by lnd's wallet anywhere since the
+// approval (a full search, for a lockup whose named transaction vanished).
 func (p *Policy) findOwnLockup(ctx context.Context, l *Lockup, height int64) (string, uint32, bool) {
 	pk, err := p.addrScript(l.Address)
 	if err != nil {
 		return "", 0, false
 	}
-	// from where the last scan stopped (a few blocks back for reorgs), not
-	// from the start every round
-	from := l.SentAt - 1
-	p.Ledger.Lock()
-	if l.ScanFrom > from {
-		from = l.ScanFrom
-	}
-	p.Ledger.Unlock()
-	found, err := p.Chain.FindOutputs(ctx, pk, l.Sat, from)
+	found, err := p.Chain.FindOutputs(ctx, pk, l.Sat, l.SentAt-1, height)
 	if err != nil {
 		return "", 0, false
-	}
-	if height > 0 {
-		p.Ledger.Lock()
-		l.ScanFrom = max(height-6, l.SentAt-1)
-		p.Ledger.Unlock()
 	}
 	for _, f := range found {
 		if own, err := p.LN.WalletOwns(ctx, f.TxID, f.Height); err == nil && own {

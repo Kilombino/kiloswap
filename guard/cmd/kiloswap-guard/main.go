@@ -172,6 +172,7 @@ func main() {
 		DailySat:             num("DAILY_SAT", daily),
 		ReserveSat:           num("RESERVE_SAT", 50_000_000),
 		MaxPendingReverse:    int(num("MAX_PENDING_REVERSE", 5)),
+		MaxUnresolved:        int(num("MAX_UNRESOLVED", 2)),
 		FeeRatio:             ratio,
 		MinFeeSat:            num("MIN_FEE_SAT", 121),
 		MaxFeeRate:           num("MAX_FEE_RATE", 25),
@@ -248,9 +249,10 @@ func main() {
 		default: // the queue is full: dropped, the log has it
 		}
 	}
-	logger.Printf("kiloswap-guard: per op %d sat, daily %d sat, LSP reserve %d sat, %d pending reverse swaps",
-		p.MaxPerOpSat, p.DailySat, p.ReserveSat, p.MaxPendingReverse)
+	logger.Printf("kiloswap-guard: per op %d sat, daily %d sat, LSP reserve %d sat, %d pending reverse swaps, %d unresolved lockups",
+		p.MaxPerOpSat, p.DailySat, p.ReserveSat, p.MaxPendingReverse, p.MaxUnresolved)
 	p.Lifecycle("guard_started")
+	p.ReportLimits() // the operator sees the limits in force on every start
 	// one full round of its own work (settle claims seen, claim paid
 	// lockups, refund timed-out ones) before lnd can hand it anything: a
 	// restart loop must not keep that work from ever running

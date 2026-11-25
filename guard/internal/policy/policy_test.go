@@ -122,6 +122,7 @@ type fakeChain struct {
 	spenders  map[string]*Spend
 	height    int64
 	broadcast []*wire.MsgTx
+	scans     [][2]int64
 	confs     map[string]int64
 	feeRate   float64
 }
@@ -176,14 +177,16 @@ func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
 	c.mu.Unlock()
 	return tx.TxHash().String(), nil
 }
-func (c *fakeChain) FindOutputs(_ context.Context, pk []byte, sat int64, _ int64) ([]Found, error) {
+func (c *fakeChain) FindOutputs(_ context.Context, pk []byte, sat int64, from, to int64) ([]Found, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.scans = append(c.scans, [2]int64{from, to})
 	var out []Found
 	for id, outs := range c.txs {
 		for i, o := range outs {
-			if bytes.Equal(o.PkScript, pk) && o.Sat == sat && o.Confirmations > 0 {
-				out = append(out, Found{TxID: id, Vout: uint32(i), Height: c.height - o.Confirmations + 1})
+			h := c.height - o.Confirmations + 1
+			if bytes.Equal(o.PkScript, pk) && o.Sat == sat && o.Confirmations > 0 && h >= from && h <= to {
+				out = append(out, Found{TxID: id, Vout: uint32(i), Height: h})
 			}
 		}
 	}
@@ -523,7 +526,10 @@ func (e *env) reverse(idx uint32, sat int64, b byte) (ReverseSwap, []byte, *btce
 		e.t.Fatal(err)
 	}
 	e.answer(id, &lnrpc.AddHoldInvoiceResp{PaymentRequest: "lnbcrt"}, false)
-	e.ln.invoices[hex.EncodeToString(hash)] = &InvoiceInfo{State: InvoiceAccepted, PaidMsat: (sat + 1000) * 1000, HTLCExpiries: []int32{1200}}
+	e.p.Ledger.Lock()
+	memo := e.p.Ledger.Holds[hex.EncodeToString(hash)].Memo // lnd keeps the guard's memo
+	e.p.Ledger.Unlock()
+	e.ln.invoices[hex.EncodeToString(hash)] = &InvoiceInfo{State: InvoiceAccepted, Memo: memo, PaidMsat: (sat + 1000) * 1000, HTLCExpiries: []int32{1200}}
 	user := randKey()
 	server, _ := e.keys.Public(idx)
 	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
@@ -1183,20 +1189,63 @@ func TestApprovalNeverDroppedOnAbsence(t *testing.T) {
 	}
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
 	mustRefuse(t, err, "stays until")
-	// HTLCs released, timeout long past, but an output to the script exists:
-	// still held
+	// HTLCs released, timeout long past, a decoy (not lnd's) paying the
+	// script: the chain is scanned a step per round, never all at once
 	e.ln.invoices[h].State = InvoiceCanceled
 	e.chain.height = 1300
 	pk, _ := e.p.addrScript(r.LockupAddress)
 	e.chain.txs[strings.Repeat("77", 32)] = []Output{{PkScript: pk, Sat: r.OnchainAmount, Confirmations: 50}}
 	e.p.Tick(context.Background())
 	if l := e.p.Ledger.Lockups[h]; l.State != LockApproved {
-		t.Fatalf("given up with an output to the script on chain: %s", l.State)
+		t.Fatalf("given up before the chain was scanned to the tip: %s", l.State)
 	}
-	delete(e.chain.txs, strings.Repeat("77", 32))
-	e.p.Tick(context.Background())
+	for i := 0; i < 5; i++ {
+		e.p.Tick(context.Background())
+	}
 	if l := e.p.Ledger.Lockups[h]; l.State != LockExpired {
-		t.Fatalf("not expired with the proof complete: %s", l.State)
+		t.Fatalf("a decoy output kept the approval (or the proof never completed): %s", l.State)
+	}
+	// every block from the approval to the tip was read, none skipped
+	next := int64(-1)
+	for _, sc := range e.chain.scans {
+		if sc[1]-sc[0]+1 > ScanStep {
+			t.Fatalf("a scan read %d blocks at once", sc[1]-sc[0]+1)
+		}
+		if next >= 0 && sc[0] > next {
+			t.Fatalf("blocks %d..%d skipped", next, sc[0]-1)
+		}
+		next = max(next, sc[1]+1)
+	}
+	if next <= 1300 {
+		t.Fatalf("scan stopped at %d", next)
+	}
+}
+
+// An approval whose lockup lnd sent (but whose answer was lost) is found on
+// chain and followed, even far from the approval height.
+func TestApprovalFoundWhenLndSentIt(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	r, _, _ := e.reverse(104, 1_000_000, 104)
+	_, err := e.call(sendURI, sendReq(r)) // lnd's answer never comes back
+	mustAllow(t, err)
+	_, hash := preimage(104)
+	h := hex.EncodeToString(hash)
+	if l := e.p.Ledger.Lockups[h]; l == nil {
+		t.Fatal("no approval")
+	}
+	at = at.Add(time.Hour)
+	pk, _ := e.p.addrScript(r.LockupAddress)
+	txid := strings.Repeat("78", 32)
+	e.chain.height = 1290
+	e.chain.txs[txid] = []Output{{PkScript: pk, Sat: r.OnchainAmount, Confirmations: 2}}
+	e.ln.walletSends = append(e.ln.walletSends, walletSend{txid: txid, address: "not-decodable"})
+	for i := 0; i < 4; i++ {
+		e.p.Tick(context.Background())
+	}
+	if l := e.p.Ledger.Lockups[h]; l.State == LockApproved || l.TxID != txid {
+		t.Fatalf("lnd's own lockup not found: %s %s", l.State, l.TxID)
 	}
 }
 
@@ -1223,9 +1272,11 @@ func TestGetTransactionsBounded(t *testing.T) {
 	e.chain.height = 10_000
 	_, err := e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 0, EndHeight: -1, MaxTransactions: 0})
 	mustRefuse(t, err, "max_transactions")
-	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 0, EndHeight: -1, MaxTransactions: 100})
+	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 0, EndHeight: -1, MaxTransactions: 50})
 	mustRefuse(t, err, "too old")
-	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 100})
+	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 51})
+	mustRefuse(t, err, "max_transactions")
+	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 50})
 	mustAllow(t, err)
 }
 
@@ -1398,10 +1449,10 @@ func TestHeavyCallsRateLimited(t *testing.T) {
 	_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
 	mustRefuse(t, err, "not allowed") // the backend has no use for the whole graph
 	for i := 0; i < 60; i++ {
-		_, err := e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 100})
+		_, err := e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 50})
 		mustAllow(t, err)
 	}
-	_, err = e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 100})
+	_, err = e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 50})
 	mustRefuse(t, err, "a minute")
 }
 

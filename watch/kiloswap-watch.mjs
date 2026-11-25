@@ -203,13 +203,16 @@ if (ALERT_PORT) {
         lockup_allowed: () => `🟢 Kiloswap: depósito permitido ${sat(j.sat)} sats (swap ${j.swap})`,
         payment_allowed: () => `🟢 Kiloswap: pago permitido ${sat(j.sat)} sats (swap ${j.swap})`,
         lockup_dropped: () => `⚠️ Kiloswap: aprobación de depósito retirada (swap ${j.swap})`,
-        guard_lockup_stuck: () => `🚨 Kiloswap: depósito atascado ${j.blocks} bloques (swap ${j.swap})`,
+        guard_lockup_stuck: () => j.approved
+          ? `🚨 Kiloswap: depósito aprobado hace ${j.blocks} bloques y sin rastro en la cadena (swap ${j.swap}); revisar lnd`
+          : `🚨 Kiloswap: depósito atascado ${j.blocks} bloques (swap ${j.swap})`,
         guard_lockup_expired: () => `ℹ️ Kiloswap: depósito nunca enviado, liberado tras comprobarlo en la cadena (swap ${j.swap})`,
         guard_hold_canceled: () => `✂️ Kiloswap: factura retenida cancelada por demasiadas partes (${j.htlcs} HTLC)`,
         guard_ledger_error: () => `🚨 Kiloswap: el guardián no puede escribir su registro: ${String(j.error).slice(0, 200)}`,
         guard_stall: () => `🐢 Kiloswap: el guardián rechazó por lentitud: ${String(j.reason).slice(0, 200)}`,
         guard_registered: () => `✅ Kiloswap: el guardián se ha registrado en lnd`,
         guard_started: () => `🔄 Kiloswap: el guardián se ha (re)iniciado`,
+        guard_limits: () => `📏 Kiloswap: límites en vigor: ${(j.per_op_sat / 1e8).toFixed(3)} BTC por operación, ${(j.daily_sat / 1e8).toFixed(3)} BTC al día, ${j.pending_reverse} swaps inversos pendientes, ${j.unresolved} depósitos sin confirmar`,
         guard_stream_ended: () => `⚠️ Kiloswap: el guardián perdió su conexión con lnd (se vuelve a registrar solo)`,
         claim_bumped: () => `⏫ Kiloswap: cobro sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
         refund_bumped: () => `⏫ Kiloswap: reembolso sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,

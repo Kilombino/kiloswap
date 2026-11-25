@@ -243,7 +243,9 @@ func (l LN) TrackPayment(ctx context.Context, hash []byte) (int32, string, error
 	}
 	var p lnrpc.Payment
 	if err := st.RecvMsg(&p); err != nil {
-		if status.Code(err) == codes.NotFound || strings.Contains(err.Error(), "not found") {
+		// only lnd's own NotFound means "no such payment"; anything else is
+		// unknown (a payment is never given back on a guess)
+		if status.Code(err) == codes.NotFound {
 			return 0, "", nil
 		}
 		return 0, "", err
@@ -480,17 +482,13 @@ const maxScan = 1500
 
 // FindOutputs lists every output paying sat to pkScript in the blocks from
 // fromHeight on (at most maxScan of them), with the height of each.
-func (c Chain) FindOutputs(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) ([]policy.Found, error) {
+func (c Chain) FindOutputs(ctx context.Context, pkScript []byte, sat int64, fromHeight, toHeight int64) ([]policy.Found, error) {
 	want := hex.EncodeToString(pkScript)
-	tip, err := c.Height(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if fromHeight < 1 || tip-fromHeight > maxScan {
-		fromHeight = tip - maxScan
+	if fromHeight < 0 {
+		fromHeight = 0
 	}
 	var out []policy.Found
-	for h := fromHeight; h <= tip; h++ {
+	for h := fromHeight; h <= toHeight; h++ {
 		var hash string
 		if err := c.rpc(ctx, "getblockhash", []any{h}, &hash); err != nil {
 			return nil, err
