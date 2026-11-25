@@ -5,9 +5,9 @@ operador. Todo lo que no corta nada se hace antes. Lo que corta va junto en
 **una sola ventana**:
 
 - **Nodo (Knots):** ZMQ, usuario RPC y subred del stack, todo de una vez.
-  Reiniciarlo deja a DATUM sin plantilla unos segundos.
+  Reiniciarlo deja a la minería sin plantilla unos segundos.
 - **LND:** `rpcmiddleware.enable`. Reiniciarlo deja los canales fuera un
-  minuto y el bridge parado ese rato. No afecta a la minería.
+  minuto, y lo que use LND parado ese rato. No afecta a la minería.
 
 Rutas de ejemplo (las de `.env.example`): repositorio en `/opt/kiloswap`,
 datos en `${KILOSWAP_ROOT}`.
@@ -63,10 +63,11 @@ datos en `${KILOSWAP_ROOT}`.
    `172.30.92.0/24` (sin salida: backend, postgres, guardián, shim y
    `lnd-proxy`) sin arrancar nada.
 
-## Ventana (cuando no haya alquileres de MRR a punto de acabar)
+## Ventana (en un momento tranquilo)
 
-Mirar antes en el panel de MRR (`/api/overview`) que ningún alquiler acaba
-en los 15 minutos siguientes.
+Elegir un momento en el que ningún servicio que dependa del nodo o de LND
+esté a mitad de algo importante (alquileres de minería que acaban, pagos
+en curso).
 
 1. **Copias**: `bitcoin.conf` → `bitcoin.conf.bak-<fecha>` y
    `lnd.conf` → `lnd.conf.bak-<fecha>`.
@@ -84,11 +85,11 @@ en los 15 minutos siguientes.
    rpcwhitelist=kiloswap:getblock,getblockhash,getblockheader,getblockchaininfo,getbestblockhash,getblockcount,getrawtransaction,gettxout,gettxspendingprevout,getrawmempool,getmempoolinfo,getmempoolentry,estimatesmartfee,getnetworkinfo,getdeploymentinfo,getzmqnotifications,uptime,sendrawtransaction,testmempoolaccept,getnewaddress,listunspent,gettransaction
    rpcwhitelist=kiloswap-guard:getrawtransaction,gettxout,getblockcount,getblockhash,getblock,gettxspendingprevout,estimatesmartfee,sendrawtransaction
    # IMPRESCINDIBLE: sin esto, la lista blanca de arriba deja SIN PERMISOS
-   # a todos los demás usuarios (LND, mempool, DATUM, Kilobot…).
-   # Ya está en producción (línea 143, por spamchainview): no duplicarla.
+   # a todos los demás usuarios (LND, explorador, minería…).
+   # Si el nodo ya la tiene (por otra lista blanca), no duplicarla.
    rpcwhitelistdefault=0
-   # the RPC work threads and queue the node serves everyone with (DATUM,
-   # LND, mempool, Kiloswap's shim with at most 8 calls at once): enough
+   # the RPC work threads and queue the node serves everyone with (mining,
+   # LND, an explorer, Kiloswap's shim with at most 8 calls at once): enough
    # that the shim can never take them all
    rpcthreads=16
    rpcworkqueue=256
@@ -126,17 +127,16 @@ en los 15 minutos siguientes.
      LND, y era un error: hay que reiniciarlo.
 4. **Reinicios, seguidos, para que sean una sola ventana:**
    ```
-   systemctl --user restart bip110-node     # ~10 s sin plantillas de minado
-   docker restart lnd-blake2b               # ~1 min sin canales; el wallet se desbloquea solo
+   <reiniciar el nodo>                      # ~10 s sin plantillas de minado
+   docker restart <contenedor-de-lnd>       # ~1 min sin canales
    ```
 5. **Comprobaciones:**
    - `bitcoin-cli getzmqnotifications`: muestra los 2 ZMQ.
-   - `journalctl -u datum-convoy | grep "Server stats"`: mismos clientes
-     que antes.
+   - La minería (si la hay) vuelve a tener los mismos clientes     que antes.
    - `lncli getinfo`: `synced_to_chain` y canales activos.
-   - El bridge responde (`bridge.kilombino.com`).
+   - Los servicios que usan LND responden.
    - Con el usuario `kiloswap`, `getblockcount` responde; con el usuario
-     de siempre, todo sigue igual (LND, mempool, Kilobot).
+     de siempre, todo sigue igual (LND, explorador, el resto).
 
 **Vuelta atrás:** restaurar las dos copias y reiniciar lo mismo otra vez.
 El stack de Kiloswap aún no ha arrancado, así que no hay nada que deshacer
@@ -172,22 +172,18 @@ en él.
    - **Cloudflare:** en el túnel, una regla de entrada
      `swap.kilombino.com → http://127.0.0.1:3260` y el CNAME del
      subdominio.
-   - **Tor:** en el Tor del sistema (`/etc/tor/torrc`, junto a los de
-     MercaSats o MiniBolt; no en el de Ammanaya), añadir:
+   - **Tor:** en el Tor del sistema (`/etc/tor/torrc`), añadir:
      ```
      HiddenServiceDir /var/lib/tor/kiloswap-onion/
      HiddenServicePort 80 127.0.0.1:3261
      ```
      Después, `systemctl reload tor` (recarga, no reinicio). La dirección
-     va a `VITE_TOR_URL` en la siguiente compilación de la web y a `ONION`
-     en `kiloswap.js` del bridge.
-   - **bridge.kilombino.com:** pestaña "Kiloswap", en la rama local
-     `kiloswap-tab` de kilobridge. Es una tarjeta con comisiones, límites y
-     un botón que abre swap.kilombino.com (en el .onion del bridge, el
-     .onion de Kiloswap). No mete la web en un iframe:
-     - Paul la hace no enmarcable a propósito (`frame-ancestors 'none'`).
+     va a `VITE_TOR_URL` en la siguiente compilación de la web.
+   - **Enlazar desde otra web:** con un enlace o botón que abra
+     swap.kilombino.com, nunca en un iframe:
+     - La web es no enmarcable a propósito (`frame-ancestors 'none'`).
      - En un iframe, los navegadores guardan aparte (por sitio) los datos
-       de los swaps. Un swap empezado dentro del bridge no aparecería al
+       de los swaps. Un swap empezado dentro de otra web no aparecería al
        abrir swap.kilombino.com directamente.
 6. **Avisos:** `watch/watch.env.example` →
    `~/.config/kiloswap-watch/watch.env` y el servicio de usuario
@@ -204,9 +200,8 @@ en él.
 
 ## ZMQ del nodo: condición previa de la ventana (revisiones 8 y 9)
 
-Revisado en solo lectura el 25 nov 2026: el `bitcoin.conf` de producción
-(`~/Projects/blake2b/node-bip110/bitcoin.conf`) **no tiene ninguna línea
-`zmqpub*`** hoy (LND no usa ZMQ del nodo). Los únicos temas que Kiloswap
+Antes de la ventana, mirar qué líneas `zmqpub*` tiene ya el `bitcoin.conf`
+del nodo (puede no tener ninguna, si LND no usa ZMQ). Los únicos temas que Kiloswap
 publica son los dos del paso 2: `zmqpubrawblock` y `zmqpubrawtx`, y **cada
 uno** lleva su `…hwm=20` en el mismo cambio. Ninguno de los dos se activa
 sin su límite: es condición previa para arrancar el shim. Si algún día se
@@ -240,16 +235,15 @@ temas, cada uno con `"hwm": 20`.
 - La red `internal` del compose lleva
   `com.docker.network.bridge.gateway_mode_ipv4: isolated`: sin ella, un
   contenedor de una red `internal` de Docker llega a los servicios del host
-  por la IP de la pasarela. Probado el 25 nov 2026 (Docker 29)
-  con una red de prueba: sin `isolated`, la pasarela daba acceso a :3021
-  (Thunderhub) y :7160 (MRR Command Center); con `isolated`, todo
-  bloqueado (:3021, :5984, :7160, :10009, :8280 y la IP de la red local).
+  por la IP de la pasarela. Probado el 25 nov 2026 (Docker 29) con una red
+  de prueba: sin `isolated`, la pasarela daba acceso a paneles web del
+  host; con `isolated`, todo bloqueado (también la IP de la red local).
 - **Propuesta, sin aplicar en producción:** la regla de UFW que deja pasar
   a `172.16.0.0/12` es más amplia de lo necesario. Lo justo sería permitir
   solo las subredes que lo necesitan (la del compose `172.30.91.0/24` al
   RPC del nodo y a ZMQ; las de LND y mempool a sus puertos) y quitar el
-  /12 entero. Hay que revisarlo con calma, porque otros servicios de
-  el host dependen hoy de esa regla.
+  /12 entero. Hay que revisarlo con calma, porque otros servicios del
+  host pueden depender hoy de esa regla.
 
 ## Base de datos: roles
 

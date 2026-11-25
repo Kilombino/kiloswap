@@ -16,7 +16,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 set -a; . ./.env; set +a
 R=${KILOSWAP_ROOT:?}
-LNCLI=${LNCLI:-docker exec ${LND_HOST:-lnd-blake2b} lncli --network=mainnet}
+LNCLI=${LNCLI:-docker exec ${LND_HOST:?set LND_HOST in .env} lncli --network=mainnet}
 KS_ID=${KS_ROOT_KEY_ID:-31}
 GUARD_ID=${GUARD_ROOT_KEY_ID:-32}
 backend=(

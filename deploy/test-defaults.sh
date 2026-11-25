@@ -4,7 +4,7 @@
 # must .env.example.
 set -euo pipefail
 cd "$(dirname "$0")"
-cfg=$(env -i PATH="$PATH" HOME="$HOME" KILOSWAP_ROOT=/x LND_DIR=/x LSP_STATE=/x NODE_HOST=x NODE_RPC_PASSWORD=x \
+cfg=$(env -i PATH="$PATH" HOME="$HOME" KILOSWAP_ROOT=/x LND_HOST=x LND_DIR=/x LSP_STATE=/x NODE_HOST=x NODE_RPC_PASSWORD=x \
 	docker compose -f docker-compose.yml --env-file /dev/null config 2>/dev/null)
 grep -q 'MAX_PER_OP_SAT: "10000000"' <<<"$cfg" || { echo "compose default MAX_PER_OP_SAT is not 10000000"; exit 1; }
 grep -q 'DAILY_SAT: "25000000"' <<<"$cfg" || { echo "compose default DAILY_SAT is not 25000000"; exit 1; }

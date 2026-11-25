@@ -31,7 +31,7 @@ rpc=$(cat "$R/secrets/node_rpc_password")
 sed -i "s|^NODE_RPC_PASSWORD=.*|NODE_RPC_PASSWORD=$rpc|" .env
 if [ ! -s "$R/boltz/boltz.conf" ]; then
 	sed -e "s|@POSTGRES_PASSWORD@|$pg|" -e "s|@NODE_RPC_PASSWORD@|$rpc|" \
-		-e "s|@LND_HOST@|${LND_HOST:-lnd-blake2b}|" boltz.conf.template >"$R/boltz/boltz.conf"
+		-e "s|@LND_HOST@|${LND_HOST:?set LND_HOST in .env}|" boltz.conf.template >"$R/boltz/boltz.conf"
 fi
 chmod 600 .env "$R"/secrets/* "$R/boltz/boltz.conf"
 # The swaps' server key: the guard's alone. The backend gets the extended

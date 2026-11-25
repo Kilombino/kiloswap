@@ -1,7 +1,7 @@
 # Kiloswap on the operator's host, next to the node and lnd it uses:
 #   - the BLAKE2b node (Knots) runs on the host; the backend reaches its
 #     RPC and ZMQ through the host's address with a whitelisted RPC user;
-#   - lnd is the operator's own (container "lnd-blake2b" on the external
+#   - lnd is the operator's own (its container, LND_HOST, on the external
 #     network lnd-net); the backend talks to it only with a macaroon that
 #     carries the "kiloswap" caveat, so lnd hands every call to the guard
 #     and refuses them all while the guard is down;
@@ -107,7 +107,7 @@ services:
       lnd: {}
       default: {}
     environment:
-      LND_GRPC: ${LND_HOST:-lnd-blake2b}:10009
+      LND_GRPC: ${LND_HOST:?set LND_HOST in .env}:10009
       GOMEMLIMIT: 100MiB
       LND_TLSCERT: /lnd/tls.cert
       LND_MACAROON: /lnd/kiloswap-guard.macaroon
@@ -167,7 +167,7 @@ services:
     restart: unless-stopped
     entrypoint: ["/bin/sh", "-c", "sed \"s/LND_HOST/$$LND_HOST/g\" /etc/lnd-proxy/nginx.conf > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf -g 'daemon off;'"]
     environment:
-      LND_HOST: ${LND_HOST:-lnd-blake2b}
+      LND_HOST: ${LND_HOST:?set LND_HOST in .env}
     tmpfs: [/tmp]
     networks: [lnd, internal]
     volumes:
