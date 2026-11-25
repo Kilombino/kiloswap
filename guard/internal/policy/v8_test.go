@@ -31,13 +31,13 @@ func TestV8MinReverse(t *testing.T) {
 // the lockup's own fee rate.
 func TestV8LockupCoverage(t *testing.T) {
 	e := newEnv(t)
-	e.chain.feeRate = 6
+	e.chain.feeRate = 5
 	r, _, _ := e.reverse(202, 1_000_000, 202) // pays 2000 sat over the lockup
 	q := sendReq(r)
-	q.SatPerByte = 7 // 266*7+330 = 2192 > 2000
+	q.SatPerByte = 6 // 293*6+330 = 2088 > 2000
 	_, err := e.call(sendURI, q)
 	mustRefuse(t, err, "a refund's")
-	q.SatPerByte = 6 // 1596+330 = 1926 <= 2000
+	q.SatPerByte = 5 // 293*5+330 = 1795 <= 2000
 	_, err = e.call(sendURI, q)
 	mustAllow(t, err)
 }

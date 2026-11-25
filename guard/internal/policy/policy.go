@@ -449,10 +449,12 @@ const (
 // lockup's own fee rate: the lockup transaction (LockupVbytes), a refund if
 // the user never claims (RefundVbytes) and RefundDustSat (the refund's
 // output and rounding). The backend charges the same as the reverse
-// "lockup" miner fee.
+// "lockup" miner fee. Sizes measured on regtest: the guard's refund is a
+// script-path spend of the timeout leaf, 138 vB (the submarine claim,
+// ClaimVbytes, 151 vB).
 const (
 	LockupVbytes  = 155
-	RefundVbytes  = 111
+	RefundVbytes  = 138
 	RefundDustSat = 330
 )
 
