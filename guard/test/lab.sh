@@ -172,9 +172,11 @@ for _ in $(seq 1 60); do r=$(curl -s http://127.0.0.1:29001/v2/swap/submarine ||
 [ "$r" != "{}" ] || { docker compose logs --tail 30 boltz >&2; bad "backend not up on the guarded macaroon"; exit 1; }
 ok "backend up on kiloswap.macaroon"
 signs=1
-for _ in $(seq 1 20); do docker compose logs boltz 2>&1 | grep -q "signing is the guard" && { signs=0; break; }; sleep 2; done
+for _ in $(seq 1 20); do [ "$(docker compose logs boltz 2>&1 | grep -c "signing is the guard" || true)" -gt 0 ] && { signs=0; break; }; sleep 2; done
 [ $signs -eq 0 ] && ok "backend: swap keys from the extended public key" || bad "backend still signs"
-if (cd "$LAB/src/swap/e2e" && NO_COOP=1 API=http://127.0.0.1:29001 RETENTION_STATE="$work/retention.json" \
+if [ -n "${SKIP_E2E:-}" ]; then
+	ok "e2e skipped (SKIP_E2E)"
+elif (cd "$LAB/src/swap/e2e" && NO_COOP=1 API=http://127.0.0.1:29001 RETENTION_STATE="$work/retention.json" \
 	node run.mjs ${E2E:-} big-reverse big-submarine refund-server-down claim-server-down reverse-timeout-refund 2>&1 | tee "$work/e2e.log") &&
 	[ "$(grep -c '^PASS' "$work/e2e.log")" -ge 5 ]; then
 	ok "e2e: $(grep -c '^PASS' "$work/e2e.log") scenarios passed with the guard on"
@@ -182,26 +184,30 @@ else
 	bad "e2e with the guard: $(grep -c '^FAIL' "$work/e2e.log") failed"; grep '^FAIL' "$work/e2e.log" | cut -c1-300 >&2 || true
 fi
 # the default scenario list again (run.mjs with names runs only those)
-if (cd "$LAB/src/swap/e2e" && NO_COOP=1 API=http://127.0.0.1:29001 RETENTION_STATE="$work/retention.json" \
+if [ -n "${SKIP_E2E:-}" ]; then
+	:
+elif (cd "$LAB/src/swap/e2e" && NO_COOP=1 API=http://127.0.0.1:29001 RETENTION_STATE="$work/retention.json" \
 	node run.mjs 2>&1 | tee "$work/e2e-all.log"); then
 	ok "e2e default list: $(grep -c '^PASS' "$work/e2e-all.log") passed"
 else
 	bad "e2e default list: $(grep -c '^FAIL' "$work/e2e-all.log") failed"; grep '^FAIL' "$work/e2e-all.log" | cut -c1-300 >&2 || true
 fi
-docker logs $GUARD 2>&1 | grep -E 'allowed|refused|claimed|refunded|settled' | sed 's/^/    guard: /' | tail -30
+{ docker logs $GUARD 2>&1 | grep -E 'allowed|refused|claimed|refunded|settled' | sed 's/^/    guard: /' | tail -30; } || true
 n_claim=$(docker logs $GUARD 2>&1 | grep -c '^.* claimed ' || true)
 n_refund=$(docker logs $GUARD 2>&1 | grep -c '^.* refunded ' || true)
-[ "$n_claim" -gt 0 ] && ok "the guard made $n_claim claims" || bad "the guard made no claim"
-[ "$n_refund" -gt 0 ] && ok "the guard made $n_refund refunds" || bad "the guard made no refund"
+if [ -z "${SKIP_E2E:-}" ]; then
+	[ "$n_claim" -gt 0 ] && ok "the guard made $n_claim claims" || bad "the guard made no claim"
+	[ "$n_refund" -gt 0 ] && ok "the guard made $n_refund refunds" || bad "the guard made no refund"
+fi
 
 start_guard
 log "a backend taken over: direct calls with its macaroon"
 addr=$(LU newaddress p2wkh | jq -r .address)
-refused "SendCoins to a random address" KS sendcoins --addr "$addr" --amt 100000 --force
+refused "SendCoins to a random address" KS sendcoins --addr "$addr" --amt 100000 --force --sat_per_vbyte 2
 refused "SendCoins send_all (sweep)" KS sendcoins --addr "$addr" --sweepall --force
 refused "SendCoins 2 BTC" KS sendcoins --addr "$addr" --amt 200000000 --force
 inv=$(LU addinvoice --amt 50000 | jq -r .payment_request)
-refused "pay a random invoice" KS payinvoice --pay_req "$inv" --force --fee_limit 100
+refused "pay a random invoice" KS payinvoice --pay_req "$inv" --force --fee_limit 100 --cltv_limit 40
 pre=$(openssl rand -hex 32); hash=$(printf %s "$pre" | xxd -r -p | sha256sum | cut -d' ' -f1)
 LS addholdinvoice "$hash" --amt 20000 >/dev/null
 refused "cancel another service's hold invoice" KS cancelinvoice "$hash"
@@ -217,27 +223,33 @@ refused "BakeMacaroon with a too-wide macaroon" WIDE bakemacaroon uri:/lnrpc.Lig
 # The backend writes its own database: a row it forged must not be enough
 fakepre=$(openssl rand -hex 32); fakehash=$(printf %s "$fakepre" | xxd -r -p | sha256sum | cut -d' ' -f1)
 psql -c "INSERT INTO \"reverseSwaps\" (id, version, pair, \"orderSide\", status, \"timeoutBlockHeight\", \"nodeId\", invoice, \"preimageHash\", \"invoiceAmount\", \"onchainAmount\", \"lockupAddress\", fee, \"createdAt\", \"updatedAt\") SELECT 'forged1', version, pair, \"orderSide\", 'invoice.pending', \"timeoutBlockHeight\", \"nodeId\", 'lnbcrtforged', '$fakehash', 150000, 150000, '$addr', 0, now(), now() FROM \"reverseSwaps\" LIMIT 1" >/dev/null
-refused "SendCoins to a forged reverse swap (no paid hold invoice in lnd)" KS sendcoins --addr "$addr" --amt 150000 --force
+refused "SendCoins to a forged reverse swap (no paid hold invoice in lnd)" KS sendcoins --addr "$addr" --amt 150000 --force --sat_per_vbyte 2
 inv2=$(LU addinvoice --amt 70000 | jq -r .payment_request)
 psql -c "INSERT INTO swaps (id, version, pair, \"orderSide\", status, \"preimageHash\", invoice, \"invoiceAmount\", \"expectedAmount\", \"onchainAmount\", \"lockupAddress\", \"lockupTransactionId\", \"timeoutBlockHeight\", \"createdRefundSignature\", \"createdAt\", \"updatedAt\") SELECT 'forged2', version, pair, \"orderSide\", 'transaction.confirmed', '$fakehash', '$inv2', 70000, 70000, 70000, '$addr', '$(openssl rand -hex 32)', \"timeoutBlockHeight\", false, now(), now() FROM swaps LIMIT 1" >/dev/null
-refused "pay the invoice of a forged submarine swap (no lockup on chain)" KS payinvoice --pay_req "$inv2" --force --fee_limit 121
+refused "pay the invoice of a forged submarine swap (no lockup on chain)" KS payinvoice --pay_req "$inv2" --force --fee_limit 121 --cltv_limit 40
 psql -c "DELETE FROM \"reverseSwaps\" WHERE id = 'forged1'; DELETE FROM swaps WHERE id = 'forged2'" >/dev/null
 log "the independent review's scenarios"
 # 1. the amount comes from the invoice: a 5 BTC invoice behind a forged row
 #    saying 1 sat, against an old confirmed transaction
 big5=$(LU addinvoice --amt 500000000 | jq -r .payment_request 2>/dev/null || true)
-oldtx=$(K getblock "$(K getblockhash 101)" | jq -r '.tx[0]')
+oldtx=$(K getblock "$(K getblockhash $(( $(K getblockcount) - 5 )))" | jq -r '.tx[0]')
 if [ -n "$big5" ]; then
 	psql -c "INSERT INTO swaps (id, version, pair, \"orderSide\", status, \"preimageHash\", invoice, \"invoiceAmount\", \"expectedAmount\", \"onchainAmount\", \"lockupAddress\", \"lockupTransactionId\", \"lockupTransactionVout\", \"keyIndex\", \"refundPublicKey\", \"timeoutBlockHeight\", \"createdRefundSignature\", \"createdAt\", \"updatedAt\") SELECT 'forged3', version, pair, \"orderSide\", 'transaction.confirmed', '$(LU decodepayreq "$big5" | jq -r .payment_hash)', '$big5', 1, 1, 1, '$addr', '$oldtx', 0, \"keyIndex\", \"refundPublicKey\", \"timeoutBlockHeight\", false, now(), now() FROM swaps WHERE version=1 LIMIT 1" >/dev/null
-	refused "pay a 5 BTC invoice behind a forged 1 sat row" KS payinvoice --pay_req "$big5" --force --fee_limit 121
+	refused "pay a 5 BTC invoice behind a forged 1 sat row" KS payinvoice --pay_req "$big5" --force --fee_limit 121 --cltv_limit 40
 	psql -c "DELETE FROM swaps WHERE id='forged3'" >/dev/null
 fi
+#    and within the per-operation limit: the old transaction's output is not
+#    the swap output the guard rebuilds with our claim key
+half=$(LU addinvoice --amt 50000000 | jq -r .payment_request)
+psql -c "INSERT INTO swaps (id, version, pair, \"orderSide\", status, \"preimageHash\", invoice, \"invoiceAmount\", \"expectedAmount\", \"onchainAmount\", \"lockupAddress\", \"lockupTransactionId\", \"lockupTransactionVout\", \"keyIndex\", \"refundPublicKey\", \"timeoutBlockHeight\", \"createdRefundSignature\", \"createdAt\", \"updatedAt\") SELECT 'forged5', version, pair, \"orderSide\", 'transaction.confirmed', '$(LU decodepayreq "$half" | jq -r .payment_hash)', '$half', 1, 1, 1, '$addr', '$oldtx', 0, \"keyIndex\", \"refundPublicKey\", $(( $(K getblockcount) + 500 )), false, now(), now() FROM swaps WHERE version=1 LIMIT 1" >/dev/null
+refused "pay 0.5 BTC against a lockup that is not our swap output" KS payinvoice --pay_req "$half" --force --fee_limit 5000 --cltv_limit 40
+psql -c "DELETE FROM swaps WHERE id='forged5'" >/dev/null
 # 3. a hold invoice created elsewhere, paid and held, does not unlock a send
 fpre=$(openssl rand -hex 32); fhash=$(printf %s "$fpre" | xxd -r -p | sha256sum | cut -d' ' -f1)
 finv=$(LS addholdinvoice "$fhash" --amt 150000 | jq -r .payment_request)
 ( LU payinvoice --pay_req "$finv" --force >/dev/null 2>&1 & )
 for _ in $(seq 1 30); do [ "$(LS lookupinvoice "$fhash" | jq -r .state)" = ACCEPTED ] && break; sleep 1; done
-psql -c "INSERT INTO \"reverseSwaps\" (id, version, pair, \"orderSide\", status, \"timeoutBlockHeight\", \"nodeId\", invoice, \"preimageHash\", \"invoiceAmount\", \"onchainAmount\", \"lockupAddress\", \"keyIndex\", \"claimPublicKey\", fee, \"createdAt\", \"updatedAt\") SELECT 'forged4', 1, pair, \"orderSide\", 'invoice.pending', \"timeoutBlockHeight\", \"nodeId\", '$finv', '$fhash', 150000, 140000, '$addr', \"keyIndex\", \"claimPublicKey\", 0, now(), now() FROM \"reverseSwaps\" WHERE version=1 LIMIT 1" >/dev/null
+psql -c "INSERT INTO \"reverseSwaps\" (id, version, pair, \"orderSide\", status, \"timeoutBlockHeight\", \"nodeId\", invoice, \"preimageHash\", \"invoiceAmount\", \"onchainAmount\", \"lockupAddress\", \"keyIndex\", \"claimPublicKey\", fee, \"createdAt\", \"updatedAt\") SELECT 'forged4', 1, pair, \"orderSide\", 'invoice.pending', $(( $(K getblockcount) + 144 )), \"nodeId\", '$finv', '$fhash', 150000, 140000, '$addr', \"keyIndex\", \"claimPublicKey\", 0, now(), now() FROM \"reverseSwaps\" WHERE version=1 LIMIT 1" >/dev/null
 refused "SendCoins backed by a foreign hold invoice paid and held" KS sendcoins --addr "$addr" --amt 140000 --force --sat_per_vbyte 2
 psql -c "DELETE FROM \"reverseSwaps\" WHERE id='forged4'" >/dev/null
 # 4. that foreign hold invoice cannot be cancelled or settled, nor claimed as
