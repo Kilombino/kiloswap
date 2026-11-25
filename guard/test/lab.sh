@@ -323,8 +323,8 @@ for i in 1 2 3; do
 	docker compose stop boltz >/dev/null 2>&1
 	( timeout 120 docker compose exec -T lnd-user lncli --network=regtest payinvoice --force "$inv" >/dev/null 2>&1 & )
 	for _ in $(seq 1 30); do [ "$(LS lookupinvoice "$ph" | jq -r .state)" = ACCEPTED ] && break; sleep 1; done
-	( KS cancelinvoice "$ph" >"$work/c$i" 2>&1; echo $? >"$work/cx$i" ) &
-	( KS sendcoins --addr "$la" --amt "$oa" --sat_per_vbyte 1 --force >"$work/s$i" 2>&1; echo $? >"$work/sx$i" ) &
+	( if KS cancelinvoice "$ph" >"$work/c$i" 2>&1; then echo 0; else echo 1; fi >"$work/cx$i" ) &
+	( if KS sendcoins --addr "$la" --amt "$oa" --sat_per_vbyte 1 --force >"$work/s$i" 2>&1; then echo 0; else echo 1; fi >"$work/sx$i" ) &
 	wait
 	c=$(cat "$work/cx$i"); sx=$(cat "$work/sx$i"); st=$(LS lookupinvoice "$ph" | jq -r .state)
 	if [ "$c" = 0 ] && [ "$sx" = 0 ]; then bad "race $i: both the cancel and the lockup went through"
