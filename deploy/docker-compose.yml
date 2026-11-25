@@ -133,8 +133,10 @@ services:
       MAX_UNRESOLVED: ${MAX_UNRESOLVED:-2}
       MIN_REVERSE_SAT: ${MIN_REVERSE_SAT:-10000}
       MAX_LOCKUPS_PER_BLOCK: ${MAX_LOCKUPS_PER_BLOCK:-2}
-      # the routing-fee cap stays off until Kilombino decides (see RUNBOOK)
-      ROUTING_CAP: ${ROUTING_CAP:-0}
+      # routing paid from the lockup's surplus, 10 sat floor (option A)
+      ROUTING_CAP: ${ROUTING_CAP:-1}
+      ROUTING_FLOOR_SAT: ${ROUTING_FLOOR_SAT:-10}
+      MIN_FEE_SAT: ${MIN_FEE_SAT:-10}
       FEE_RATIO: ${FEE_RATIO:-0.0001}
       REQUIRED_CONFS: ${REQUIRED_CONFS:-3}
       HOLD_EXPIRY_DELTA: "18"

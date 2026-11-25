@@ -179,6 +179,26 @@ func TestV8RoutingCapFlag(t *testing.T) {
 	if q.FeeLimitMsat != 110_000 {
 		t.Fatalf("floor: %d msat", q.FeeLimitMsat)
 	}
+	// a limit far over the cap is lowered, not refused
+	inv, _, _ = e.submarine(227, 100_000, 100_400, 227)
+	q5 := payReq(inv)
+	q5.FeeLimitSat = 5000
+	id, err = e.call(payURI, q5)
+	mustAllow(t, err)
+	_ = proto.Unmarshal(e.p.Replacement(id), &q)
+	if q.FeeLimitMsat != 110_000 || q.FeeLimitSat != 0 {
+		t.Fatalf("5000 sat asked: replaced with %d msat", q.FeeLimitMsat)
+	}
+	// and a payment that then fails gives its caps back only on lnd's FAILED
+	e.answer(id, &lnrpc.Payment{Status: paymentInFlight}, false)
+	x := e.p.Ledger.Payments[e.swaps.swaps[inv].PreimageHash]
+	if x.State != PayInflight {
+		t.Fatalf("state %s", x.State)
+	}
+	e.answer(id, nil, true) // the stream ends: unknown, nothing released
+	if x.State != PayUnknown || e.p.Ledger.Outpoints[x.LockupTx+":0"] == "" {
+		t.Fatalf("released without lnd's FAILED: %s", x.State)
+	}
 	_ = time.Second
 	_ = swapscript.Reverse
 }

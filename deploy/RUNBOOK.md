@@ -43,9 +43,13 @@ datos en `${KILOSWAP_ROOT}`.
    límites en vigor: comprobar ese aviso tras cada despliegue.
    Swaps inversos desde 10000 sat (`MIN_REVERSE_SAT`, igual que
    `minSwapAmount` del backend) y 2 depósitos por bloque como mucho
-   (`MAX_LOCKUPS_PER_BLOCK`). El tope de comisión de enrutado
-   (`ROUTING_CAP=1`, con `ROUTING_FLOOR_SAT`) está preparado pero
-   **apagado** hasta que Kilombino decida cómo cubrir el suelo de 121 sat.
+   (`MAX_LOCKUPS_PER_BLOCK`). Comisión de enrutado (opción A, decidida por
+   Kilombino el 25 nov 2026): el guardián reescribe el límite de cada pago
+   a `min(FEE_RATIO × factura, max(sobrante del depósito − cobro, 10 sat))`
+   (`ROUTING_CAP=1`, `ROUTING_FLOOR_SAT=10`, `MIN_FEE_SAT=10`; el backend
+   usa el mismo suelo de 10 sat). Si no hay ruta dentro de ese límite el
+   pago falla, el swap queda en `invoice.failedToPay` y el usuario
+   recupera su depósito tras el timeout.
 4. **Cartera vacía del backend en el nodo**, en caliente:
    `bitcoin-cli createwallet kiloswap-empty true true`
    (sin claves y en blanco, solo para los caminos raros del backend).

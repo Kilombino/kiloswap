@@ -70,6 +70,7 @@ log "guard binary"
 ( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/kiloswap-guard" ./cmd/kiloswap-guard )
 ( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/bigreq" ./test/bigreq )
 ( cd "$here" && CGO_ENABLED=0 go build -trimpath -o "$work/slowloris" ./test/slowloris )
+( cd "$here/test/hintinv" && CGO_ENABLED=0 go build -trimpath -o "$work/hintinv" . )
 ok "built"
 
 log "macaroons"
@@ -408,7 +409,7 @@ upaddr=$(tr '[:lower:]' '[:upper:]' <<<"$addr")
 refused "SendCoins to an uppercase (non-canonical) address" KS sendcoins --addr "$upaddr" --amt 100000 --sat_per_vbyte 1 --force
 refused "the whole wallet history (from height 0, unbounded)" KS listchaintxns --start_height 0
 tip=$(K getblockcount)
-allowed "a recent page of the wallet history" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 50
+allowed "a recent page of the wallet history" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 7
 nh=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
 allowed "a hold invoice (memo of its own)" KS addholdinvoice "$nh" --amt 20000 --expiry 3600 --memo backend-memo
 memo=$(LS lookupinvoice "$nh" | jq -r .memo)
@@ -424,7 +425,7 @@ shimcode() { docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/
 log "the seventh review: canonical SendCoins, pages of 50, the shim's strict parameters and caps"
 refused "SendCoins with a 200-character label (lnd would refuse it after approval)" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 1 --label "$(printf 'x%.0s' $(seq 200))" --force
 refused "SendCoins with min_confs 1000" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 1 --min_confs 1000 --force
-refused "a wallet history page of 51" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 51
+refused "a wallet history page of 8 (raw hex could pass 8 MiB)" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 8
 fh=$(openssl rand -hex 32)
 LS addinvoice --amt 1000 --preimage "$fh" --memo bridge >/dev/null 2>&1 || true
 fhash=$(printf '%s' "$fh" | xxd -r -p | sha256sum | cut -d' ' -f1)
@@ -436,8 +437,10 @@ bh=$(K getbestblockhash)
 [ "$(shimcode / '{"id":1,"method":"getblock","params":["'"$bh"'",1]}')" = 200 ] && ok "the shim answers getblock verbosity 1" || bad "the shim refused getblock verbosity 1"
 b10="[$(for i in $(seq 10); do printf '{"method":"getblock","params":["%s",0]},' "$bh"; done | sed 's/,$//')]"
 b11="[$(for i in $(seq 11); do printf '{"method":"getblock","params":["%s",0]},' "$bh"; done | sed 's/,$//')]"
-[ "$(shimcode / "$b10")" = 200 ] && ok "the shim answers a batch of 10 raw blocks (the sidecar's rescan)" || bad "the shim refused 10 raw blocks"
+b3="[$(for i in $(seq 3); do printf '{"method":"getblock","params":["%s",0]},' "$bh"; done | sed 's/,$//')]"
+[ "$(shimcode / "$b3")" = 200 ] && ok "the shim answers a batch of 3 raw blocks (the sidecar's rescan)" || bad "the shim refused 3 raw blocks"
 [ "$(shimcode / "$b11")" = 400 ] && ok "the shim refuses 11 whole blocks in one batch" || bad "the shim took 11 blocks"
+[ "$(shimcode / "$b10")" = 400 ] && ok "the shim refuses 10 whole blocks in one batch (at most 4)" || bad "the shim took 10 blocks"
 knots=$(docker compose ps -q knots)
 rss() { docker stats --no-stream --format '{{.MemUsage}}' "$knots" | cut -d/ -f1 | tr -d ' '; }
 heavy="[$(for i in $(seq 100); do printf '{"method":"getblock","params":["%s",2]},' "$bh"; done | sed 's/,$//')]"
@@ -446,6 +449,121 @@ codes=""
 for i in $(seq 20); do codes+="$(shimcode / "$heavy") "; done
 r1=$(rss)
 [ -z "$(tr -d '4 0' <<<"$codes")" ] && ok "20 batches of 100x getblock verbosity 2 refused before the node (knots RSS $r0 -> $r1)" || bad "heavy batches reached the node: $codes (RSS $r0 -> $r1)"
+
+log "the eighth review: tiny reverse swaps, lockup coverage, lockups per block, big transactions through the shim, ZMQ"
+h8=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
+refused "a 330 sat hold invoice (under the 10000 sat reverse minimum)" KS addholdinvoice "$h8" --amt 330 --expiry 3600
+refused "a 330 sat lockup" KS sendcoins --addr "$addr" --amt 330 --sat_per_vbyte 1 --force
+sw8=$(curl -s -X POST http://127.0.0.1:29001/v2/swap/reverse -H 'content-type: application/json' -d '{"from":"BTC","to":"BTC","invoiceAmount":330,"preimageHash":"'"$h8"'","claimPublicKey":"02'"$(openssl rand -hex 32)"'"}')
+grep -qi "minimal\|minimum\|less than" <<<"$sw8" && ok "the backend refuses a 330 sat reverse swap: ${sw8:0:100}" || bad "330 sat reverse swap: ${sw8:0:200}"
+# a griefing loop: reverse swaps paid and never claimed, every lockup asked
+# in the same block; the backend stopped so only the backend's macaroon acts
+sent8=0; refused8=0; why8=""
+# the e2e part's big swaps fill the launch daily limit: raised for the loop
+start_guard -e DAILY_SAT=10000000000
+K generatetoaddress 1 "$(K getnewaddress)" >/dev/null # a fresh height for the loop
+mk8() {
+	pre=$(openssl rand -hex 32); ph=$(printf %s "$pre" | xxd -r -p | sha256sum | cut -d' ' -f1)
+	cpk=$(openssl ecparam -name secp256k1 -genkey 2>/dev/null | openssl ec -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | xxd -p -c 99)
+	docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1
+	for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done
+	sw=$(curl -s -X POST http://127.0.0.1:29001/v2/swap/reverse -H 'content-type: application/json' \
+		-d "{\"from\":\"BTC\",\"to\":\"BTC\",\"invoiceAmount\":20000,\"preimageHash\":\"$ph\",\"claimPublicKey\":\"$cpk\"}")
+	docker compose stop boltz >/dev/null 2>&1
+	inv=$(jq -r .invoice <<<"$sw"); la=$(jq -r .lockupAddress <<<"$sw"); oa=$(jq -r .onchainAmount <<<"$sw")
+	( timeout 120 docker compose exec -T lnd-user lncli --network=regtest payinvoice --force "$inv" >/dev/null 2>&1 & )
+	for _ in $(seq 1 30); do [ "$(LS lookupinvoice "$ph" | jq -r .state)" = ACCEPTED ] && break; sleep 1; done
+}
+mk8; la1=$la; oa1=$oa
+refused "a lockup at 2 sat/vB when the swap was charged at 1 (hold does not cover the lockup and a refund)" KS sendcoins --addr "$la1" --amt "$oa1" --sat_per_vbyte 2 --force
+for i in 1 2 3; do
+	[ "$i" = 1 ] || mk8
+	[ "$i" = 1 ] && { la=$la1; oa=$oa1; }
+	if out=$(KS sendcoins --addr "$la" --amt "$oa" --sat_per_vbyte 1 --force 2>&1); then sent8=$((sent8 + 1)); else
+		grep -q "a block" <<<"$out" && refused8=$((refused8 + 1)); why8+="[$i: $(grep -o -E 'kiloswap guard: [^"]*' <<<"$out" | head -1 | cut -c1-140)${out:0:80}] "; fi
+done
+[ "$sent8" = 2 ] && [ "$refused8" = 1 ] && ok "a loop of 3 never-claimed reverse swaps in one block: 2 lockups, the third refused (at most 2 a block)" || bad "lockups per block: sent $sent8, refused $refused8: $why8"
+start_guard
+K generatetoaddress 1 "$(K getnewaddress)" >/dev/null
+docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1
+for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done
+# a big transaction (2000 outputs) and batches of it through the shim
+outs=$(docker compose exec -T knots sh -c 'for i in $(seq 2000); do printf "\"%s\":0.0001," "$(bitcoin-cli -regtest -rpcuser=lab -rpcpassword=lab getnewaddress)"; done' | sed 's/,$//')
+bigtx=$(K -named sendmany amounts="{$outs}" fee_rate=1 2>/dev/null || true)
+K generatetoaddress 1 "$(K getnewaddress)" >/dev/null
+if [ -n "$bigtx" ]; then
+	size=$(K gettransaction "$bigtx" | jq -r .hex | wc -c)
+	t10="[$(for i in $(seq 10); do printf '{"method":"getrawtransaction","params":["%s"]},' "$bigtx"; done | sed 's/,$//')]"
+	t11="[$(for i in $(seq 11); do printf '{"method":"getrawtransaction","params":["%s"]},' "$bigtx"; done | sed 's/,$//')]"
+	tv="[$(for i in $(seq 100); do printf '{"method":"getrawtransaction","params":["%s",1]},' "$bigtx"; done | sed 's/,$//')]"
+	[ "$(shimcode / "$t10")" = 200 ] && ok "the shim answers 10 raw copies of a $((size / 2)) byte transaction" || bad "10 raw txs refused"
+	[ "$(shimcode / "$t11")" = 400 ] && ok "the shim refuses 11 raw transactions in one batch" || bad "11 raw txs taken"
+	[ "$(shimcode / '{"id":1,"method":"getrawtransaction","params":["'"$bigtx"'",1]}')" = 200 ] && ok "the shim answers one verbose copy of it" || bad "one verbose big tx refused"
+	r0=$(rss); codes=""
+	for i in $(seq 10); do codes+="$(shimcode / "$tv") "; done
+	r1=$(rss)
+	[ -z "$(tr -d '4 0' <<<"$codes")" ] && ok "10 batches of 100 verbose copies refused by the shim (knots RSS $r0 -> $r1)" || bad "verbose batches: $codes"
+	bb=$(K gettransaction "$bigtx" | jq -r .blockhash)
+	tvk="[$(for i in $(seq 100); do printf '{"method":"getrawtransaction","params":["%s",1,"%s"]},' "$bigtx" "$bb"; done | sed 's/,$//')]"
+	printf '%s' "$tvk" > "$work/tv.json"
+	r2=$(rss)
+	for i in $(seq 10); do docker run --rm -i --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null -u lab:lab -H 'content-type: application/json' --data-binary @- http://knots:18443/ <"$work/tv.json"; done
+	r3=$(rss)
+	ok "for comparison, the same 10 batches straight to knots: RSS $r2 -> $r3 (each answer ~$(docker run --rm -i --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null -w '%{size_download}' -u lab:lab -H 'content-type: application/json' --data-binary @- http://knots:18443/ <"$work/tv.json") bytes)"
+	shimrss=$(docker stats --no-stream --format '{{.MemUsage}}' "$(docker compose ps -q shim)" | cut -d/ -f1)
+	ok "shim memory after all of it: $shimrss (limit 256 MB)"
+else
+	bad "could not make the big transaction"
+fi
+hwm=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -u lab:lab -H 'content-type: application/json' -d '{"id":1,"method":"getzmqnotifications","params":[]}' http://shim:8332/ | jq -c '[.result[].hwm]' || true)
+[ "$hwm" = "[20,20]" ] && ok "knots queues at most 20 ZMQ messages per socket ($hwm)" || bad "zmq hwm: $hwm"
+
+log "option A: the routing fee paid from the lockup's surplus (10 sat floor), rewritten by the guard"
+# an attacker's invoice: the payment must go through their node (a route
+# hint through lnd-user, a 60 sat fee) to a key of theirs
+upk=$(LU getinfo | jq -r .identity_pubkey)
+subswap() { # invoice -> creates the swap and pays its lockup; the backend pays once it is confirmed
+	local cpk sw
+	cpk=$(openssl ecparam -name secp256k1 -genkey 2>/dev/null | openssl ec -pubout -conv_form compressed -outform DER 2>/dev/null | tail -c 33 | xxd -p -c 99)
+	sw=$(curl -s -X POST http://127.0.0.1:29001/v2/swap/submarine -H 'content-type: application/json' \
+		-d "{\"from\":\"BTC\",\"to\":\"BTC\",\"invoice\":\"$1\",\"refundPublicKey\":\"$cpk\"}")
+	sid=$(jq -r .id <<<"$sw"); sad=$(jq -r .address <<<"$sw"); samt=$(jq -r .expectedAmount <<<"$sw")
+	[ "$sid" != null ] || { echo "no swap: ${sw:0:200}" >&2; return 1; }
+	K sendtoaddress "$sad" "$(awk "BEGIN{printf \"%.8f\", $samt/1e8}")" >/dev/null
+	sleep 3
+	K generatetoaddress 3 "$(K getnewaddress)" >/dev/null
+	for _ in $(seq 1 30); do
+		curl -s "http://127.0.0.1:29001/v2/swap/$sid" | grep -q -E 'invoice.pending|invoice.failedToPay|transaction.claim' && break; sleep 2
+	done
+	sleep 10
+}
+paystate() { LS listpayments --include_incomplete | jq -c --arg h "$1" '[.payments[] | select(.payment_hash == $h)] | last | {status, failure_reason, htlcs: (.htlcs | length)}'; }
+upb() { docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1; for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done; }
+read -r inv1 ph1 < <("$work/hintinv" 20000 "$upk" 60000 0 | paste -sd' ')
+if subswap "$inv1"; then
+	stb=$(paystate "$ph1")
+	grep -q '"htlcs":0' <<<"$stb" && ok "the backend's own payment through the 60 sat hop: nothing sent ($stb)" || bad "backend payment through the attacker's hop: $stb"
+	# the backend taken over asks a 5000 sat limit: the guard lowers it
+	docker compose stop boltz >/dev/null 2>&1
+	KS payinvoice --pay_req "$inv1" --force --fee_limit 5000 --cltv_limit 40 >"$work/r1" 2>&1 || true
+	st1=$(paystate "$ph1")
+	grep -q '"status":"FAILED"' <<<"$st1" && grep -q '"htlcs":0' <<<"$st1" && grep -q NO_ROUTE <<<"$st1" \
+		&& ok "a 5000 sat fee limit through the attacker's 60 sat hop: lowered by the guard, no route, nothing sent ($st1)" \
+		|| bad "attacker route: $st1 $(head -c 200 "$work/r1")"
+	upb
+	for _ in $(seq 1 6); do K generatetoaddress 1 "$(K getnewaddress)" >/dev/null; sleep 6; done
+	sst=$(curl -s "http://127.0.0.1:29001/v2/swap/$sid")
+	grep -q "invoice.failedToPay" <<<"$sst" && grep -q "routing fee limit" <<<"$sst" \
+		&& ok "the backend gives the swap up cleanly: $(jq -c . <<<"$sst" | cut -c1-200)" || bad "backend after no route: ${sst:0:240}"
+	docker logs $GUARD 2>&1 | grep -q 'payment_failed' && ok "the guard released the payment on lnd's FAILED" || bad "no payment_failed in the guard's log"
+else bad "attacker swap not created"; upb; fi
+# a free hop is tried within the same rewritten limit (its fake end fails it)
+read -r inv2 ph2 < <("$work/hintinv" 20000 "$upk" 0 0 | paste -sd' ')
+if subswap "$inv2"; then
+	st2=$(paystate "$ph2")
+	[ -n "$st2" ] && ! grep -q '"htlcs":0' <<<"$st2" && [ "$st2" != null ] \
+		&& ok "a free hop is tried within the rewritten limit: $st2" || bad "the cheap route was not tried: $st2"
+else bad "cheap swap not created"; fi
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null

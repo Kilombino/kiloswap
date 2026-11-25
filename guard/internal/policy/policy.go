@@ -1016,7 +1016,7 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 		}
 		feeMsat = r.FeeLimitSat * 1000
 	}
-	if feeMsat > maxFeeMsat+999 { // the backend rounds up to whole sat
+	if !p.RoutingCap && feeMsat > maxFeeMsat+999 { // the backend rounds up to whole sat
 		return refuse("routing fee limit %d msat over %d msat", feeMsat, maxFeeMsat)
 	}
 	if p.MaxSubTimeoutBlocks > 0 && s.Timeout-height > p.MaxSubTimeoutBlocks {
@@ -1024,14 +1024,26 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	}
 	if p.RoutingCap {
 		// routing paid out of what the lockup brings over the invoice and
-		// the claim (never under the floor, never over FeeRatio)
+		// the claim (never under the floor, never over FeeRatio): the
+		// backend's request is rewritten to that limit (a larger one is
+		// lowered, never refused; lnd then finds a route within it or fails
+		// the payment, and the user refunds after the timeout)
 		capMsat := min(maxFeeMsat, max((o.Sat-cover)*1000, p.RoutingFloorSat*1000))
-		if feeMsat > capMsat {
+		if feeMsat > capMsat || r.FeeLimitSat != 0 {
 			repl := proto.Clone(r).(*lnrpc.SendPaymentRequest)
-			repl.FeeLimitSat, repl.FeeLimitMsat = 0, capMsat
+			repl.FeeLimitSat, repl.FeeLimitMsat = 0, min(feeMsat, capMsat)
 			b, err := proto.Marshal(repl)
 			if err != nil {
-				return refuse("replacing the fee limit: %v", err)
+				return refuse("the request cannot be rewritten safely: %v", err)
+			}
+			// what lnd will run must be exactly the judged request with
+			// only the fee limit lowered: checked before it is sent
+			var back lnrpc.SendPaymentRequest
+			if proto.Unmarshal(b, &back) != nil || back.FeeLimitMsat != repl.FeeLimitMsat || back.FeeLimitSat != 0 ||
+				back.PaymentRequest != r.PaymentRequest || back.CltvLimit != r.CltvLimit || back.TimeoutSeconds != r.TimeoutSeconds ||
+				back.MaxParts != r.MaxParts || back.Amt != 0 || back.AmtMsat != 0 || len(back.OutgoingChanIds) != 0 ||
+				len(back.LastHopPubkey) != 0 || len(back.RouteHints) != 0 || len(back.Dest) != 0 {
+				return refuse("the request cannot be rewritten safely")
 			}
 			p.setReplacement(requestID, b)
 		}
