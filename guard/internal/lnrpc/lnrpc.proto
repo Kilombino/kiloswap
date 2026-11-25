@@ -111,6 +111,7 @@ message PaymentHash {
 
 // Only what the guard reads of an invoice; the rest is skipped.
 message Invoice {
+    string memo = 1;
     bytes r_hash = 4;
     int64 value = 5;
     int64 creation_date = 7;

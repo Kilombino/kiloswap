@@ -200,6 +200,15 @@ if (ALERT_PORT) {
         settled: () => `💰 Kiloswap: factura liquidada ${sat(j.sat)} sats (swap ${j.swap})`,
         guard_claim_failed: () => `🚨 Kiloswap: el guardián no ha podido cobrar (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
         guard_lockup_error: () => `🚨 Kiloswap: depósito con problemas (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
+        lockup_allowed: () => `🟢 Kiloswap: depósito permitido ${sat(j.sat)} sats (swap ${j.swap})`,
+        payment_allowed: () => `🟢 Kiloswap: pago permitido ${sat(j.sat)} sats (swap ${j.swap})`,
+        lockup_dropped: () => `⚠️ Kiloswap: aprobación de depósito retirada (swap ${j.swap})`,
+        guard_lockup_stuck: () => `🚨 Kiloswap: depósito atascado ${j.blocks} bloques (swap ${j.swap})`,
+        guard_lockup_expired: () => `ℹ️ Kiloswap: depósito nunca enviado, liberado tras comprobarlo en la cadena (swap ${j.swap})`,
+        guard_hold_canceled: () => `✂️ Kiloswap: factura retenida cancelada por demasiadas partes (${j.htlcs} HTLC)`,
+        guard_ledger_error: () => `🚨 Kiloswap: el guardián no puede escribir su registro: ${String(j.error).slice(0, 200)}`,
+        guard_stall: () => `🐢 Kiloswap: el guardián rechazó por lentitud: ${String(j.reason).slice(0, 200)}`,
+        guard_registered: () => `✅ Kiloswap: el guardián se ha registrado en lnd`,
         guard_started: () => `🔄 Kiloswap: el guardián se ha (re)iniciado`,
         guard_stream_ended: () => `⚠️ Kiloswap: el guardián perdió su conexión con lnd (se vuelve a registrar solo)`,
         claim_bumped: () => `⏫ Kiloswap: cobro sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
@@ -208,6 +217,11 @@ if (ALERT_PORT) {
         refund_confirmed: () => `✔️ Kiloswap: reembolso confirmado (swap ${j.swap})`,
       };
       if (j.event === 'guard_alive' || j.event === 'guard_registered') { lastAlive = Date.now(); if (j.event === 'guard_alive') return; }
+      if (j.event === 'guard_stall' || j.event === 'lockup_allowed' || j.event === 'payment_allowed') {
+        // frequent: at most a few a minute, like refusals
+        const now = Date.now(); burst = now - last < 60_000 ? burst + 1 : 0; last = now;
+        if (burst > 5) return;
+      }
       if (moves[j.event]) { try { await send(moves[j.event]()); } catch { /* next one */ } return; }
       if (j.event !== 'guard_refusal') return;
       const now = Date.now(); burst = now - last < 60_000 ? burst + 1 : 0; last = now;

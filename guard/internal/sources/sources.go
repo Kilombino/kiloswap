@@ -134,7 +134,8 @@ func (l LN) WalletOwns(ctx context.Context, txid string, height int64) (bool, er
 // WalletPaid finds, among ALL of lnd's own wallet transactions from
 // startHeight on (unconfirmed too, every page), one paying sat to address:
 // lnd's own truth about whether it sent a lockup.
-func (l LN) WalletPaid(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, bool, error) {
+func (l LN) WalletPaid(ctx context.Context, pkScript []byte, sat int64, startHeight int64) (string, uint32, int64, bool, error) {
+	want := hex.EncodeToString(pkScript)
 	var offset uint32
 	for page := 0; page < 200; page++ {
 		cctx, cancel := call(ctx)
@@ -150,7 +151,8 @@ func (l LN) WalletPaid(ctx context.Context, address string, sat int64, startHeig
 				continue
 			}
 			for _, o := range t.OutputDetails {
-				if !o.IsOurAddress && o.Address == address && o.Amount == sat {
+				// by script, never by address string (case, encodings)
+				if !o.IsOurAddress && strings.EqualFold(o.PkScript, want) && o.Amount == sat {
 					return t.TxHash, uint32(o.OutputIndex), int64(t.NumConfirmations), true, nil
 				}
 			}
@@ -173,7 +175,7 @@ func (l LN) LookupInvoice(ctx context.Context, hash []byte) (*policy.InvoiceInfo
 		}
 		return nil, err
 	}
-	info := &policy.InvoiceInfo{State: r.State, PaidMsat: r.AmtPaidMsat, ValueMsat: r.ValueMsat, Created: time.Unix(r.CreationDate, 0)}
+	info := &policy.InvoiceInfo{Memo: r.Memo, State: r.State, PaidMsat: r.AmtPaidMsat, ValueMsat: r.ValueMsat, Created: time.Unix(r.CreationDate, 0)}
 	if info.ValueMsat == 0 {
 		info.ValueMsat = r.Value * 1000
 	}

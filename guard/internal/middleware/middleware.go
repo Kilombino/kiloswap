@@ -170,6 +170,7 @@ type Judge interface {
 	Answered(requestID uint64, m *lnrpc.RPCMessage)
 	Stall(why string)
 	Forget(requestID uint64)
+	Replacement(requestID uint64) []byte
 }
 
 func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger *log.Logger) *lnrpc.InterceptFeedback {
@@ -202,8 +203,13 @@ func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger
 		if err != nil {
 			feedback.Error = err.Error()
 			logger.Printf("refused %s: %v", t.Request.GetMethodFullUri(), err)
-		} else if j := policy.Allowed[t.Request.GetMethodFullUri()]; j {
-			logger.Printf("allowed %s (request %d)", t.Request.GetMethodFullUri(), req.RequestId)
+		} else {
+			if j := policy.Allowed[t.Request.GetMethodFullUri()]; j {
+				logger.Printf("allowed %s (request %d)", t.Request.GetMethodFullUri(), req.RequestId)
+			}
+			if b := p.Replacement(req.RequestId); b != nil {
+				feedback.ReplaceResponse, feedback.ReplacementSerialized = true, b
+			}
 		}
 	case *lnrpc.RPCMiddlewareRequest_Response:
 		p.Answered(req.RequestId, t.Response)

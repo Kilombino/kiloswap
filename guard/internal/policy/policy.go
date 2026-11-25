@@ -43,6 +43,7 @@ package policy
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -126,6 +127,7 @@ type Swap struct {
 
 // InvoiceInfo is lnd's own record of an invoice.
 type InvoiceInfo struct {
+	Memo      string
 	State     int32
 	PaidMsat  int64
 	ValueMsat int64
@@ -157,7 +159,7 @@ type Lightning interface {
 	WalletOwns(ctx context.Context, txid string, height int64) (bool, error)
 	// WalletPaid finds among all of lnd's wallet transactions from
 	// startHeight on (unconfirmed too) one paying sat to address.
-	WalletPaid(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, bool, error)
+	WalletPaid(ctx context.Context, pkScript []byte, sat int64, startHeight int64) (string, uint32, int64, bool, error)
 }
 
 // Output is one transaction output as the node sees it.
@@ -308,6 +310,7 @@ type Policy struct {
 	calls       map[string][]time.Time
 	lastSaveErr string
 	confCache   map[string]confAt
+	replace     map[uint64][]byte
 }
 
 // ConfTier is one step of ConfTiers.
@@ -461,6 +464,11 @@ func (p *Policy) intercept(ctx context.Context, condition string, requestID uint
 	}
 	if lim, heavy := heavyCalls[uri]; heavy && !p.rate(uri, lim) {
 		return refuse("%s more than %d times a minute", uri, lim)
+	}
+	if uri == "/lnrpc.Lightning/GetTransactions" {
+		if err := p.judgeGetTransactions(ctx, m); err != nil {
+			return err
+		}
 	}
 	if uri == "/lnrpc.Lightning/NewAddress" && !p.rateWindow(uri, 30, time.Hour) {
 		return refuse("NewAddress more than 30 times an hour")
@@ -655,6 +663,9 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 			return refuse("fee rate %.0f sat/vB under %.0f (the node's estimate)", rate, floor)
 		}
 	}
+	if r.Addr != strings.ToLower(r.Addr) {
+		return refuse("only lowercase (canonical) addresses")
+	}
 	want, err := p.addrScript(r.Addr)
 	if err != nil {
 		return refuse("unreadable address: %v", err)
@@ -686,6 +697,9 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 func (p *Policy) checkReverse(ctx context.Context, s ReverseSwap, want []byte, height int64) (*Lockup, error) {
 	if s.Version != 1 {
 		return nil, refuse("only taproot swaps")
+	}
+	if s.LockupAddress != strings.ToLower(s.LockupAddress) {
+		return nil, refuse("the swap's lockup address is not canonical (lowercase)")
 	}
 	hash, err := hex.DecodeString(s.PreimageHash)
 	if err != nil || len(hash) != 32 {
@@ -1031,7 +1045,19 @@ func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHold
 	}
 	// recorded before lnd is told yes: an answer lost on the way (a stream
 	// reset) leaves the hold known, and closeHolds settles it from lnd
-	p.Ledger.Holds[hh] = &Hold{Sat: sat, At: p.now(), State: HoldCreating}
+	// a nonce of the guard's in the invoice's memo (the request is replaced
+	// with it): only an invoice carrying it can ever be taken for this hold
+	nonce := make([]byte, 8)
+	_, _ = rand.Read(nonce)
+	memo := "kiloswap " + hex.EncodeToString(nonce)
+	repl := proto.Clone(r).(*lnrpc.AddHoldInvoiceRequest)
+	repl.Memo = memo
+	b, err := proto.Marshal(repl)
+	if err != nil {
+		return refuse("replacing the memo: %v", err)
+	}
+	p.setReplacement(requestID, b)
+	p.Ledger.Holds[hh] = &Hold{Sat: sat, At: p.now(), State: HoldCreating, Memo: memo}
 	if err := p.Ledger.save(); err != nil {
 		delete(p.Ledger.Holds, hh)
 		return refuse("ledger: %v", err)
@@ -1297,6 +1323,31 @@ func (p *Policy) ResetPending() {
 	// and the chain
 }
 
+// judgeGetTransactions bounds the backend's wallet listing: from a recent
+// height, at most a page at a time (the answers come back through the guard
+// and must stay far under its message limit).
+func (p *Policy) judgeGetTransactions(ctx context.Context, m *lnrpc.RPCMessage) error {
+	var r lnrpc.GetTransactionsRequest
+	if err := decode(m, &r); err != nil {
+		return err
+	}
+	tip, err := p.Chain.Height(ctx)
+	if err != nil {
+		return refuse("node height: %v", err)
+	}
+	switch {
+	case r.Account != "":
+		return refuse("the default account only")
+	case r.MaxTransactions == 0 || r.MaxTransactions > 500:
+		return refuse("max_transactions must be 1..500")
+	case int64(r.StartHeight) < tip-4320:
+		return refuse("start_height %d is too old (at most 4320 blocks back)", r.StartHeight)
+	case r.EndHeight != -1 && r.EndHeight < r.StartHeight:
+		return refuse("bad height range")
+	}
+	return nil
+}
+
 // heavyCalls are calls cheap to ask and dear to answer (the whole graph,
 // pathfinding, the wallet's history): at most so many a minute.
 var heavyCalls = map[string]int{
@@ -1364,6 +1415,25 @@ func (p *Policy) addInvoice(requestID uint64, m *lnrpc.RPCMessage) error {
 
 // MaxInvoicesPerMinute caps AddInvoice.
 const MaxInvoicesPerMinute = 30
+
+func (p *Policy) setReplacement(requestID uint64, b []byte) {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	if p.replace == nil {
+		p.replace = map[uint64][]byte{}
+	}
+	p.replace[requestID] = b
+}
+
+// Replacement is the request the guard sends lnd instead of the one judged
+// (nil to keep it), once: AddHoldInvoice gets the guard's memo nonce.
+func (p *Policy) Replacement(requestID uint64) []byte {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	b := p.replace[requestID]
+	delete(p.replace, requestID)
+	return b
+}
 
 // Lifecycle reports the guard starting, registering with lnd or losing its
 // stream (the operator's bot alerts on starts and lost streams).

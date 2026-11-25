@@ -26,6 +26,7 @@ func (j *slowJudge) Intercept(ctx context.Context, _ string, _ uint64, _ *lnrpc.
 	return nil
 }
 func (j *slowJudge) Answered(uint64, *lnrpc.RPCMessage) {}
+func (j *slowJudge) Replacement(uint64) []byte          { return nil }
 func (j *slowJudge) Stall(why string) {
 	j.mu.Lock()
 	j.stalls = append(j.stalls, why)

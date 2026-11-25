@@ -374,31 +374,27 @@ func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool
 	if txid, vout, ok := p.findOwnLockup(ctx, l, height); ok {
 		return adopt(txid, vout)
 	}
-	// lnd's own truth: every transaction of its wallet since, unconfirmed
-	// too (every page)
-	txid, vout, _, found, err := p.LN.WalletPaid(ctx, l.Address, l.Sat, l.SentAt-1)
-	switch {
-	case err != nil:
-		// unknown: keep everything held
-	case found:
-		return adopt(txid, vout)
-	case p.now().Sub(l.At) > ApprovalWindow:
-		// lnd's call is long over (rpcmiddleware.intercepttimeout and the
-		// send itself) and its wallet never paid the lockup: nothing left
-		p.Ledger.Lock()
-		if l.State == LockApproved {
-			delete(p.Ledger.Lockups, l.Hash)
-			delete(p.Ledger.Entries, "send:"+l.Hash)
-			_ = p.Ledger.save()
+	// lnd's own wallet history (every page, unconfirmed too): positive
+	// evidence only. An approval is never dropped for lack of evidence.
+	pk, perr := p.addrScript(l.Address)
+	if perr == nil {
+		if txid, vout, _, found, err := p.LN.WalletPaid(ctx, pk, l.Sat, l.SentAt-1); err == nil && found {
+			return adopt(txid, vout)
 		}
-		p.Ledger.Unlock()
-		p.notify("lockup_dropped", map[string]any{"swap": l.SwapID, "sat": l.Sat})
-		return false
 	}
 	if p.ApprovedExpireBlocks > 0 && height-l.SentAt > p.ApprovedExpireBlocks && height > int64(l.Timeout)+p.ReverseMarginBlocks+p.HoldExpiryDelta {
+		// given up only on proof that nothing of ours is at stake: lnd
+		// released the HTLCs, the timeout is long past, and a full scan of
+		// the chain from the approval finds no output to the lockup script
 		hash, _ := hex.DecodeString(l.Hash)
 		inv, err := p.LN.LookupInvoice(ctx, hash)
-		if err == nil && (inv == nil || inv.State == InvoiceCanceled || inv.State == InvoiceSettled) {
+		released := err == nil && (inv == nil || inv.State == InvoiceCanceled || inv.State == InvoiceSettled)
+		empty := false
+		if released && perr == nil {
+			found, ferr := p.Chain.FindOutputs(ctx, pk, l.Sat, l.SentAt-1)
+			empty = ferr == nil && len(found) == 0
+		}
+		if released && empty {
 			p.Ledger.Lock()
 			if l.State == LockApproved {
 				l.State = LockExpired
@@ -411,11 +407,6 @@ func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool
 	}
 	return false
 }
-
-// ApprovalWindow is how long after an allowed lockup lnd's wallet must show
-// it before the approval is dropped: well past rpcmiddleware's intercept
-// timeout and lnd's own send.
-const ApprovalWindow = 5 * time.Minute
 
 // findOwnLockup scans the blocks since l was allowed for an output paying
 // its rebuilt script and amount, sent by lnd's wallet.
@@ -957,8 +948,11 @@ func (p *Policy) closeHold(ctx context.Context, h string) {
 		p.Ledger.Lock()
 		sat := x.Sat
 		p.Ledger.Unlock()
+		p.Ledger.Lock()
+		memo := x.Memo
+		p.Ledger.Unlock()
 		switch {
-		case inv != nil && (inv.ValueMsat+999)/1000 == sat && !inv.Created.Before(at.Add(-2*time.Minute)):
+		case inv != nil && memo != "" && inv.Memo == memo && (inv.ValueMsat+999)/1000 == sat && !inv.Created.Before(at.Add(-2*time.Minute)):
 			set([]string{HoldCreating}, "open") // lnd made it; the rest next round
 		case inv != nil:
 			// an invoice with that hash that is not the one asked for (its

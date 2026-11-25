@@ -24,7 +24,8 @@ type Entry struct {
 type Hold struct {
 	Sat   int64     `json:"sat"`
 	At    time.Time `json:"at"`
-	State string    `json:"state"` // open, settled, canceled
+	State string    `json:"state"`          // creating, open, canceling, settled, canceled
+	Memo  string    `json:"memo,omitempty"` // the guard's nonce in the invoice's memo
 }
 
 // Lockup is an on-chain send the guard allowed for a reverse swap, with the

@@ -884,6 +884,7 @@ func (x *PaymentHash) GetRHash() []byte {
 // Only what the guard reads of an invoice; the rest is skipped.
 type Invoice struct {
 	state        protoimpl.MessageState `protogen:"open.v1"`
+	Memo         string                 `protobuf:"bytes,1,opt,name=memo,proto3" json:"memo,omitempty"`
 	RHash        []byte                 `protobuf:"bytes,4,opt,name=r_hash,json=rHash,proto3" json:"r_hash,omitempty"`
 	Value        int64                  `protobuf:"varint,5,opt,name=value,proto3" json:"value,omitempty"`
 	CreationDate int64                  `protobuf:"varint,7,opt,name=creation_date,json=creationDate,proto3" json:"creation_date,omitempty"`
@@ -925,6 +926,13 @@ func (x *Invoice) ProtoReflect() protoreflect.Message {
 // Deprecated: Use Invoice.ProtoReflect.Descriptor instead.
 func (*Invoice) Descriptor() ([]byte, []int) {
 	return file_lnrpc_proto_rawDescGZIP(), []int{11}
+}
+
+func (x *Invoice) GetMemo() string {
+	if x != nil {
+		return x.Memo
+	}
+	return ""
 }
 
 func (x *Invoice) GetRHash() []byte {
@@ -2632,8 +2640,9 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\vPaymentHash\x12\x1c\n" +
 	"\n" +
 	"r_hash_str\x18\x01 \x01(\tR\brHashStr\x12\x15\n" +
-	"\x06r_hash\x18\x02 \x01(\fR\x05rHash\"\x80\x02\n" +
-	"\aInvoice\x12\x15\n" +
+	"\x06r_hash\x18\x02 \x01(\fR\x05rHash\"\x94\x02\n" +
+	"\aInvoice\x12\x12\n" +
+	"\x04memo\x18\x01 \x01(\tR\x04memo\x12\x15\n" +
 	"\x06r_hash\x18\x04 \x01(\fR\x05rHash\x12\x14\n" +
 	"\x05value\x18\x05 \x01(\x03R\x05value\x12#\n" +
 	"\rcreation_date\x18\a \x01(\x03R\fcreationDate\x12\x1d\n" +
