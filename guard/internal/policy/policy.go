@@ -151,6 +151,10 @@ type Lightning interface {
 	// 3 failed) and its preimage once succeeded; 0 if lnd has no payment.
 	TrackPayment(ctx context.Context, hash []byte) (int32, string, error)
 	NewAddress(ctx context.Context) (string, error)
+	// FindWalletSend finds a transaction of lnd's own wallet paying sat to
+	// address (from startHeight on, unconfirmed too): its id, the output and
+	// its confirmations; "" if none.
+	FindWalletSend(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, error)
 }
 
 // Output is one transaction output as the node sees it.
@@ -180,9 +184,6 @@ type Chain interface {
 	FeeRate(ctx context.Context) (float64, error) // sat/vB
 	Broadcast(ctx context.Context, rawHex string) (string, error)
 	Confirmations(ctx context.Context, txid string) (int64, error)
-	// FindOutput finds a transaction paying sat to pkScript in the mempool
-	// or in the blocks from fromHeight on; "" if none.
-	FindOutput(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) (string, uint32, error)
 }
 
 // Keys are the swaps' server keys, held by the guard alone.
@@ -259,6 +260,10 @@ type Policy struct {
 	ReverseMarginBlocks int64
 	// MaxHoldCltv is the most cltv_expiry a hold invoice may ask.
 	MaxHoldCltv uint64
+	// ApprovedExpireBlocks: a lockup allowed but never found in lnd's wallet
+	// after this many blocks is given up (its reserve released, its hold
+	// invoice cancellable).
+	ApprovedExpireBlocks int64
 	// LockupFeeFactor caps a lockup's fee rate at this times the node's
 	// estimate (at least 2 sat/vB): no paying the miners to grief.
 	LockupFeeFactor float64

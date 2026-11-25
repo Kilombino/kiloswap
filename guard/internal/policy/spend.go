@@ -286,7 +286,7 @@ func (p *Policy) watchLockups(ctx context.Context) {
 	for _, l := range approved {
 		// lnd's answer never reached the guard (a stalled stream): look for
 		// the lockup on chain by its rebuilt output and amount
-		if p.findApproved(ctx, l) {
+		if p.findApproved(ctx, l, height) {
 			todo = append(todo, l)
 		}
 	}
@@ -305,16 +305,30 @@ func (p *Policy) watchLockups(ctx context.Context) {
 }
 
 // findApproved looks for an allowed lockup whose send lnd never confirmed
-// to the guard; once found it is followed like any other (claims settle,
-// the timeout refunds).
-func (p *Policy) findApproved(ctx context.Context, l *Lockup) bool {
-	pk, err := p.addrScript(l.Address)
+// to the guard, among lnd's own wallet transactions (a payment to the same
+// address by anyone else is no lockup of ours); once found and confirmed it
+// is followed like any other (claims settle, the timeout refunds). One never
+// found after ApprovedExpireBlocks is given up.
+func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool {
+	txid, vout, confs, err := p.LN.FindWalletSend(ctx, l.Address, l.Sat, l.SentAt-1)
 	if err != nil {
 		return false
 	}
-	txid, vout, err := p.Chain.FindOutput(ctx, pk, l.Sat, l.SentAt-1)
-	if err != nil || txid == "" {
+	if txid == "" {
+		if p.ApprovedExpireBlocks > 0 && height-l.SentAt > p.ApprovedExpireBlocks {
+			p.Ledger.Lock()
+			if l.State == LockApproved {
+				l.State = LockExpired
+				delete(p.Ledger.Entries, "send:"+l.Hash)
+				_ = p.Ledger.save()
+			}
+			p.Ledger.Unlock()
+			p.notify("guard_lockup_expired", map[string]any{"swap": l.SwapID, "sat": l.Sat})
+		}
 		return false
+	}
+	if confs < 1 {
+		return false // in lnd's wallet but not in a block yet: next round
 	}
 	p.Ledger.Lock()
 	if l.State == LockApproved {
@@ -367,6 +381,17 @@ func (p *Policy) lockupOutput(ctx context.Context, l *Lockup) (*swapscript.Outpu
 
 func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error {
 	out, o, vout, err := p.lockupOutput(ctx, l)
+	if errors.Is(err, ErrNotYet) && height-l.SentAt > bumpEvery*2 {
+		// the transaction lnd named is not on chain (replaced?): look in
+		// lnd's wallet for what paid the lockup instead
+		if txid, v, confs, ferr := p.LN.FindWalletSend(ctx, l.Address, l.Sat, l.SentAt-1); ferr == nil && txid != "" && confs >= 1 && !strings.EqualFold(txid, l.TxID) {
+			p.Ledger.Lock()
+			l.TxID, l.Vout = txid, int32(v)
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+			out, o, vout, err = p.lockupOutput(ctx, l)
+		}
+	}
 	if err != nil {
 		return err
 	}

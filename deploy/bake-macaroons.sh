@@ -37,6 +37,7 @@ guard=(
 	uri:/lnrpc.Lightning/LookupInvoice uri:/lnrpc.Lightning/DecodePayReq
 	uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice
 	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress
+	uri:/lnrpc.Lightning/GetTransactions
 )
 bake() { # NAME ROOT_KEY_ID OWNER ARGS...
 	local name=$1 key=$2 owner=$3; shift 3

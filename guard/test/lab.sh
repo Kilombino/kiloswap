@@ -94,7 +94,7 @@ LS bakemacaroon --save_to /root/.lnd/kiloswap-guard.macaroon \
 	uri:/lnrpc.Lightning/RegisterRPCMiddleware uri:/lnrpc.Lightning/WalletBalance \
 	uri:/lnrpc.Lightning/LookupInvoice uri:/lnrpc.Lightning/DecodePayReq \
 	uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice \
-	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress >/dev/null
+	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress uri:/lnrpc.Lightning/GetTransactions >/dev/null
 docker compose exec -T lnd-swap chmod 644 /root/.lnd/kiloswap.macaroon /root/.lnd/kiloswap-wide.macaroon /root/.lnd/kiloswap-guard.macaroon
 ok "kiloswap (caveat kiloswap=v1), kiloswap-wide, kiloswap-guard"
 

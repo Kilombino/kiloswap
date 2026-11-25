@@ -30,13 +30,14 @@ import (
 // ---- fakes ----
 
 type fakeLN struct {
-	mu       sync.Mutex
-	invoices map[string]*InvoiceInfo
-	payreqs  map[string]*PayReq
-	tracks   map[string][2]string // hash -> status, preimage
-	settled  [][]byte
-	balance  Balance
-	addr     string
+	mu          sync.Mutex
+	invoices    map[string]*InvoiceInfo
+	payreqs     map[string]*PayReq
+	tracks      map[string][2]string // hash -> status, preimage
+	settled     [][]byte
+	balance     Balance
+	addr        string
+	walletSends []walletSend
 }
 
 func (f *fakeLN) LookupInvoice(_ context.Context, h []byte) (*InvoiceInfo, error) {
@@ -79,6 +80,22 @@ func (f *fakeLN) CancelInvoice(_ context.Context, h []byte) error {
 	return nil
 }
 func (f *fakeLN) NewAddress(context.Context) (string, error) { return f.addr, nil }
+func (f *fakeLN) FindWalletSend(_ context.Context, address string, sat int64, _ int64) (string, uint32, int64, error) {
+	for _, w := range f.walletSends {
+		if w.address == address && w.sat == sat {
+			return w.txid, w.vout, w.confs, nil
+		}
+	}
+	return "", 0, 0, nil
+}
+
+type walletSend struct {
+	address string
+	sat     int64
+	txid    string
+	vout    uint32
+	confs   int64
+}
 
 type fakeChain struct {
 	mu        sync.Mutex
@@ -137,18 +154,6 @@ func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
 }
 func (c *fakeChain) Confirmations(_ context.Context, txid string) (int64, error) {
 	return c.confs[txid], nil
-}
-func (c *fakeChain) FindOutput(_ context.Context, pk []byte, sat int64, _ int64) (string, uint32, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id, outs := range c.txs {
-		for i, o := range outs {
-			if bytes.Equal(o.PkScript, pk) && o.Sat == sat {
-				return id, uint32(i), nil
-			}
-		}
-	}
-	return "", 0, nil
 }
 
 type fakeSwaps struct {
@@ -860,6 +865,9 @@ func TestApprovedLockupFoundWithoutAnswer(t *testing.T) {
 	txid := strings.Repeat("63", 32)
 	pk, _ := e.p.addrScript(r.LockupAddress)
 	e.chain.txs[txid] = []Output{{PkScript: []byte{0x51}, Sat: 1}, {PkScript: pk, Sat: r.OnchainAmount, Confirmations: 1}}
+	// a decoy paying the same address and amount, not from lnd's wallet
+	e.chain.txs[strings.Repeat("de", 32)] = []Output{{PkScript: pk, Sat: r.OnchainAmount, Confirmations: 5}}
+	e.ln.walletSends = append(e.ln.walletSends, walletSend{address: r.LockupAddress, sat: r.OnchainAmount, txid: txid, vout: 1, confs: 1})
 	_, hash := preimage(63)
 	l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]
 	e.p.Tick(context.Background())
@@ -1106,4 +1114,29 @@ func TestLockupCheckedBeforeCancelRefused(t *testing.T) {
 	mustAllow(t, err)
 	err = e.p.allowSend(context.Background(), 999, l, 1000)
 	mustRefuse(t, err, "no longer open")
+}
+
+// An allowed lockup never seen in lnd's wallet is given up after
+// ApprovedExpireBlocks: its reserve and daily share come back, its hold
+// invoice can be cancelled.
+func TestApprovedNeverSeenExpires(t *testing.T) {
+	e := newEnv(t)
+	e.p.ApprovedExpireBlocks = 72
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	r, _, _ := e.reverse(103, 1_000_000, 103)
+	_, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	at = at.Add(time.Hour)
+	e.chain.height += 73
+	e.p.Tick(context.Background())
+	_, hash := preimage(103)
+	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockExpired {
+		t.Fatalf("not expired: %s", l.State)
+	}
+	if e.p.Ledger.since(time.Time{}) != 0 {
+		t.Fatal("the daily share was not given back")
+	}
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustAllow(t, err)
 }

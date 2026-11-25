@@ -104,6 +104,30 @@ func (l LN) Balance(ctx context.Context) (policy.Balance, error) {
 	return policy.Balance{Confirmed: r.ConfirmedBalance, Locked: r.LockedBalance, AnchorReserve: r.ReservedBalanceAnchorChan}, nil
 }
 
+// FindWalletSend finds a transaction of lnd's own wallet (from startHeight,
+// unconfirmed ones too) paying sat to address: a lockup lnd sent. Only the
+// wallet's own transactions count: anyone can pay the same address.
+func (l LN) FindWalletSend(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, error) {
+	ctx, cancel := call(ctx)
+	defer cancel()
+	var r lnrpc.TransactionDetails
+	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/GetTransactions",
+		&lnrpc.GetTransactionsRequest{StartHeight: int32(max(startHeight, 0)), EndHeight: -1, MaxTransactions: 2000}, &r); err != nil {
+		return "", 0, 0, err
+	}
+	for _, t := range r.Transactions {
+		if t.Amount >= 0 { // not a send of ours
+			continue
+		}
+		for _, o := range t.OutputDetails {
+			if !o.IsOurAddress && o.Address == address && o.Amount == sat {
+				return t.TxHash, uint32(o.OutputIndex), int64(t.NumConfirmations), nil
+			}
+		}
+	}
+	return "", 0, 0, nil
+}
+
 func (l LN) LookupInvoice(ctx context.Context, hash []byte) (*policy.InvoiceInfo, error) {
 	ctx, cancel := call(ctx)
 	defer cancel()
@@ -413,62 +437,6 @@ func (c Chain) Spender(ctx context.Context, txid string, vout uint32, fromHeight
 
 // maxScan bounds how many blocks one search reads.
 const maxScan = 1500
-
-// FindOutput finds a transaction paying sat to pkScript, in the mempool or
-// in the blocks from fromHeight on (at most maxScan of them): a lockup lnd
-// sent although its answer never reached the guard.
-func (c Chain) FindOutput(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) (string, uint32, error) {
-	want := hex.EncodeToString(pkScript)
-	match := func(t rawTx) (uint32, bool) {
-		for _, o := range t.Vout {
-			v, err := sats(o.Value)
-			if err == nil && v == sat && strings.EqualFold(o.ScriptPubKey.Hex, want) {
-				return o.N, true
-			}
-		}
-		return 0, false
-	}
-	var mp []string
-	if err := c.rpc(ctx, "getrawmempool", []any{}, &mp); err == nil {
-		if len(mp) > 5000 {
-			mp = mp[:5000]
-		}
-		for _, id := range mp {
-			var t rawTx
-			if err := c.rpc(ctx, "getrawtransaction", []any{id, 1}, &t); err != nil {
-				continue
-			}
-			if n, ok := match(t); ok {
-				return t.Txid, n, nil
-			}
-		}
-	}
-	tip, err := c.Height(ctx)
-	if err != nil {
-		return "", 0, err
-	}
-	if fromHeight < 1 || tip-fromHeight > maxScan {
-		fromHeight = tip - maxScan
-	}
-	for h := fromHeight; h <= tip; h++ {
-		var hash string
-		if err := c.rpc(ctx, "getblockhash", []any{h}, &hash); err != nil {
-			return "", 0, err
-		}
-		var b struct {
-			Tx []rawTx `json:"tx"`
-		}
-		if err := c.rpc(ctx, "getblock", []any{hash, 2}, &b); err != nil {
-			return "", 0, err
-		}
-		for _, t := range b.Tx {
-			if n, ok := match(t); ok {
-				return t.Txid, n, nil
-			}
-		}
-	}
-	return "", 0, nil
-}
 
 // LSP reads the LSP's state file. Requests waiting for payment or paid
 // hold their amount until the channel's funding transaction is out (then

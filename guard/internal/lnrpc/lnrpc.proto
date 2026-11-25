@@ -21,6 +21,7 @@ service Lightning {
     rpc LookupInvoice (PaymentHash) returns (Invoice);
     rpc DecodePayReq (PayReqString) returns (PayReq);
     rpc NewAddress (NewAddressRequest) returns (NewAddressResponse);
+    rpc GetTransactions (GetTransactionsRequest) returns (TransactionDetails);
 }
 
 message RPCMiddlewareRequest {
@@ -236,4 +237,48 @@ message SendPaymentRequest {
     double time_pref = 23;
     bool cancelable = 24;
     map<uint64, bytes> first_hop_custom_records = 25;
+}
+
+// GetTransactions: the guard finds lockups lnd's own wallet sent
+message GetTransactionsRequest {
+    int32 start_height = 1;
+    int32 end_height = 2;
+    string account = 3;
+    uint32 index_offset = 4;
+    uint32 max_transactions = 5;
+}
+message TransactionDetails {
+    repeated Transaction transactions = 1;
+    uint64 last_index = 2;
+    uint64 first_index = 3;
+}
+message Transaction {
+    string tx_hash = 1;
+    int64 amount = 2;
+    int32 num_confirmations = 3;
+    string block_hash = 4;
+    int32 block_height = 5;
+    int64 time_stamp = 6;
+    int64 total_fees = 7;
+    string raw_tx_hex = 9;
+    string label = 10;
+    repeated OutputDetail output_details = 11;
+}
+message OutputDetail {
+    int32 output_type = 1;
+    string address = 2;
+    string pk_script = 3;
+    int64 output_index = 4;
+    int64 amount = 5;
+    bool is_our_address = 6;
+}
+// AddInvoice's request is lnd's Invoice: the fields the guard judges (the
+// rest it ignores, read leniently)
+message AddInvoiceCheck {
+    string memo = 1;
+    bytes r_preimage = 3;
+    int64 value = 5;
+    int64 expiry = 9;
+    int64 value_msat = 23;
+    bool private = 15;
 }
