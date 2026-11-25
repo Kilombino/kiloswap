@@ -294,6 +294,11 @@ func (p *Policy) watchLockups(ctx context.Context) {
 		switch l.State {
 		case LockSent, LockClaimed, LockRefunding:
 			todo = append(todo, l)
+		case LockSettled:
+			// paid but never claimed on chain: refunded after a long grace
+			if l.TxID != "" {
+				todo = append(todo, l)
+			}
 		case LockApproved:
 			if p.now().Sub(l.At) > 2*time.Minute {
 				approved = append(approved, l)
@@ -498,6 +503,12 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 		_, _, err := p.refund(ctx, l, out, o, vout)
 		return err
 	}
+	if l.State == LockSettled && height >= int64(l.Timeout)+settledGrace {
+		// the hold invoice was settled yet the user never claimed: the coins
+		// would stay locked for good
+		_, _, err := p.refund(ctx, l, out, o, vout)
+		return err
+	}
 	if l.State == LockRefunding {
 		// our refund is in no block and not in the mempool: dropped
 		return p.bumpRefund(ctx, l, out, o, vout, height, false)
@@ -543,22 +554,27 @@ func (p *Policy) Refund(ctx context.Context, swapID string) (string, int64, erro
 			l = y
 		}
 	}
-	p.Ledger.Unlock()
 	if l == nil {
+		p.Ledger.Unlock()
 		return "", 0, fmt.Errorf("no lockup of swap %s", swapID)
 	}
-	if l.RefundTx != "" {
-		return l.RefundTx, 0, nil
+	refundTx, state, timeout := l.RefundTx, l.State, l.Timeout
+	p.Ledger.Unlock()
+	if refundTx != "" {
+		return refundTx, 0, nil
 	}
-	if l.State != LockSent {
-		return "", 0, fmt.Errorf("%w: the lockup is %s", ErrNotYet, l.State)
+	if state != LockSent && state != LockSettled {
+		return "", 0, fmt.Errorf("%w: the lockup is %s", ErrNotYet, state)
+	}
+	if state == LockSettled {
+		timeout += settledGrace
 	}
 	height, err := p.Chain.Height(ctx)
 	if err != nil {
 		return "", 0, err
 	}
-	if height < int64(l.Timeout) {
-		return "", 0, fmt.Errorf("%w: timeout at %d, now %d", ErrNotYet, l.Timeout, height)
+	if height < int64(timeout) {
+		return "", 0, fmt.Errorf("%w: timeout at %d, now %d", ErrNotYet, timeout, height)
 	}
 	out, o, vout, err := p.lockupOutput(ctx, l)
 	if err != nil {
@@ -570,20 +586,27 @@ func (p *Policy) Refund(ctx context.Context, swapID string) (string, int64, erro
 func (p *Policy) refund(ctx context.Context, l *Lockup, out *swapscript.Output, o *Output, vout uint32) (string, int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if l.RefundTx != "" {
-		return l.RefundTx, 0, nil
+	p.Ledger.Lock()
+	refundTx, dest := l.RefundTx, l.Bump.Dest
+	p.Ledger.Unlock()
+	if refundTx != "" {
+		return refundTx, 0, nil
 	}
 	server, err := p.Keys.Private(l.KeyIndex)
 	if err != nil {
 		return "", 0, err
 	}
-	sp := &spendFee{}
+	sp := &spendFee{dest: dest} // the same address on every attempt
 	tx, fee, err := p.spendLeafWith(ctx, out, out.RefundLeaf, l.TxID, vout, o, l.Timeout, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, leaf, cb}
 	}, server, sp)
 	if err != nil {
 		return "", 0, err
 	}
+	p.Ledger.Lock()
+	l.Bump.Dest = sp.dest
+	p.saveOrAlert()
+	p.Ledger.Unlock()
 	txid, err := p.broadcast(ctx, tx)
 	if err != nil {
 		return "", 0, err
@@ -984,4 +1007,22 @@ func (p *Policy) refundExposure(ctx context.Context, l *Lockup) int64 {
 		}
 	}
 	return s
+}
+
+// settledGrace is how long after the timeout a lockup whose invoice was
+// settled but never claimed on chain waits before the guard refunds it.
+const settledGrace = 144
+
+// saveOrAlert saves the ledger (caller holds its lock) and alerts once per
+// failure kind: a ledger that cannot be written is the operator's emergency.
+func (p *Policy) saveOrAlert() {
+	if err := p.Ledger.save(); err != nil {
+		p.pmu.Lock()
+		repeat := p.lastSaveErr == err.Error()
+		p.lastSaveErr = err.Error()
+		p.pmu.Unlock()
+		if !repeat {
+			p.notify("guard_ledger_error", map[string]any{"error": err.Error()})
+		}
+	}
 }

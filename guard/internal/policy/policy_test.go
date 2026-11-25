@@ -490,7 +490,7 @@ const (
 // and the backend's row for its lockup.
 func (e *env) reverse(idx uint32, sat int64, b byte) (ReverseSwap, []byte, *btcec.PrivateKey) {
 	pre, hash := preimage(b)
-	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: sat + 1000})
+	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: sat + 1000})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -569,7 +569,7 @@ func TestConcurrentSendsKeepTheReserve(t *testing.T) {
 	// lnd has not answered the send yet, so its coins are still in the
 	// balance: they must not be promised again
 	_, hash := preimage(25)
-	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 1_501_000})
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 1_501_000})
 	mustRefuse(t, err, "would not fit")
 }
 
@@ -587,7 +587,7 @@ func TestCancelOnlyOwnAndNotWhileLockedUp(t *testing.T) {
 	mustRefuse(t, err, "stays until")
 	// a hold invoice the backend tried to add with an existing hash is never its own
 	e.ln.invoices[hex.EncodeToString(other)] = &InvoiceInfo{State: InvoiceAccepted}
-	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: other, Value: 1000})
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: other, Expiry: 3600, Value: 1000})
 	mustRefuse(t, err, "already exists")
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: other})
 	mustRefuse(t, err, "not a Kiloswap")
@@ -596,7 +596,7 @@ func TestCancelOnlyOwnAndNotWhileLockedUp(t *testing.T) {
 func TestHoldRecordedOnlyWhenLndCreatedIt(t *testing.T) {
 	e := newEnv(t)
 	_, hash := preimage(40)
-	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 1000})
+	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 1000})
 	mustAllow(t, err)
 	e.answer(id, nil, true) // lnd refused it
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
@@ -611,7 +611,7 @@ func TestPendingCountIsTheGuards(t *testing.T) {
 	e.reverse(41, 100_000, 41)
 	e.reverse(42, 100_000, 42)
 	_, hash := preimage(43)
-	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 1000})
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 1000})
 	mustRefuse(t, err, "pending")
 }
 
@@ -1007,7 +1007,7 @@ func TestLockupFeeCappedByEstimate(t *testing.T) {
 func TestHoldInvoiceGriefingLimits(t *testing.T) {
 	e := newEnv(t)
 	_, hash := preimage(76)
-	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000, CltvExpiry: 1000})
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 50_000, CltvExpiry: 1000})
 	mustRefuse(t, err, "cltv_expiry")
 	// many HTLC parts: no lockup
 	r, _, _ := e.reverse(77, 1_000_000, 77)
@@ -1030,11 +1030,11 @@ func TestHoldCountReservedAtOnce(t *testing.T) {
 	e := newEnv(t)
 	for i := byte(0); i < 5; i++ {
 		_, hash := preimage(80 + i)
-		_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+		_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 50_000})
 		mustAllow(t, err) // no answers from lnd yet
 	}
 	_, hash := preimage(90)
-	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 50_000})
 	mustRefuse(t, err, "pending")
 }
 
@@ -1178,6 +1178,7 @@ func TestDepthByExposureDefeatsSplitting(t *testing.T) {
 			e.chain.confs[id] = 12
 		}
 	}
+	e.chain.height++ // depth changes with a new block (the guard caches per block)
 	_, err = e.call(payURI, payReq(inv))
 	mustAllow(t, err)
 }
@@ -1358,15 +1359,15 @@ func TestRefundStateAndSlots(t *testing.T) {
 	e2.p.HoldSlotTime = 15 * time.Minute
 	for i := byte(0); i < 5; i++ {
 		_, hash := preimage(130 + i)
-		id, err := e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+		id, err := e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 50_000})
 		mustAllow(t, err)
 		e2.answer(id, &lnrpc.AddHoldInvoiceResp{PaymentRequest: "x"}, false)
 	}
 	_, hash := preimage(140)
-	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 50_000})
 	mustRefuse(t, err, "pending")
 	at = at.Add(20 * time.Minute)
-	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 50_000})
 	mustAllow(t, err)
 }
 
@@ -1393,10 +1394,10 @@ func TestHoldRecordedBeforeAnswer(t *testing.T) {
 	at := time.Unix(1_800_000_000, 0)
 	e.p.Now = func() time.Time { return at }
 	_, h1 := preimage(151)
-	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h1, Value: 50_000})
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h1, Expiry: 3600, Value: 50_000})
 	mustAllow(t, err)
 	_, h2 := preimage(152)
-	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h2, Value: 50_000})
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h2, Expiry: 3600, Value: 50_000})
 	mustAllow(t, err)
 	if e.p.Ledger.Holds[hex.EncodeToString(h1)].State != HoldCreating {
 		t.Fatal("not recorded before the answer")
@@ -1451,4 +1452,34 @@ func TestRefundFinalityByExposure(t *testing.T) {
 	if e.ln.invoices[hex.EncodeToString(h1)].State != InvoiceCanceled {
 		t.Fatal("not cancelled at 12")
 	}
+}
+
+// A lockup whose invoice was settled but never claimed on chain is refunded
+// after the grace (the coins would stay locked for good).
+func TestSettledUnclaimedRefundedAfterGrace(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(156, 1_000_000, 156)
+	e.sent(r, 156)
+	_, hash := preimage(156)
+	l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]
+	l.State = LockSettled
+	e.chain.height = 1100 + settledGrace - 1
+	e.p.Tick(context.Background())
+	if len(e.chain.broadcast) != 0 {
+		t.Fatal("refunded before the grace")
+	}
+	e.chain.height++
+	e.p.Tick(context.Background())
+	if len(e.chain.broadcast) != 1 || l.State != LockRefunding {
+		t.Fatalf("not refunded after the grace: %s", l.State)
+	}
+}
+
+func TestHoldExpiryCapped(t *testing.T) {
+	e := newEnv(t)
+	_, hash := preimage(157)
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000, Expiry: 86400})
+	mustRefuse(t, err, "expiry")
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	mustRefuse(t, err, "expiry")
 }

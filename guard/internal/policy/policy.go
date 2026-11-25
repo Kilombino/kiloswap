@@ -296,11 +296,13 @@ type Policy struct {
 	// made (for the operator's bot): event, then key/values.
 	Notify func(event string, kv map[string]any)
 
-	mu       sync.Mutex // judgments that touch the ledger, one at a time
-	pmu      sync.Mutex
-	pending  map[uint64]pendingReq
-	claimErr map[string]string // last claim error per payment hash
-	calls    map[string][]time.Time
+	mu          sync.Mutex // judgments that touch the ledger, one at a time
+	pmu         sync.Mutex
+	pending     map[uint64]pendingReq
+	claimErr    map[string]string // last claim error per payment hash
+	calls       map[string][]time.Time
+	lastSaveErr string
+	confCache   map[string]confAt
 }
 
 // ConfTier is one step of ConfTiers.
@@ -350,13 +352,43 @@ func (p *Policy) shallowExposure(ctx context.Context) (int64, int) {
 	}
 	p.Ledger.Unlock()
 	var s int64
+	height, herr := p.Chain.Height(ctx)
 	for _, c := range check {
-		confs, err := p.Chain.Confirmations(ctx, c.tx)
+		confs, err := p.cachedConfs(ctx, c.tx, height, herr == nil)
 		if err != nil || confs < deep {
 			s += c.sat // unknown counts as shallow
 		}
 	}
 	return s, inflight
+}
+
+type confAt struct {
+	confs, height int64
+}
+
+// cachedConfs asks a transaction's depth once per block (judgments under the
+// lock must not make one call per payment each time).
+func (p *Policy) cachedConfs(ctx context.Context, txid string, height int64, useCache bool) (int64, error) {
+	p.pmu.Lock()
+	if p.confCache == nil {
+		p.confCache = map[string]confAt{}
+	}
+	c, ok := p.confCache[txid]
+	p.pmu.Unlock()
+	if useCache && ok && c.height == height {
+		return c.confs, nil
+	}
+	confs, err := p.Chain.Confirmations(ctx, txid)
+	if err != nil {
+		return 0, err
+	}
+	p.pmu.Lock()
+	if len(p.confCache) > 1000 {
+		p.confCache = map[string]confAt{}
+	}
+	p.confCache[txid] = confAt{confs, height}
+	p.pmu.Unlock()
+	return confs, nil
 }
 
 // ClaimVbytes is what the guard's claim of a submarine lockup weighs at
@@ -958,6 +990,10 @@ func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHold
 	if p.MaxHoldCltv > 0 && r.CltvExpiry > p.MaxHoldCltv {
 		return refuse("cltv_expiry %d over %d", r.CltvExpiry, p.MaxHoldCltv)
 	}
+	if r.Expiry < 60 || r.Expiry > 3600 {
+		// an unpaid hold expires (lnd cancels it) within the hour
+		return refuse("expiry %d s not within 60..3600", r.Expiry)
+	}
 	if inv, err := p.LN.LookupInvoice(ctx, r.Hash); err != nil {
 		return refuse("lnd invoice: %v", err)
 	} else if inv != nil {
@@ -1256,6 +1292,7 @@ var heavyCalls = map[string]int{
 	"/lnrpc.Lightning/QueryRoutes":     120,
 	"/lnrpc.Lightning/GetTransactions": 60,
 	"/lnrpc.Lightning/GetNodeInfo":     240,
+	"/lnrpc.Lightning/NewAddress":      30,
 }
 
 // rate is a per-call limit over the last minute.

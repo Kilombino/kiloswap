@@ -221,7 +221,7 @@ func (l *Ledger) save() error {
 		}
 	}
 	for h, x := range l.Lockups {
-		if (x.State == LockSettled || x.State == LockRefunded) && x.At.Before(cut) {
+		if (x.State == LockSettled || x.State == LockRefunded || x.State == LockExpired) && x.At.Before(cut) {
 			delete(l.Lockups, h)
 		}
 	}
