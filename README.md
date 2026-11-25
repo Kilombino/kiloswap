@@ -23,7 +23,7 @@ to Bitcoin BLAKE2b by paulscode in
 | Lightning → on-chain (reverse) | 0.15 % + the on-chain fee |
 | Per swap | 10,000 sat – 1 BTC |
 | All swaps together | 2 BTC per 24 hours |
-| Confirmations before paying out | 3 |
+| Confirmations before paying out | 1 up to 0.01 BTC, 2 up to 0.1 BTC, 3 above (of total exposure) |
 
 ## Trustless
 
@@ -72,7 +72,7 @@ The threat it is built for is the backend and its database taken over.
   `send_all`; timeout between 12 and 4,320 blocks away.
 - **Payments** (`SendPaymentV2`) only of an invoice lnd decodes (amount and
   hash from the invoice, never from the database), for a submarine swap
-  whose rebuilt output the node shows unspent with 3 confirmations, paying
+  whose rebuilt output the node shows unspent and deep enough (`CONF_TIERS`), paying
   at least the invoice plus a claim margin; each lockup backs one payment;
   `cltv_limit` leaves time to claim before the timeout (lowered to it, and
   to 288 blocks at most); at most 4 parts; the routing fee limit rewritten
@@ -131,9 +131,10 @@ guard stopped.
   (the web app says so, in English and Spanish).
 - `HOLD_EXPIRY_DELTA` must equal lnd's `invoices.holdexpirydelta` (18): lnd
   does not report it, so the guard cannot check it. Change both together.
-- Confirmations scale with the amount (`CONF_TIERS`, default 3 up to 1M
-  sat, 6 up to 10M, 12 above, because about half of the chain's hash rate
-  sits in one pool). The backend's own `requiredConfirmations` is lower, so
+- Confirmations scale with the amount (`CONF_TIERS`, default 1 up to 1M
+  sat, 2 up to 10M, 3 above: the operator's choice, 25 Nov 2026; about half
+  of the chain's hash rate sits in one pool, so a reorg of a few blocks is a
+  known risk bounded by the daily cap). The backend's own `requiredConfirmations` is lower, so
   a big lockup's payment is refused by the guard until it is deep enough
   and the backend tries again.
 
@@ -179,7 +180,7 @@ operation and 2 BTC a day.
 - A cancel and a lockup of one hold invoice are judged under one lock (the
   invoice is "canceling" until lnd answers).
 - Depth is asked of the total not yet deep: all payments whose lockups are
-  under 12 confirmations plus the new one (splitting a lockup does not help).
+  under the last tier's depth plus the new one (splitting a lockup does not help).
 - Lockups lnd sent without telling the guard are looked for only among
   lnd's own wallet transactions; one never seen expires after 72 blocks.
 - AddInvoice is judged (amount, a day's expiry, 30 a minute) and at most

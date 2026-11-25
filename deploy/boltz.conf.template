@@ -83,7 +83,7 @@ minSwapAmount = 10000
 maxSwapAmount = 10000000 # launch mode: 0.1 BTC (the guard: LAUNCH_MODE); later 100000000
 maxZeroConfAmount = 0
 # A lockup is paid against only once this deep
-requiredConfirmations = 3
+requiredConfirmations = 1 # the guard asks 1/2/3 by exposure; the backend retries until it allows
 
   [currencies.chain]
   host = "shim"

@@ -600,9 +600,9 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 				return p.bumpRefund(ctx, l, out, o, vout, height, true)
 			}
 			// the hold invoice is cancelled only when the refund is as deep as
-			// the amount asks (a reorg that undid it would let the user claim
+			// the amount asks (the same tiers as payments, Kilombino 25 Nov 2026) (a reorg that undid it would let the user claim
 			// with the preimage after getting the payment back)
-			if sp.Confirmations >= max(finalConfs, p.confsFor(p.refundExposure(ctx, l))) {
+			if sp.Confirmations >= p.confsFor(p.refundExposure(ctx, l)) {
 				p.Ledger.Lock()
 				l.State = LockRefunded
 				_ = p.Ledger.save()

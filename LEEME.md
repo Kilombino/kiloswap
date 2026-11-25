@@ -25,7 +25,7 @@ a Bitcoin BLAKE2b por paulscode en
 | Por swap | de 10.000 sats a 0,1 BTC (al principio; luego 1 BTC) |
 | Todos los swaps juntos | 0,25 BTC cada 24 horas (al principio; luego 2 BTC) |
 | Comisión de enrutado (on-chain → Lightning) | la paga lo que el depósito trae de más, al menos 10 sats |
-| Confirmaciones antes de pagar | 3 |
+| Confirmaciones antes de pagar | 1 hasta 0,01 BTC, 2 hasta 0,1 BTC, 3 por encima (del total expuesto) |
 
 ## Sin confiar en nadie
 
@@ -72,7 +72,7 @@ Está pensado para el caso de que alguien tome el backend y su base de datos:
   importe exacto, monedas confirmadas y comisión explícita bajo el tope.
 - **Pagos** solo de facturas que LND descodifica (importe y hash de la
   factura, nunca de la base de datos), de un swap submarino cuya salida
-  reconstruida el nodo ve sin gastar y con 3 confirmaciones, por al menos el
+  reconstruida el nodo ve sin gastar y con las confirmaciones que pide `CONF_TIERS`, por al menos el
   importe más un margen de cobro; cada depósito respalda un solo pago; el
   `cltv_limit` deja tiempo para cobrar antes del plazo; comisión de ruta como
   mucho 0,01 %; sin elegir canales ni rutas.

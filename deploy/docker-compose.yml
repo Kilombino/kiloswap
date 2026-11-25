@@ -140,7 +140,9 @@ services:
       ROUTING_FLOOR_SAT: ${ROUTING_FLOOR_SAT:-10}
       MIN_FEE_SAT: ${MIN_FEE_SAT:-10}
       FEE_RATIO: ${FEE_RATIO:-0.0001}
-      REQUIRED_CONFS: ${REQUIRED_CONFS:-3}
+      REQUIRED_CONFS: ${REQUIRED_CONFS:-1}
+      # depth by total shallow exposure (Kilombino 25 Nov 2026: at most 3)
+      CONF_TIERS: ${CONF_TIERS:-1000000:1,10000000:2,100000000:3}
       HOLD_EXPIRY_DELTA: "18"
     volumes:
       - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
