@@ -75,13 +75,17 @@ en los 15 minutos siguientes.
    # Kiloswap
    zmqpubrawblock=tcp://<IP-del-host>:28332
    zmqpubrawtx=tcp://<IP-del-host>:28333
+   # a slow subscriber costs the node at most 20 queued messages per topic
+   zmqpubrawblockhwm=20
+   zmqpubrawtxhwm=20
    rpcallowip=172.30.91.0/24
    rpcauth=kiloswap:<lo que imprime setup.sh>
    rpcauth=kiloswap-guard:<lo que imprime setup.sh>
    rpcwhitelist=kiloswap:getblock,getblockhash,getblockheader,getblockchaininfo,getbestblockhash,getblockcount,getrawtransaction,gettxout,gettxspendingprevout,getrawmempool,getmempoolinfo,getmempoolentry,estimatesmartfee,getnetworkinfo,getdeploymentinfo,getzmqnotifications,uptime,sendrawtransaction,testmempoolaccept,getnewaddress,listunspent,gettransaction
    rpcwhitelist=kiloswap-guard:getrawtransaction,gettxout,getblockcount,getblockhash,getblock,gettxspendingprevout,estimatesmartfee,sendrawtransaction
    # IMPRESCINDIBLE: sin esto, la lista blanca de arriba deja SIN PERMISOS
-   # a todos los demás usuarios (LND, mempool, DATUM, Kilobot…)
+   # a todos los demás usuarios (LND, mempool, DATUM, Kilobot…).
+   # Ya está en producción (línea 143, por spamchainview): no duplicarla.
    rpcwhitelistdefault=0
    # the RPC work threads and queue the node serves everyone with (DATUM,
    # LND, mempool, Kiloswap's shim with at most 8 calls at once): enough
@@ -198,24 +202,24 @@ en él.
      cambio de swap:
      `<usuario> ALL=(root) NOPASSWD: /opt/kiloswap/deploy/backup/kiloswap-backup.sh change`
 
-## Ventana de mantenimiento: ZMQ del nodo (revisión 8)
+## ZMQ del nodo: condición previa de la ventana (revisiones 8 y 9)
 
-El shim reenvía los ZMQ de Knots (bloques y transacciones) al backend. Si
-un suscriptor deja de leer, el nodo acumula mensajes para él. Hay que
-limitarlo **en el nodo** (Knots de producción), en la próxima ventana de
-mantenimiento, no antes:
+Revisado en solo lectura el 25 nov 2026: el `bitcoin.conf` de producción
+(`~/Projects/blake2b/node-bip110/bitcoin.conf`) **no tiene ninguna línea
+`zmqpub*`** hoy (LND no usa ZMQ del nodo). Los únicos temas que Kiloswap
+publica son los dos del paso 2: `zmqpubrawblock` y `zmqpubrawtx`, y **cada
+uno** lleva su `…hwm=20` en el mismo cambio. Ninguno de los dos se activa
+sin su límite: es condición previa para arrancar el shim. Si algún día se
+añade otro tema (`zmqpubhashblock`, `zmqpubhashtx`, `zmqpubsequence`),
+lleva también su `zmqpub<tema>hwm=20`.
 
-```
-zmqpubrawblockhwm=20
-zmqpubrawtxhwm=20
-```
+Con eso, el nodo descarta lo que no quepa en 20 mensajes por tema en vez de
+crecer en memoria. El shim corta a un suscriptor que no lee en 10 s y
+acepta como mucho 16 conexiones por puerto reenviado. El laboratorio ya
+corre con esos valores.
 
-en `bitcoin.conf` del nodo BLAKE2b y reiniciarlo (con LND parado antes,
-como en cualquier reinicio del nodo). Con eso, el nodo descarta lo que no
-quepa en 20 mensajes por socket en vez de crecer en memoria. Por su parte,
-el shim corta a un suscriptor que no lee en 10 s y acepta como mucho 16
-conexiones por puerto reenviado. El laboratorio ya corre con esos valores.
-Comprobación después: `bitcoin-cli getzmqnotifications` muestra `hwm: 20`.
+Comprobación: `bitcoin-cli getzmqnotifications` lista exactamente los dos
+temas, cada uno con `"hwm": 20`.
 
 ## Pausar o apagar
 

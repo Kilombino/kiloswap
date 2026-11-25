@@ -279,7 +279,8 @@ func checkParams(method string, p []any, inBatch bool) error {
 			}
 		}
 	case "getrawmempool":
-		ok = n == 0 || (n == 1 && p[0] == false)
+		// the whole mempool's txids: once per call, never repeated in a batch
+		ok = !inBatch && (n == 0 || (n == 1 && p[0] == false))
 	case "getmempoolentry":
 		ok = n == 1 && isHash(p[0])
 	case "estimatesmartfee":
