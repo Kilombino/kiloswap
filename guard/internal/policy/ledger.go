@@ -200,8 +200,16 @@ func (l *Ledger) save() error {
 		}
 	}
 	for h, x := range l.Payments {
-		if (x.State == PayClaimed || x.State == PayFailed) && x.At.Before(cut) {
+		claimed := x.State == PayClaimed && (x.Bump.Done || x.Bump.Dest == "")
+		if (claimed || x.State == PayFailed) && x.At.Before(cut) {
 			delete(l.Payments, h)
+		}
+	}
+	// an outpoint is remembered while its payment is: once that is gone
+	// (claimed and deep, or failed long ago) the outpoint is spent or free
+	for op, h := range l.Outpoints {
+		if _, ok := l.Payments[h]; !ok {
+			delete(l.Outpoints, op)
 		}
 	}
 	for h, at := range l.Invoices {
