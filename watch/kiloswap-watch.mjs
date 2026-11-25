@@ -302,7 +302,7 @@ if (ALERT_PORT) {
         guard_stall: () => `🐢 Kiloswap: el guardián rechazó por lentitud: ${String(j.reason).slice(0, 200)}`,
         guard_registered: () => `✅ Kiloswap: el guardián se ha registrado en lnd`,
         guard_started: () => `🔄 Kiloswap: el guardián se ha (re)iniciado`,
-        guard_limits: () => `📏 Kiloswap: límites en vigor: ${(j.per_op_sat / 1e8).toFixed(3)} BTC por operación, ${(j.daily_sat / 1e8).toFixed(3)} BTC al día, ${j.pending_reverse} swaps inversos pendientes, ${j.unresolved} depósitos sin confirmar`,
+        guard_limits: () => { const btc = (v) => (v / 1e8).toLocaleString('es-ES', { maximumFractionDigits: 8 }); return `📏 Kiloswap: límites en vigor: ${btc(j.per_op_sat)} BTC por swap, ${btc(j.daily_sat)} BTC al día, máximo ${j.pending_reverse} swaps inversos pendientes y máximo ${j.unresolved} depósitos nuestros sin confirmar a la vez`; },
         guard_stream_ended: () => `⚠️ Kiloswap: el guardián perdió su conexión con lnd (se vuelve a registrar solo)`,
         claim_bumped: () => `⏫ Kiloswap: cobro sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
         refund_bumped: () => `⏫ Kiloswap: reembolso sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
