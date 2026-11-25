@@ -185,6 +185,8 @@ func main() {
 		MaxHoldCltv:          uint64(num("MAX_HOLD_CLTV", 432)),
 		LockupFeeFactor:      2,
 		ApprovedExpireBlocks: num("APPROVED_EXPIRE_BLOCKS", 72),
+		MaxSubTimeoutBlocks:  num("MAX_SUB_TIMEOUT_BLOCKS", 1200),
+		MaxInflightPayments:  int(num("MAX_INFLIGHT_PAYMENTS", 10)),
 		Net:                  net,
 		Swaps:                db,
 		LN:                   sources.LN{Conn: conn},

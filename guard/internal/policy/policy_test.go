@@ -153,7 +153,16 @@ func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
 	return tx.TxHash().String(), nil
 }
 func (c *fakeChain) Confirmations(_ context.Context, txid string) (int64, error) {
-	return c.confs[txid], nil
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if n, ok := c.confs[txid]; ok {
+		return n, nil
+	}
+	var n int64
+	for _, o := range c.txs[txid] {
+		n = max(n, o.Confirmations)
+	}
+	return n, nil
 }
 
 type fakeSwaps struct {
@@ -1139,4 +1148,44 @@ func TestApprovedNeverSeenExpires(t *testing.T) {
 	}
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
 	mustAllow(t, err)
+}
+
+
+// Splitting one lockup's worth into many small outputs does not make them
+// shallow-safe: the depth asked is that of all payments not deep yet.
+func TestDepthByExposureDefeatsSplitting(t *testing.T) {
+	e := newEnv(t)
+	inv, _, _ := e.submarine(110, 900_000, 1_000_000, 110)
+	_, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err) // 1M not deep: 3 confirmations do
+	inv, s2, _ := e.submarine(111, 900_000, 1_000_000, 111)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "6 needed for 2000000")
+	// once the first lockup is deep (12), the second stands alone again
+	for id := range e.chain.txs {
+		if id != s2.LockupTxID {
+			e.chain.confs[id] = 12
+		}
+	}
+	_, err = e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+}
+
+func TestInflightPaymentsCapped(t *testing.T) {
+	e := newEnv(t)
+	e.p.MaxInflightPayments = 1
+	inv, _, _ := e.submarine(112, 100_000, 200_000, 112)
+	_, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	inv, _, _ = e.submarine(113, 100_000, 200_000, 113)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "not claimed yet")
+}
+
+func TestMaxSubmarineTimeout(t *testing.T) {
+	e := newEnv(t)
+	e.p.MaxSubTimeoutBlocks = 50
+	inv, _, _ := e.submarine(114, 100_000, 200_000, 114)
+	_, err := e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "at most 50")
 }

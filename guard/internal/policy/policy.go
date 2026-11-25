@@ -260,6 +260,11 @@ type Policy struct {
 	ReverseMarginBlocks int64
 	// MaxHoldCltv is the most cltv_expiry a hold invoice may ask.
 	MaxHoldCltv uint64
+	// MaxSubTimeoutBlocks is the most a submarine swap's timeout may be
+	// ahead (a long one ties the payment's outcome up for days).
+	MaxSubTimeoutBlocks int64
+	// MaxInflightPayments caps payments made and not claimed yet.
+	MaxInflightPayments int
 	// ApprovedExpireBlocks: a lockup allowed but never found in lnd's wallet
 	// after this many blocks is given up (its reserve released, its hold
 	// invoice cancellable).
@@ -303,6 +308,42 @@ func (p *Policy) confsFor(sat int64) int64 {
 		return max(c, p.ConfTiers[n-1].Confs)
 	}
 	return c
+}
+
+// shallowExposure is what payments not claimed deep yet stand on: the sum
+// of their lockups that are less deep than the last tier, and how many
+// payments are not claimed yet (caller holds p.mu).
+func (p *Policy) shallowExposure(ctx context.Context) (int64, int) {
+	deep := p.RequiredConfs
+	if n := len(p.ConfTiers); n > 0 {
+		deep = max(deep, p.ConfTiers[n-1].Confs)
+	}
+	type lk struct {
+		tx   string
+		vout uint32
+		sat  int64
+	}
+	var check []lk
+	inflight := 0
+	p.Ledger.Lock()
+	for _, x := range p.Ledger.Payments {
+		switch {
+		case x.State == PayInflight || x.State == PayUnknown || x.State == PaySucceeded:
+			inflight++
+			check = append(check, lk{x.LockupTx, x.Vout, x.LockupSat})
+		case x.State == PayClaimed && !x.Bump.Done:
+			check = append(check, lk{x.LockupTx, x.Vout, x.LockupSat})
+		}
+	}
+	p.Ledger.Unlock()
+	var s int64
+	for _, c := range check {
+		confs, err := p.Chain.Confirmations(ctx, c.tx)
+		if err != nil || confs < deep {
+			s += c.sat // unknown counts as shallow
+		}
+	}
+	return s, inflight
 }
 
 // ClaimVbytes is what the guard's claim of a submarine lockup weighs at
@@ -772,8 +813,8 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if !out.Matches(o.PkScript) {
 		return refuse("the lockup output is not the swap output the guard rebuilds")
 	}
-	if need := p.confsFor(o.Sat); o.Confirmations < need {
-		return refuse("the lockup has %d confirmations, %d needed for %d sat", o.Confirmations, need, o.Sat)
+	if o.Confirmations < p.RequiredConfs {
+		return refuse("the lockup has %d confirmations, %d needed", o.Confirmations, p.RequiredConfs)
 	}
 	maxFeeMsat := int64(math.Ceil(math.Max(float64(pr.AmountMsat)*p.FeeRatio, float64(p.MinFeeSat*1000))))
 	// the lockup must cover the invoice and our claim at the node's current
@@ -816,16 +857,30 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if feeMsat > maxFeeMsat+999 { // the backend rounds up to whole sat
 		return refuse("routing fee limit %d msat over %d msat", feeMsat, maxFeeMsat)
 	}
-	return p.allowPay(requestID, &Payment{
+	if p.MaxSubTimeoutBlocks > 0 && s.Timeout-height > p.MaxSubTimeoutBlocks {
+		return refuse("the swap's timeout is %d blocks away, at most %d", s.Timeout-height, p.MaxSubTimeoutBlocks)
+	}
+	return p.allowPay(ctx, o.Confirmations, &Payment{
 		SwapID: s.ID, Hash: hh, Sat: sat, Request: requestID, State: PayInflight,
 		KeyIndex: uint32(s.KeyIndex), UserKey: strings.ToLower(s.RefundKey), Timeout: uint32(s.Timeout),
 		LockupTx: strings.ToLower(s.LockupTxID), Vout: vout, LockupSat: o.Sat,
 	})
 }
 
-func (p *Policy) allowPay(requestID uint64, pay *Payment) error {
+func (p *Policy) allowPay(ctx context.Context, confs int64, pay *Payment) error {
+	requestID := pay.Request
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	// depth by exposure: every payment made against a lockup that is not
+	// deep yet counts, so splitting one big lockup into many small outputs
+	// (each under a tier) asks the depth of their total
+	shallow, inflight := p.shallowExposure(ctx)
+	if p.MaxInflightPayments > 0 && inflight >= p.MaxInflightPayments {
+		return refuse("%d payments not claimed yet, the limit is %d", inflight, p.MaxInflightPayments)
+	}
+	if need := p.confsFor(shallow + pay.LockupSat); confs < need {
+		return refuse("the lockup has %d confirmations, %d needed for %d sat not deep yet (this one and %d more)", confs, need, shallow+pay.LockupSat, shallow)
+	}
 	p.Ledger.Lock()
 	defer p.Ledger.Unlock()
 	op := fmt.Sprintf("%s:%d", pay.LockupTx, pay.Vout)
