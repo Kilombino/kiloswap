@@ -7,6 +7,9 @@
 package api
 
 import (
+	"net"
+	"sync"
+
 	"context"
 	"crypto/subtle"
 	"encoding/json"
@@ -68,9 +71,59 @@ func Serve(ctx context.Context, addr, token string, p *policy.Policy, logger *lo
 	mux.HandleFunc("/v1/claim", handle(p.Claim))
 	mux.HandleFunc("/v1/refund", handle(p.Refund))
 	mux.HandleFunc("/v1/health", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+	// a slow or flooding client must not tie it up: every read and write has
+	// a deadline, headers and bodies are small, connections are few
+	srv := &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: 3 * time.Second,
+		ReadTimeout:       3 * time.Second,
+		WriteTimeout:      2 * time.Minute, // a claim waits on the node
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+	}
 	go func() { <-ctx.Done(); _ = srv.Close() }()
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
 		logger.Fatalf("api: %v", err)
 	}
+	if err := srv.Serve(&dropListener{Listener: ln, slots: make(chan struct{}, MaxConns)}); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logger.Fatalf("api: %v", err)
+	}
+}
+
+// MaxConns is how many connections the API serves at once (the backend
+// needs a handful); more are closed at once, not queued, so a flood can
+// never exhaust the guard's file descriptors (which its lnd stream needs).
+const MaxConns = 64
+
+type dropListener struct {
+	net.Listener
+	slots chan struct{}
+}
+
+func (l *dropListener) Accept() (net.Conn, error) {
+	for {
+		c, err := l.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.slots <- struct{}{}:
+			return &slotConn{Conn: c, free: func() { <-l.slots }}, nil
+		default:
+			c.Close()
+		}
+	}
+}
+
+type slotConn struct {
+	net.Conn
+	once sync.Once
+	free func()
+}
+
+func (c *slotConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.free)
+	return err
 }
