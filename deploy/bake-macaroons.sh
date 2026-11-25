@@ -22,7 +22,7 @@ GUARD_ID=${GUARD_ROOT_KEY_ID:-32}
 backend=(
 	uri:/lnrpc.Lightning/GetInfo uri:/lnrpc.Lightning/AddInvoice uri:/lnrpc.Lightning/LookupInvoice
 	uri:/lnrpc.Lightning/DecodePayReq uri:/lnrpc.Lightning/GetNodeInfo uri:/lnrpc.Lightning/GetChanInfo
-	uri:/lnrpc.Lightning/DescribeGraph uri:/lnrpc.Lightning/QueryRoutes uri:/lnrpc.Lightning/ListChannels
+	uri:/lnrpc.Lightning/QueryRoutes uri:/lnrpc.Lightning/ListChannels
 	uri:/lnrpc.Lightning/ListPeers uri:/lnrpc.Lightning/WalletBalance
 	uri:/lnrpc.Lightning/SubscribePeerEvents uri:/lnrpc.Lightning/SubscribeChannelEvents
 	uri:/lnrpc.Lightning/ExportAllChannelBackups uri:/lnrpc.Lightning/SubscribeChannelBackups

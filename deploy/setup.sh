@@ -8,7 +8,14 @@ cd "$(dirname "$0")"
 set -a; . ./.env; set +a
 R=${KILOSWAP_ROOT:?}
 umask 077
-mkdir -p "$R"/{secrets,postgres,shim,boltz,guard,macaroons,webapp,backups}
+mkdir -p "$R"/{secrets,postgres,shim,boltz,guard,macaroons,webapp,backups} "$R/secrets/lnd-proxy"
+# lnd-proxy's own certificate (the backend trusts it for lnd-proxy:10009)
+if [ ! -s "$R/secrets/lnd-proxy/proxy.crt" ]; then
+	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
+		-subj /CN=lnd-proxy -addext subjectAltName=DNS:lnd-proxy \
+		-keyout "$R/secrets/lnd-proxy/proxy.key" -out "$R/secrets/lnd-proxy/proxy.crt" 2>/dev/null
+	chmod 640 "$R/secrets/lnd-proxy/proxy.key"
+fi
 gen() { [ -s "$R/secrets/$1" ] || openssl rand -hex 24 >"$R/secrets/$1"; }
 gen postgres_password
 gen postgres_admin_password

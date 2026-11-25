@@ -79,7 +79,6 @@ var Allowed = map[string]bool{
 	"/lnrpc.Lightning/DecodePayReq":                false,
 	"/lnrpc.Lightning/GetNodeInfo":                 false,
 	"/lnrpc.Lightning/GetChanInfo":                 false,
-	"/lnrpc.Lightning/DescribeGraph":               false,
 	"/lnrpc.Lightning/QueryRoutes":                 false,
 	"/lnrpc.Lightning/ListChannels":                false, // privacy: see README
 	"/lnrpc.Lightning/ListPeers":                   false, // privacy: see README
@@ -1288,7 +1287,6 @@ func (p *Policy) ResetPending() {
 // heavyCalls are calls cheap to ask and dear to answer (the whole graph,
 // pathfinding, the wallet's history): at most so many a minute.
 var heavyCalls = map[string]int{
-	"/lnrpc.Lightning/DescribeGraph":   6,
 	"/lnrpc.Lightning/QueryRoutes":     120,
 	"/lnrpc.Lightning/GetTransactions": 60,
 	"/lnrpc.Lightning/GetNodeInfo":     240,
@@ -1349,6 +1347,10 @@ func (p *Policy) addInvoice(requestID uint64, m *lnrpc.RPCMessage) error {
 
 // MaxInvoicesPerMinute caps AddInvoice.
 const MaxInvoicesPerMinute = 30
+
+// Lifecycle reports the guard starting, registering with lnd or losing its
+// stream (the operator's bot alerts on starts and lost streams).
+func (p *Policy) Lifecycle(event string) { p.notify(event, map[string]any{}) }
 
 // Stall reports a judgment that took too long or requests that came too
 // fast: the backend's database blocked or slowed down, or lnd flooded. The

@@ -95,7 +95,9 @@ requiredConfirmations = 3
   feeFloor = 1
 
   [[currencies.lnds]]
-  host = "@LND_HOST@"
+  # through lnd-proxy (nginx: requests over 256 KiB stop there); certpath is
+  # the proxy's own certificate
+  host = "lnd-proxy"
   port = 10009
   certpath = "/lnd/tls.cert"
   macaroonpath = "/lnd/kiloswap.macaroon"

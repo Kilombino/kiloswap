@@ -1283,11 +1283,13 @@ func TestAddInvoiceJudged(t *testing.T) {
 
 func TestHeavyCallsRateLimited(t *testing.T) {
 	e := newEnv(t)
-	for i := 0; i < 6; i++ {
-		_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
+	_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
+	mustRefuse(t, err, "not allowed") // the backend has no use for the whole graph
+	for i := 0; i < 60; i++ {
+		_, err := e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.WalletBalanceRequest{})
 		mustAllow(t, err)
 	}
-	_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
+	_, err = e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.WalletBalanceRequest{})
 	mustRefuse(t, err, "a minute")
 }
 

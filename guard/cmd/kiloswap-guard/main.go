@@ -250,13 +250,26 @@ func main() {
 	}
 	logger.Printf("kiloswap-guard: per op %d sat, daily %d sat, LSP reserve %d sat, %d pending reverse swaps",
 		p.MaxPerOpSat, p.DailySat, p.ReserveSat, p.MaxPendingReverse)
+	p.Lifecycle("guard_started")
+	// one full round of its own work (settle claims seen, claim paid
+	// lockups, refund timed-out ones) before lnd can hand it anything: a
+	// restart loop must not keep that work from ever running
+	{
+		tctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		p.Tick(tctx)
+		cancel()
+	}
 	go func() {
 		t := time.NewTicker(15 * time.Second)
 		defer t.Stop()
+		alive := time.NewTicker(5 * time.Minute)
+		defer alive.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
+			case <-alive.C:
+				p.Lifecycle("guard_alive") // the watcher alerts when these stop
 			case <-t.C:
 				tctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 				p.Tick(tctx)

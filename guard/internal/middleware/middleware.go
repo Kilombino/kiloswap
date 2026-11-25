@@ -103,6 +103,7 @@ func Serve(ctx context.Context, conn grpc.ClientConnInterface, p *policy.Policy,
 		}
 		if _, ok := req.InterceptType.(*lnrpc.RPCMiddlewareRequest_RegComplete); ok {
 			logger.Printf("registered with lnd for the %q caveat", policy.CaveatName)
+			p.Lifecycle("guard_registered")
 			// a new registration (lnd restarted?): ids of earlier calls mean
 			// nothing any more
 			p.ResetPending()
@@ -146,11 +147,12 @@ func Serve(ctx context.Context, conn grpc.ClientConnInterface, p *policy.Policy,
 	}
 }
 
-// MaxMessageBytes is the largest message read from lnd (answers such as
-// DescribeGraph's are big); MaxRequestBytes the largest request judged
-// (the backend's are small: a bigger one is refused, not parsed).
+// MaxMessageBytes is the largest message read from lnd (the backend's
+// answers are small: no DescribeGraph; requests over 256 KiB stop at
+// lnd-proxy), well within the guard's memory; MaxRequestBytes the largest
+// request judged (a bigger one is refused, not parsed).
 const (
-	MaxMessageBytes = 64 << 20
+	MaxMessageBytes = 8 << 20
 	MaxRequestBytes = 64 << 10
 )
 
@@ -223,6 +225,7 @@ func Run(ctx context.Context, conn grpc.ClientConnInterface, p *policy.Policy, l
 			return
 		}
 		logger.Printf("stream ended: %v", err)
+		p.Lifecycle("guard_stream_ended")
 		if time.Since(start) > time.Minute {
 			wait = time.Second
 		}

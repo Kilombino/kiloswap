@@ -200,11 +200,14 @@ if (ALERT_PORT) {
         settled: () => `💰 Kiloswap: factura liquidada ${sat(j.sat)} sats (swap ${j.swap})`,
         guard_claim_failed: () => `🚨 Kiloswap: el guardián no ha podido cobrar (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
         guard_lockup_error: () => `🚨 Kiloswap: depósito con problemas (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
+        guard_started: () => `🔄 Kiloswap: el guardián se ha (re)iniciado`,
+        guard_stream_ended: () => `⚠️ Kiloswap: el guardián perdió su conexión con lnd (se vuelve a registrar solo)`,
         claim_bumped: () => `⏫ Kiloswap: cobro sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
         refund_bumped: () => `⏫ Kiloswap: reembolso sin confirmar, reenviado con más comisión (${j.rate} sat/vB, swap ${j.swap})`,
         claim_confirmed: () => `✔️ Kiloswap: cobro confirmado (swap ${j.swap})`,
         refund_confirmed: () => `✔️ Kiloswap: reembolso confirmado (swap ${j.swap})`,
       };
+      if (j.event === 'guard_alive' || j.event === 'guard_registered') { lastAlive = Date.now(); if (j.event === 'guard_alive') return; }
       if (moves[j.event]) { try { await send(moves[j.event]()); } catch { /* next one */ } return; }
       if (j.event !== 'guard_refusal') return;
       const now = Date.now(); burst = now - last < 60_000 ? burst + 1 : 0; last = now;
@@ -220,3 +223,13 @@ if (ALERT_PORT) {
 }
 await pass();
 if (INTERVAL > 0) setInterval(pass, INTERVAL * 1000);
+
+// The guard says it is alive every 5 minutes: silence for 15 is an alert
+// (it may be stopped, crashing in a loop, or not registered with lnd).
+let lastAlive = Date.now();
+let aliveAlerted = false;
+if (ALERT_PORT) setInterval(async () => {
+  if (Date.now() - lastAlive > 15 * 60_000) {
+    if (!aliveAlerted) { aliveAlerted = true; try { await send('🚨 Kiloswap: el guardián lleva 15 minutos sin dar señales (¿parado o reiniciándose?)'); } catch { /* next time */ } }
+  } else aliveAlerted = false;
+}, 60_000);

@@ -98,6 +98,7 @@ services:
       default: {}
     environment:
       LND_GRPC: ${LND_HOST:-lnd-blake2b}:10009
+      GOMEMLIMIT: 100MiB
       LND_TLSCERT: /lnd/tls.cert
       LND_MACAROON: /lnd/kiloswap-guard.macaroon
       DATABASE_URL_FILE: /run/secrets/guard_db_url
@@ -130,22 +131,30 @@ services:
       - ${KILOSWAP_ROOT:?}/secrets/swap_seed:/run/secrets/swap_seed:ro
       - ${KILOSWAP_ROOT:?}/secrets/guard_api_token:/run/secrets/guard_api_token:ro
     logging: *logging
-    mem_limit: 64m
+    # lnd's messages to it are at most 8 MiB (MaxMessageBytes); requests
+    # over 256 KiB never get through lnd-proxy
+    mem_limit: 160m
 
-  # lnd's gRPC port, and nothing else of lnd-net, for the backend; it takes
-  # lnd's name on the internal network so lnd's certificate matches
+  # lnd's gRPC port, and nothing else of lnd-net, for the backend, through
+  # nginx's gRPC proxy: requests over 256 KiB stop here (lnd would take 200
+  # MB and hand each to the guard). The backend trusts the proxy's own
+  # certificate (setup.sh), the proxy checks lnd's.
   lnd-proxy:
-    image: alpine/socat:1.8.0.3
+    image: nginx:1.27-alpine
     security_opt: [no-new-privileges:true]
     read_only: true
     restart: unless-stopped
-    command: ["-d", "TCP-LISTEN:10009,fork,reuseaddr", "TCP:${LND_HOST:-lnd-blake2b}:10009"]
-    networks:
-      lnd: {}
-      internal:
-        aliases: ["${LND_HOST:-lnd-blake2b}"]
+    entrypoint: ["/bin/sh", "-c", "sed \"s/LND_HOST/$$LND_HOST/g\" /etc/lnd-proxy/nginx.conf > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf -g 'daemon off;'"]
+    environment:
+      LND_HOST: ${LND_HOST:-lnd-blake2b}
+    tmpfs: [/tmp]
+    networks: [lnd, internal]
+    volumes:
+      - ./lnd-proxy/nginx.conf:/etc/lnd-proxy/nginx.conf:ro
+      - ${KILOSWAP_ROOT:?}/secrets/lnd-proxy:/certs:ro
+      - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
     logging: *logging
-    mem_limit: 32m
+    mem_limit: 64m
 
   boltz:
     image: kiloswap/backend:${BACKEND_TAG:-dev}
@@ -162,7 +171,7 @@ services:
     command: ["--configpath", "/boltz/boltz.conf", "--datadir", "/boltz"]
     volumes:
       - ${KILOSWAP_ROOT:?}/boltz:/boltz
-      - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
+      - ${KILOSWAP_ROOT:?}/secrets/lnd-proxy/proxy.crt:/lnd/tls.cert:ro
       - ${KILOSWAP_ROOT:?}/macaroons/kiloswap.macaroon:/lnd/kiloswap.macaroon:ro
       - ${KILOSWAP_ROOT:?}/secrets/swap_xpub:/run/secrets/swap_xpub:ro
       - ${KILOSWAP_ROOT:?}/secrets/guard_api_token_backend:/run/secrets/guard_api_token:ro
