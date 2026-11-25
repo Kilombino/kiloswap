@@ -36,6 +36,7 @@ const dust = 330
 func (p *Policy) Tick(ctx context.Context) {
 	p.reconcilePayments(ctx)
 	p.claimPaid(ctx)
+	p.watchClaims(ctx)
 	p.watchLockups(ctx)
 	p.closeHolds(ctx)
 }
@@ -153,9 +154,10 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 	if !out.Matches(o.PkScript) {
 		return "", 0, errors.New("the lockup output changed")
 	}
+	sp := &spendFee{}
 	tx, fee, err := p.spendLeafWith(ctx, out, out.ClaimLeaf, x.LockupTx, x.Vout, o, 0, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, preimage, leaf, cb}
-	}, server)
+	}, server, sp)
 	if err != nil {
 		return "", 0, err
 	}
@@ -163,8 +165,10 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
+	height, _ := p.Chain.Height(ctx)
 	p.Ledger.Lock()
 	x.ClaimTx, x.ClaimFee, x.State = txid, fee, PayClaimed
+	x.Bump = Bump{TxIDs: []string{txid}, Dest: sp.dest, Rate: sp.rate, Height: height}
 	_ = p.Ledger.save()
 	p.Ledger.Unlock()
 	p.notify("claimed", map[string]any{"swap": x.SwapID, "sat": o.Sat - fee, "fee": fee, "txid": txid})
@@ -174,15 +178,21 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 // spendLeafWith builds and signs a transaction spending the swap output
 // txid:vout through leaf to a fresh address of lnd's wallet. lockTime is
 // the refund leaf's timeout (0 for a claim).
+//
+// sp carries a replacement: its address (kept, so a replacement pays the
+// same address) and the least fee rate it must pay (0 for a first spend).
+// The address and fee rate used are written back to sp.
 func (p *Policy) spendLeafWith(ctx context.Context, out *swapscript.Output, leaf txscript.TapLeaf, txid string, vout uint32,
-	o *Output, lockTime uint32, witness func(sig, leaf, cb []byte) wire.TxWitness, key *btcec.PrivateKey) (*wire.MsgTx, int64, error) {
+	o *Output, lockTime uint32, witness func(sig, leaf, cb []byte) wire.TxWitness, key *btcec.PrivateKey, sp *spendFee) (*wire.MsgTx, int64, error) {
 	h, err := chainhash.NewHashFromStr(txid)
 	if err != nil {
 		return nil, 0, err
 	}
-	addr, err := p.LN.NewAddress(ctx)
-	if err != nil {
-		return nil, 0, fmt.Errorf("lnd address: %w", err)
+	addr := sp.dest
+	if addr == "" {
+		if addr, err = p.LN.NewAddress(ctx); err != nil {
+			return nil, 0, fmt.Errorf("lnd address: %w", err)
+		}
 	}
 	pk, err := p.addrScript(addr)
 	if err != nil {
@@ -217,6 +227,9 @@ func (p *Policy) spendLeafWith(ctx context.Context, out *swapscript.Output, leaf
 	if err != nil || rate < 1 {
 		rate = 1
 	}
+	if rate < sp.minRate {
+		rate = sp.minRate
+	}
 	if rate > float64(p.MaxFeeRate) {
 		rate = float64(p.MaxFeeRate)
 	}
@@ -228,7 +241,15 @@ func (p *Policy) spendLeafWith(ctx context.Context, out *swapscript.Output, leaf
 	if err := sign(); err != nil {
 		return nil, 0, err
 	}
+	sp.dest, sp.rate = addr, rate
 	return tx, fee, nil
+}
+
+// spendFee is a guard spend's address and fee rate (see spendLeafWith).
+type spendFee struct {
+	dest    string
+	minRate float64
+	rate    float64
 }
 
 func (p *Policy) broadcast(ctx context.Context, tx *wire.MsgTx) (string, error) {
@@ -327,7 +348,10 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 		if pre, ok := out.PreimageFromClaim(sp.Witness, hash); ok {
 			return p.settleClaimed(ctx, l, pre, sp.TxID)
 		}
-		if l.State == LockRefunding && strings.EqualFold(sp.TxID, l.RefundTx) {
+		if l.State == LockRefunding && (strings.EqualFold(sp.TxID, l.RefundTx) || l.Bump.Ours(sp.TxID)) {
+			if sp.Confirmations < 1 {
+				return p.bumpRefund(ctx, l, out, o, vout, height, true)
+			}
 			if sp.Confirmations >= 1 {
 				p.Ledger.Lock()
 				l.State = LockRefunded
@@ -352,6 +376,10 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 	if l.State == LockSent && height >= int64(l.Timeout) {
 		_, _, err := p.refund(ctx, l, out, o, vout)
 		return err
+	}
+	if l.State == LockRefunding {
+		// our refund is in no block and not in the mempool: dropped
+		return p.bumpRefund(ctx, l, out, o, vout, height, false)
 	}
 	return nil
 }
@@ -425,9 +453,10 @@ func (p *Policy) refund(ctx context.Context, l *Lockup, out *swapscript.Output, 
 	if err != nil {
 		return "", 0, err
 	}
+	sp := &spendFee{}
 	tx, fee, err := p.spendLeafWith(ctx, out, out.RefundLeaf, l.TxID, vout, o, l.Timeout, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, leaf, cb}
-	}, server)
+	}, server, sp)
 	if err != nil {
 		return "", 0, err
 	}
@@ -435,12 +464,195 @@ func (p *Policy) refund(ctx context.Context, l *Lockup, out *swapscript.Output, 
 	if err != nil {
 		return "", 0, err
 	}
+	height, _ := p.Chain.Height(ctx)
 	p.Ledger.Lock()
 	l.State, l.RefundTx = LockRefunding, txid
+	l.Bump = Bump{TxIDs: []string{txid}, Dest: sp.dest, Rate: sp.rate, Height: height}
 	_ = p.Ledger.save()
 	p.Ledger.Unlock()
 	p.notify("refunded", map[string]any{"swap": l.SwapID, "sat": o.Sat - fee, "fee": fee, "txid": txid})
 	return txid, fee, nil
+}
+
+// bumpEvery is how many blocks one of the guard's own spends may stay
+// unconfirmed before the guard replaces it with a higher fee.
+const bumpEvery = 3
+
+// nextRate is the least fee rate of a replacement: half as much again plus
+// 1 sat/vB, which also covers BIP 125's increment over the replaced fee.
+func nextRate(last float64) float64 { return last*1.5 + 1 }
+
+// replacementRate is the least fee rate for replacing (or broadcasting
+// again) a guard spend last broadcast as b, and whether to do it now: one
+// still in the mempool after bumpEvery blocks gets a higher fee (none past
+// max, where it waits); one that fell out of it goes again at once, at a
+// higher fee too once bumpEvery blocks have passed (the mempool dropped it
+// for its fee, most likely).
+func replacementRate(b Bump, height int64, inMempool bool, max float64) (float64, bool) {
+	waited := height-b.Height >= bumpEvery
+	switch {
+	case inMempool && (!waited || b.Rate >= max):
+		return 0, false
+	case waited:
+		return nextRate(b.Rate), true
+	default:
+		return b.Rate, true
+	}
+}
+
+// bumpRefund replaces our refund of l when it stayed unconfirmed bumpEvery
+// blocks (inMempool) or fell out of the mempool (rebroadcast at once, at
+// least at the last fee rate).
+func (p *Policy) bumpRefund(ctx context.Context, l *Lockup, out *swapscript.Output, o *Output, vout uint32, height int64, inMempool bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Ledger.Lock()
+	b := l.Bump
+	p.Ledger.Unlock()
+	if b.Dest == "" {
+		return nil // a refund from before bumps were kept: nothing to replace it with
+	}
+	min, ok := replacementRate(b, height, inMempool, float64(p.MaxFeeRate))
+	if !ok {
+		return nil
+	}
+	server, err := p.Keys.Private(l.KeyIndex)
+	if err != nil {
+		return err
+	}
+	sp := &spendFee{dest: b.Dest, minRate: min}
+	tx, fee, err := p.spendLeafWith(ctx, out, out.RefundLeaf, l.TxID, vout, o, l.Timeout, func(sig, leaf, cb []byte) wire.TxWitness {
+		return wire.TxWitness{sig, leaf, cb}
+	}, server, sp)
+	if err != nil {
+		return err
+	}
+	txid, err := p.broadcast(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("refund replacement: %w", err)
+	}
+	p.Ledger.Lock()
+	l.RefundTx = txid
+	if !l.Bump.Ours(txid) {
+		l.Bump.TxIDs = append(l.Bump.TxIDs, txid)
+	}
+	l.Bump.Rate, l.Bump.Height = sp.rate, height
+	_ = p.Ledger.save()
+	p.Ledger.Unlock()
+	p.notify("refund_bumped", map[string]any{"swap": l.SwapID, "fee": fee, "rate": sp.rate, "txid": txid})
+	return nil
+}
+
+// watchClaims follows the guard's claims of submarine lockups until one
+// confirms: a claim that stays unconfirmed bumpEvery blocks is replaced with
+// a higher fee, one that fell out of the mempool is broadcast again. Before
+// the swap's timeout the user cannot refund, so it must confirm by then.
+func (p *Policy) watchClaims(ctx context.Context) {
+	p.Ledger.Lock()
+	var todo []*Payment
+	for _, x := range p.Ledger.Payments {
+		if x.State == PayClaimed && !x.Bump.Done && x.Bump.Dest != "" {
+			todo = append(todo, x)
+		}
+	}
+	p.Ledger.Unlock()
+	if len(todo) == 0 {
+		return
+	}
+	height, err := p.Chain.Height(ctx)
+	if err != nil {
+		return
+	}
+	for _, x := range todo {
+		if err := p.watchClaim(ctx, x, height); err != nil {
+			p.notify("guard_claim_failed", map[string]any{"swap": x.SwapID, "error": err.Error()})
+		}
+	}
+}
+
+func (p *Policy) watchClaim(ctx context.Context, x *Payment, height int64) error {
+	unspent, err := p.Chain.Unspent(ctx, x.LockupTx, x.Vout)
+	if err != nil {
+		return nil
+	}
+	inMempool := false
+	if !unspent {
+		sp, err := p.Chain.Spender(ctx, x.LockupTx, x.Vout, x.Bump.Height-1)
+		if err != nil || sp == nil {
+			return nil // not found yet
+		}
+		if !x.Bump.Ours(sp.TxID) {
+			p.Ledger.Lock()
+			x.Bump.Done = true
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+			return fmt.Errorf("lockup %s:%d spent by %s, not our claim", x.LockupTx, x.Vout, sp.TxID)
+		}
+		if sp.Confirmations >= 1 {
+			p.Ledger.Lock()
+			x.Bump.Done, x.ClaimTx = true, sp.TxID
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+			p.notify("claim_confirmed", map[string]any{"swap": x.SwapID, "txid": sp.TxID})
+			return nil
+		}
+		inMempool = true
+	}
+	return p.bumpClaim(ctx, x, height, inMempool)
+}
+
+func (p *Policy) bumpClaim(ctx context.Context, x *Payment, height int64, inMempool bool) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Ledger.Lock()
+	b, pre := x.Bump, x.Preimage
+	p.Ledger.Unlock()
+	min, ok := replacementRate(b, height, inMempool, float64(p.MaxFeeRate))
+	if !ok {
+		return nil
+	}
+	preimage, _ := hex.DecodeString(pre)
+	hash, _ := hex.DecodeString(x.Hash)
+	server, err := p.Keys.Private(x.KeyIndex)
+	if err != nil {
+		return err
+	}
+	user, err := p.userKey(x.UserKey)
+	if err != nil {
+		return err
+	}
+	out, err := swapscript.Build(swapscript.Params{Kind: swapscript.Submarine, Server: server.PubKey(), User: user, PaymentHash: hash, Timeout: x.Timeout})
+	if err != nil {
+		return err
+	}
+	o, err := p.Chain.Output(ctx, x.LockupTx, x.Vout)
+	if err != nil {
+		return err
+	}
+	if !out.Matches(o.PkScript) {
+		return errors.New("the lockup output changed")
+	}
+	sp := &spendFee{dest: b.Dest, minRate: min}
+	tx, fee, err := p.spendLeafWith(ctx, out, out.ClaimLeaf, x.LockupTx, x.Vout, o, 0, func(sig, leaf, cb []byte) wire.TxWitness {
+		return wire.TxWitness{sig, preimage, leaf, cb}
+	}, server, sp)
+	if err != nil {
+		return err
+	}
+	txid, err := p.broadcast(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("claim replacement: %w", err)
+	}
+	p.Ledger.Lock()
+	x.ClaimTx, x.ClaimFee = txid, fee
+	if !x.Bump.Ours(txid) {
+		x.Bump.TxIDs = append(x.Bump.TxIDs, txid)
+	}
+	x.Bump.Rate, x.Bump.Height = sp.rate, height
+	_ = p.Ledger.save()
+	p.Ledger.Unlock()
+	p.notify("claim_bumped", map[string]any{"swap": x.SwapID, "fee": fee, "rate": sp.rate, "txid": txid})
+	return nil
 }
 
 func (p *Policy) closeHolds(ctx context.Context) {

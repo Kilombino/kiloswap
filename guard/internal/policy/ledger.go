@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -43,6 +44,29 @@ type Lockup struct {
 	RefundTx string    `json:"refundTx,omitempty"`
 	Preimage string    `json:"preimage,omitempty"`
 	Note     string    `json:"note,omitempty"`
+	Bump     Bump      `json:"refundBump,omitempty"`
+}
+
+// Bump is what the guard needs to replace one of its own spends that did not
+// confirm (or fell out of the mempool) with a higher fee: every transaction
+// id it broadcast for that spend, the address it pays, the last fee rate and
+// the height it was broadcast at.
+type Bump struct {
+	TxIDs  []string `json:"txids,omitempty"`
+	Dest   string   `json:"dest,omitempty"`
+	Rate   float64  `json:"rate,omitempty"`
+	Height int64    `json:"height,omitempty"`
+	Done   bool     `json:"confirmed,omitempty"`
+}
+
+// Ours tells whether txid is one of the spends broadcast for it.
+func (b *Bump) Ours(txid string) bool {
+	for _, t := range b.TxIDs {
+		if strings.EqualFold(t, txid) {
+			return true
+		}
+	}
+	return false
 }
 
 // Lockup states.
@@ -72,6 +96,7 @@ type Payment struct {
 	LockupSat int64     `json:"lockupSat"`
 	ClaimTx   string    `json:"claimTx,omitempty"`
 	ClaimFee  int64     `json:"claimFee,omitempty"`
+	Bump      Bump      `json:"claimBump,omitempty"`
 	At        time.Time `json:"at"`
 }
 

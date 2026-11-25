@@ -678,3 +678,144 @@ func btcutilHD(xpub string) (func(uint32) []byte, error) {
 		return p.SerializeCompressed()
 	}, nil
 }
+
+func feeOf(tx *wire.MsgTx, prevSat int64) int64 { return prevSat - tx.TxOut[0].Value }
+
+// A claim that stays unconfirmed is replaced with a higher fee to the same
+// address after bumpEvery blocks; one that fell out of the mempool goes
+// again; the one that confirms (even an older one) closes it.
+func TestClaimBumped(t *testing.T) {
+	e := newEnv(t)
+	inv, s, pre := e.submarine(12, 100_000, 200_000, 12)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: hex.EncodeToString(pre)}, false)
+	ctx := context.Background()
+	if _, _, err := e.p.Claim(ctx, s.ID); err != nil {
+		t.Fatal(err)
+	}
+	first := e.chain.broadcast[0]
+	o := e.chain.txs[s.LockupTxID][0]
+	var x *Payment
+	for _, y := range e.p.Ledger.Payments {
+		x = y
+	}
+	op := fmt.Sprintf("%s:%d", x.LockupTx, x.Vout)
+	dest := e.ln.addr
+	e.ln.addr = "" // a replacement must not ask lnd for a new address
+	// in the mempool, not long enough: nothing
+	e.chain.spent[op] = true
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness}
+	e.chain.height += bumpEvery - 1
+	e.p.Tick(ctx)
+	if len(e.chain.broadcast) != 1 {
+		t.Fatal("replaced too early")
+	}
+	e.chain.height++
+	e.p.Tick(ctx)
+	if len(e.chain.broadcast) != 2 {
+		t.Fatal("not replaced after bumpEvery blocks")
+	}
+	second := e.chain.broadcast[1]
+	verify(t, second, o.PkScript, o.Sat)
+	if feeOf(second, o.Sat) <= feeOf(first, o.Sat) || addrOf(t, second.TxOut[0].PkScript) != dest {
+		t.Fatalf("replacement fee %d (was %d) to %s", feeOf(second, o.Sat), feeOf(first, o.Sat), addrOf(t, second.TxOut[0].PkScript))
+	}
+	if second.TxIn[0].Sequence >= wire.MaxTxInSequenceNum-1 {
+		t.Fatal("the replacement does not signal RBF")
+	}
+	// dropped from the mempool: broadcast again at once
+	delete(e.chain.spent, op)
+	delete(e.chain.spenders, op)
+	e.p.Tick(ctx)
+	if len(e.chain.broadcast) != 3 {
+		t.Fatal("a dropped claim was not broadcast again")
+	}
+	// the first one confirms after all: done, no more replacements
+	e.chain.spent[op] = true
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 1}
+	e.chain.height += 10
+	e.p.Tick(ctx)
+	e.p.Tick(ctx)
+	if len(e.chain.broadcast) != 3 || !x.Bump.Done {
+		t.Fatal("kept replacing a confirmed claim")
+	}
+}
+
+// The user refunding the lockup (spent by someone else) stops the guard and
+// alerts.
+func TestClaimLostAlerts(t *testing.T) {
+	e := newEnv(t)
+	inv, s, pre := e.submarine(13, 100_000, 200_000, 13)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: hex.EncodeToString(pre)}, false)
+	ctx := context.Background()
+	if _, _, err := e.p.Claim(ctx, s.ID); err != nil {
+		t.Fatal(err)
+	}
+	var x *Payment
+	for _, y := range e.p.Ledger.Payments {
+		x = y
+	}
+	op := fmt.Sprintf("%s:%d", x.LockupTx, x.Vout)
+	e.chain.spent[op] = true
+	e.chain.spenders[op] = &Spend{TxID: strings.Repeat("ab", 32), Confirmations: 1}
+	e.p.Tick(ctx)
+	e.p.Tick(ctx)
+	if !x.Bump.Done || len(e.chain.broadcast) != 1 {
+		t.Fatal("kept claiming a lockup someone else spent")
+	}
+}
+
+// Our refund stuck in the mempool is replaced (same lock time, same
+// address); the replaced one confirming still counts as our refund.
+func TestRefundBumped(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(62, 1_000_000, 62)
+	txid, pk := e.sent(r, 62)
+	ctx := context.Background()
+	e.chain.height = 1100
+	e.p.Tick(ctx)
+	if len(e.chain.broadcast) != 1 {
+		t.Fatal("no refund")
+	}
+	first := e.chain.broadcast[0]
+	op := txid + ":1"
+	e.ln.addr = ""
+	e.chain.spent[op] = true
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness}
+	e.chain.height += bumpEvery
+	e.p.Tick(ctx)
+	if len(e.chain.broadcast) != 2 {
+		t.Fatal("refund not replaced")
+	}
+	second := e.chain.broadcast[1]
+	verify(t, second, pk, r.OnchainAmount)
+	if second.LockTime != first.LockTime || feeOf(second, r.OnchainAmount) <= feeOf(first, r.OnchainAmount) ||
+		!bytes.Equal(second.TxOut[0].PkScript, first.TxOut[0].PkScript) {
+		t.Fatal("the replacement changed the lock time or address, or did not raise the fee")
+	}
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 1}
+	e.p.Tick(ctx)
+	_, hash := preimage(62)
+	if e.ln.invoices[hex.EncodeToString(hash)].State != InvoiceCanceled {
+		t.Fatal("the replaced refund confirming was not taken as ours")
+	}
+}
+
+func TestReplacementRate(t *testing.T) {
+	b := Bump{Rate: 2, Height: 100}
+	if _, ok := replacementRate(b, 101, true, 25); ok {
+		t.Fatal("bumped too early")
+	}
+	if r, ok := replacementRate(b, 103, true, 25); !ok || r != 4 {
+		t.Fatalf("got %v %v", r, ok)
+	}
+	if r, ok := replacementRate(b, 101, false, 25); !ok || r != 2 {
+		t.Fatal("a dropped spend goes again at its rate")
+	}
+	if _, ok := replacementRate(Bump{Rate: 25, Height: 100}, 200, true, 25); ok {
+		t.Fatal("bumped past the cap")
+	}
+}
