@@ -86,6 +86,10 @@ const (
 // not answered: no lockup may be allowed for it.
 const HoldCanceling = "canceling"
 
+// HoldCreating is a hold invoice the guard allowed and lnd has not confirmed
+// creating: recorded first so a lost answer cannot hide it.
+const HoldCreating = "creating"
+
 // Payment is a submarine swap's invoice the guard allowed to be paid, with
 // the lockup output it checked: what it claims on its own once paid.
 type Payment struct {

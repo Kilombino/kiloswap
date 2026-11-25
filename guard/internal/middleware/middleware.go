@@ -46,7 +46,10 @@ func Dial(target, certPath, macaroonPath string) (*grpc.ClientConn, error) {
 	}
 	return grpc.NewClient(target,
 		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(pool, "")),
-		grpc.WithPerRPCCredentials(macaroonCreds(hex.EncodeToString(mac))))
+		grpc.WithPerRPCCredentials(macaroonCreds(hex.EncodeToString(mac))),
+		// lnd forwards every caveat call and answer: a big one must not end
+		// the stream (requests over MaxRequestBytes are refused when judged)
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(MaxMessageBytes)))
 }
 
 type macaroonCreds string
@@ -143,6 +146,14 @@ func Serve(ctx context.Context, conn grpc.ClientConnInterface, p *policy.Policy,
 	}
 }
 
+// MaxMessageBytes is the largest message read from lnd (answers such as
+// DescribeGraph's are big); MaxRequestBytes the largest request judged
+// (the backend's are small: a bigger one is refused, not parsed).
+const (
+	MaxMessageBytes = 64 << 20
+	MaxRequestBytes = 64 << 10
+)
+
 // MaxConcurrent is how many interceptions are judged at once.
 const MaxConcurrent = 32
 
@@ -168,6 +179,11 @@ func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger
 			logger.Printf("refused stream %s: %v", t.StreamAuth.GetMethodFullUri(), err)
 		}
 	case *lnrpc.RPCMiddlewareRequest_Request:
+		if n := len(t.Request.GetSerialized()); n > MaxRequestBytes {
+			feedback.Error = fmt.Sprintf("kiloswap guard: request of %d bytes, over %d", n, MaxRequestBytes)
+			logger.Printf("refused %s: %s", t.Request.GetMethodFullUri(), feedback.Error)
+			return feedback
+		}
 		jctx, cancel := context.WithTimeout(ctx, JudgeTimeout)
 		defer cancel()
 		done := make(chan error, 1)

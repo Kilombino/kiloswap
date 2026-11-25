@@ -67,8 +67,10 @@ func (p *Policy) reconcilePayments(ctx context.Context) {
 		case paymentFailed:
 			p.failed(x)
 		case 0:
-			// lnd never started it (refused before sending): give it back
-			if x.State == PayUnknown && p.now().Sub(x.At).Minutes() > 10 {
+			// lnd has no such payment (never started, or refused before
+			// sending): after ten minutes it is given back, whether the
+			// stream said nothing or looks still open
+			if p.now().Sub(x.At).Minutes() > 10 {
 				p.failed(x)
 			}
 		}
@@ -325,17 +327,32 @@ func (p *Policy) watchLockups(ctx context.Context) {
 }
 
 // findApproved looks for an allowed lockup whose send lnd never confirmed
-// to the guard, among lnd's own wallet transactions (a payment to the same
-// address by anyone else is no lockup of ours); once found and confirmed it
-// is followed like any other (claims settle, the timeout refunds). One never
-// found after ApprovedExpireBlocks is given up.
+// to the guard: on chain, by its rebuilt output and amount in the blocks
+// since it was allowed, taking only an output of a transaction lnd's own
+// wallet sent (asked block by block, so nothing can push it out); a decoy
+// paying the same address is not ours. Once found it is followed like any
+// other (claims settle, the timeout refunds).
+//
+// One never found is NOT given up while its hold invoice may still be paid
+// out: its reserve, daily share and the block on cancelling stay until lnd
+// itself shows the invoice cancelled or settled and the timeout is well
+// past (then nothing of ours can be at stake).
 func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool {
-	txid, vout, confs, err := p.LN.FindWalletSend(ctx, l.Address, l.Sat, l.SentAt-1)
-	if err != nil {
-		return false
+	txid, vout, ok := p.findOwnLockup(ctx, l)
+	if ok {
+		p.Ledger.Lock()
+		if l.State == LockApproved {
+			l.State, l.TxID, l.Vout = LockSent, txid, int32(vout)
+			_ = p.Ledger.save()
+		}
+		p.Ledger.Unlock()
+		p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": txid, "found": true})
+		return true
 	}
-	if txid == "" {
-		if p.ApprovedExpireBlocks > 0 && height-l.SentAt > p.ApprovedExpireBlocks {
+	if p.ApprovedExpireBlocks > 0 && height-l.SentAt > p.ApprovedExpireBlocks && height > int64(l.Timeout)+p.ReverseMarginBlocks+p.HoldExpiryDelta {
+		hash, _ := hex.DecodeString(l.Hash)
+		inv, err := p.LN.LookupInvoice(ctx, hash)
+		if err == nil && (inv == nil || inv.State == InvoiceCanceled || inv.State == InvoiceSettled) {
 			p.Ledger.Lock()
 			if l.State == LockApproved {
 				l.State = LockExpired
@@ -345,19 +362,27 @@ func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool
 			p.Ledger.Unlock()
 			p.notify("guard_lockup_expired", map[string]any{"swap": l.SwapID, "sat": l.Sat})
 		}
-		return false
 	}
-	if confs < 1 {
-		return false // in lnd's wallet but not in a block yet: next round
+	return false
+}
+
+// findOwnLockup scans the blocks since l was allowed for an output paying
+// its rebuilt script and amount, sent by lnd's wallet.
+func (p *Policy) findOwnLockup(ctx context.Context, l *Lockup) (string, uint32, bool) {
+	pk, err := p.addrScript(l.Address)
+	if err != nil {
+		return "", 0, false
 	}
-	p.Ledger.Lock()
-	if l.State == LockApproved {
-		l.State, l.TxID, l.Vout = LockSent, txid, int32(vout)
-		_ = p.Ledger.save()
+	found, err := p.Chain.FindOutputs(ctx, pk, l.Sat, l.SentAt-1)
+	if err != nil {
+		return "", 0, false
 	}
-	p.Ledger.Unlock()
-	p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": txid, "found": true})
-	return true
+	for _, f := range found {
+		if own, err := p.LN.WalletOwns(ctx, f.TxID, f.Height); err == nil && own {
+			return f.TxID, f.Vout, true
+		}
+	}
+	return "", 0, false
 }
 
 func (p *Policy) lockupOutput(ctx context.Context, l *Lockup) (*swapscript.Output, *Output, uint32, error) {
@@ -402,9 +427,9 @@ func (p *Policy) lockupOutput(ctx context.Context, l *Lockup) (*swapscript.Outpu
 func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error {
 	out, o, vout, err := p.lockupOutput(ctx, l)
 	if errors.Is(err, ErrNotYet) && height-l.SentAt > bumpEvery*2 {
-		// the transaction lnd named is not on chain (replaced?): look in
-		// lnd's wallet for what paid the lockup instead
-		if txid, v, confs, ferr := p.LN.FindWalletSend(ctx, l.Address, l.Sat, l.SentAt-1); ferr == nil && txid != "" && confs >= 1 && !strings.EqualFold(txid, l.TxID) {
+		// the transaction lnd named is not on chain (replaced?): look on
+		// chain for what lnd's wallet paid the lockup with instead
+		if txid, v, ok := p.findOwnLockup(ctx, l); ok && !strings.EqualFold(txid, l.TxID) {
 			p.Ledger.Lock()
 			l.TxID, l.Vout = txid, int32(v)
 			_ = p.Ledger.save()
@@ -448,7 +473,7 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 			// the hold invoice is cancelled only when the refund is as deep as
 			// the amount asks (a reorg that undid it would let the user claim
 			// with the preimage after getting the payment back)
-			if sp.Confirmations >= max(finalConfs, p.confsFor(l.Sat)) {
+			if sp.Confirmations >= max(finalConfs, p.confsFor(p.refundExposure(ctx, l))) {
 				p.Ledger.Lock()
 				l.State = LockRefunded
 				_ = p.Ledger.save()
@@ -794,54 +819,123 @@ func (p *Policy) bumpClaim(ctx context.Context, x *Payment, height int64, inMemp
 
 func (p *Policy) closeHolds(ctx context.Context) {
 	p.Ledger.Lock()
-	var open []string
+	var todo []string
 	for h, x := range p.Ledger.Holds {
-		if x.State == "open" || x.State == HoldCanceling {
-			open = append(open, h)
+		if x.State == "open" || x.State == HoldCanceling || x.State == HoldCreating {
+			todo = append(todo, h)
 		}
 	}
 	p.Ledger.Unlock()
-	for _, h := range open {
-		hash, _ := hex.DecodeString(h)
-		inv, err := p.LN.LookupInvoice(ctx, hash)
-		if err != nil {
-			continue
-		}
-		state := ""
-		switch {
-		case inv == nil, inv.State == InvoiceCanceled:
-			state = "canceled"
-		case inv.State == InvoiceSettled:
-			state = "settled"
-		case inv.State == InvoiceAccepted && p.MaxHoldParts > 0 && len(inv.HTLCExpiries) > p.MaxHoldParts:
-			// too many parts hold too many of the channels' HTLC slots (the
-			// bridge's and the LSP's too): cancel it, unless it has a lockup
-			p.Ledger.Lock()
-			_, locked := p.Ledger.Lockups[h]
-			p.Ledger.Unlock()
-			if !locked && p.LN.CancelInvoice(ctx, hash) == nil {
-				state = "canceled"
-				p.notify("guard_hold_canceled", map[string]any{"hash": h, "htlcs": len(inv.HTLCExpiries)})
-			}
-		}
-		if state == "" {
-			// a cancel allowed whose answer never came: open again unless
-			// one is still waiting
-			p.Ledger.Lock()
-			if x := p.Ledger.Holds[h]; x != nil && x.State == HoldCanceling && !p.cancelPending(h) {
-				x.State = "open"
-				_ = p.Ledger.save()
-			}
-			p.Ledger.Unlock()
-			continue
-		}
+	for _, h := range todo {
+		p.closeHold(ctx, h)
+	}
+}
+
+// closeHold brings one hold's record in line with lnd. Changes that could
+// let a lockup through (back to open) or stop one (cancelling) are made
+// under the judgment lock, after a fresh look at lnd.
+func (p *Policy) closeHold(ctx context.Context, h string) {
+	hash, _ := hex.DecodeString(h)
+	inv, err := p.LN.LookupInvoice(ctx, hash)
+	if err != nil {
+		return
+	}
+	set := func(from []string, to string) {
 		p.Ledger.Lock()
-		if x := p.Ledger.Holds[h]; x != nil && (x.State == "open" || x.State == HoldCanceling) {
-			x.State = state
+		defer p.Ledger.Unlock()
+		x := p.Ledger.Holds[h]
+		if x == nil {
+			return
+		}
+		for _, f := range from {
+			if x.State == f {
+				if to == "" {
+					delete(p.Ledger.Holds, h)
+				} else {
+					x.State = to
+				}
+				_ = p.Ledger.save()
+				return
+			}
+		}
+	}
+	p.Ledger.Lock()
+	x := p.Ledger.Holds[h]
+	var state string
+	var at time.Time
+	if x != nil {
+		state, at = x.State, x.At
+	}
+	_, locked := p.Ledger.Lockups[h]
+	p.Ledger.Unlock()
+	switch {
+	case x == nil:
+		return
+	case state == HoldCreating:
+		switch {
+		case inv != nil:
+			set([]string{HoldCreating}, "open") // lnd made it; the rest next round
+		case p.now().Sub(at) > 2*time.Minute && !p.pendingHold(h):
+			set([]string{HoldCreating}, "") // lnd never made it
+		}
+	case inv == nil, inv.State == InvoiceCanceled:
+		set([]string{"open", HoldCanceling}, "canceled")
+	case inv.State == InvoiceSettled:
+		set([]string{"open", HoldCanceling}, "settled")
+	case state == "open" && !locked && inv.State == InvoiceAccepted && p.MaxHoldParts > 0 && len(inv.HTLCExpiries) > p.MaxHoldParts:
+		// too many parts hold too many HTLC slots (the bridge's and the
+		// LSP's too): cancel it, closed to lockups first, under the lock
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		p.Ledger.Lock()
+		x := p.Ledger.Holds[h]
+		_, locked := p.Ledger.Lockups[h]
+		ok := x != nil && x.State == "open" && !locked
+		if ok {
+			x.State = HoldCanceling
 			_ = p.Ledger.save()
 		}
 		p.Ledger.Unlock()
+		if !ok {
+			return
+		}
+		if p.LN.CancelInvoice(ctx, hash) == nil {
+			set([]string{HoldCanceling}, "canceled")
+			p.notify("guard_hold_canceled", map[string]any{"hash": h, "htlcs": len(inv.HTLCExpiries)})
+		} else {
+			set([]string{HoldCanceling}, "open")
+		}
+	case state == HoldCanceling && !p.cancelPending(h):
+		// a cancel allowed whose answer never came: open again only if lnd,
+		// asked afresh under the lock, did not cancel it
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.cancelPending(h) {
+			return
+		}
+		inv, err := p.LN.LookupInvoice(ctx, hash)
+		if err != nil {
+			return
+		}
+		if inv == nil || inv.State == InvoiceCanceled {
+			set([]string{HoldCanceling}, "canceled")
+		} else if inv.State == InvoiceSettled {
+			set([]string{HoldCanceling}, "settled")
+		} else {
+			set([]string{HoldCanceling}, "open")
+		}
 	}
+}
+
+func (p *Policy) pendingHold(hash string) bool {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	for _, r := range p.pending {
+		if r.method == "/invoicesrpc.Invoices/AddHoldInvoice" && r.hash == hash {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Policy) cancelPending(hash string) bool {
@@ -872,4 +966,22 @@ func (p *Policy) claimLeafSpend(x *Payment, sp *Spend) bool {
 	}
 	out, err := swapscript.Build(swapscript.Params{Kind: swapscript.Submarine, Server: server, User: user, PaymentHash: hash, Timeout: x.Timeout})
 	return err == nil && out.SpendsLeaf(sp.Witness, out.ClaimLeaf)
+}
+
+// refundExposure is what refunds not final yet stand on: this lockup and
+// every other being refunded whose hold invoice is still held (a reorg
+// undoing several small refunds costs as much as one big one).
+func (p *Policy) refundExposure(ctx context.Context, l *Lockup) int64 {
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	s := l.Sat
+	for h, x := range p.Ledger.Lockups {
+		if x == l || x.State != LockRefunding {
+			continue
+		}
+		if hold := p.Ledger.Holds[h]; hold != nil && hold.State != "canceled" {
+			s += x.Sat
+		}
+	}
+	return s
 }

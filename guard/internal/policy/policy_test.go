@@ -80,21 +80,17 @@ func (f *fakeLN) CancelInvoice(_ context.Context, h []byte) error {
 	return nil
 }
 func (f *fakeLN) NewAddress(context.Context) (string, error) { return f.addr, nil }
-func (f *fakeLN) FindWalletSend(_ context.Context, address string, sat int64, _ int64) (string, uint32, int64, error) {
+func (f *fakeLN) WalletOwns(_ context.Context, txid string, _ int64) (bool, error) {
 	for _, w := range f.walletSends {
-		if w.address == address && w.sat == sat {
-			return w.txid, w.vout, w.confs, nil
+		if w.txid == txid {
+			return true, nil
 		}
 	}
-	return "", 0, 0, nil
+	return false, nil
 }
 
 type walletSend struct {
-	address string
-	sat     int64
-	txid    string
-	vout    uint32
-	confs   int64
+	txid string
 }
 
 type fakeChain struct {
@@ -151,6 +147,19 @@ func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
 	}
 	c.mu.Unlock()
 	return tx.TxHash().String(), nil
+}
+func (c *fakeChain) FindOutputs(_ context.Context, pk []byte, sat int64, _ int64) ([]Found, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []Found
+	for id, outs := range c.txs {
+		for i, o := range outs {
+			if bytes.Equal(o.PkScript, pk) && o.Sat == sat && o.Confirmations > 0 {
+				out = append(out, Found{TxID: id, Vout: uint32(i), Height: c.height - o.Confirmations + 1})
+			}
+		}
+	}
+	return out, nil
 }
 func (c *fakeChain) Confirmations(_ context.Context, txid string) (int64, error) {
 	c.mu.Lock()
@@ -876,7 +885,7 @@ func TestApprovedLockupFoundWithoutAnswer(t *testing.T) {
 	e.chain.txs[txid] = []Output{{PkScript: []byte{0x51}, Sat: 1}, {PkScript: pk, Sat: r.OnchainAmount, Confirmations: 1}}
 	// a decoy paying the same address and amount, not from lnd's wallet
 	e.chain.txs[strings.Repeat("de", 32)] = []Output{{PkScript: pk, Sat: r.OnchainAmount, Confirmations: 5}}
-	e.ln.walletSends = append(e.ln.walletSends, walletSend{address: r.LockupAddress, sat: r.OnchainAmount, txid: txid, vout: 1, confs: 1})
+	e.ln.walletSends = append(e.ln.walletSends, walletSend{txid: txid})
 	_, hash := preimage(63)
 	l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]
 	e.p.Tick(context.Background())
@@ -1125,10 +1134,10 @@ func TestLockupCheckedBeforeCancelRefused(t *testing.T) {
 	mustRefuse(t, err, "no longer open")
 }
 
-// An allowed lockup never seen in lnd's wallet is given up after
-// ApprovedExpireBlocks: its reserve and daily share come back, its hold
-// invoice can be cancelled.
-func TestApprovedNeverSeenExpires(t *testing.T) {
+// An allowed lockup never seen on chain is NOT given up while its hold
+// invoice is held: no cancel, its reserve and daily share stay. Only once lnd
+// dropped the HTLCs and the timeout is well past is it expired.
+func TestApprovedNeverSeenKeptUntilHTLCsGone(t *testing.T) {
 	e := newEnv(t)
 	e.p.ApprovedExpireBlocks = 72
 	at := time.Unix(1_800_000_000, 0)
@@ -1136,18 +1145,21 @@ func TestApprovedNeverSeenExpires(t *testing.T) {
 	r, _, _ := e.reverse(103, 1_000_000, 103)
 	_, err := e.call(sendURI, sendReq(r))
 	mustAllow(t, err)
-	at = at.Add(time.Hour)
-	e.chain.height += 73
-	e.p.Tick(context.Background())
 	_, hash := preimage(103)
-	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockExpired {
-		t.Fatalf("not expired: %s", l.State)
-	}
-	if e.p.Ledger.since(time.Time{}) != 0 {
-		t.Fatal("the daily share was not given back")
+	at = at.Add(time.Hour)
+	e.chain.height = 1300 // well past the timeout and the expiry window
+	e.p.Tick(context.Background())
+	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockApproved {
+		t.Fatalf("given up while the invoice is held: %s", l.State)
 	}
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
-	mustAllow(t, err)
+	mustRefuse(t, err, "stays until")
+	// lnd itself dropped the HTLCs: now it may go
+	e.ln.invoices[hex.EncodeToString(hash)].State = InvoiceCanceled
+	e.p.Tick(context.Background())
+	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockExpired || e.p.Ledger.since(time.Time{}) != 0 {
+		t.Fatalf("not expired after the HTLCs went: %s", l.State)
+	}
 }
 
 // Splitting one lockup's worth into many small outputs does not make them
@@ -1356,4 +1368,87 @@ func TestRefundStateAndSlots(t *testing.T) {
 	at = at.Add(20 * time.Minute)
 	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
 	mustAllow(t, err)
+}
+
+// ---- the fourth review ----
+
+// A lockup checked while the invoice was held is refused if, under the lock,
+// lnd no longer holds it paid (a stale look must not let it through).
+func TestAllowSendLooksAgainUnderTheLock(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(150, 1_000_000, 150)
+	want, _ := e.p.addrScript(r.LockupAddress)
+	l, err := e.p.checkReverse(context.Background(), r, want, 1000)
+	mustAllow(t, err)
+	_, hash := preimage(150)
+	e.ln.invoices[hex.EncodeToString(hash)].State = InvoiceCanceled
+	err = e.p.allowSend(context.Background(), 1, l, 1000)
+	mustRefuse(t, err, "no longer paid")
+}
+
+// A hold is recorded before lnd is told yes; a lost answer leaves it known,
+// and lnd's own record settles it.
+func TestHoldRecordedBeforeAnswer(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	_, h1 := preimage(151)
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h1, Value: 50_000})
+	mustAllow(t, err)
+	_, h2 := preimage(152)
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h2, Value: 50_000})
+	mustAllow(t, err)
+	if e.p.Ledger.Holds[hex.EncodeToString(h1)].State != HoldCreating {
+		t.Fatal("not recorded before the answer")
+	}
+	e.p.ResetPending() // the stream reset: both answers lost
+	e.ln.invoices[hex.EncodeToString(h1)] = &InvoiceInfo{State: InvoiceOpen}
+	at = at.Add(3 * time.Minute)
+	e.p.Tick(context.Background())
+	if x := e.p.Ledger.Holds[hex.EncodeToString(h1)]; x == nil || x.State != "open" {
+		t.Fatal("a hold lnd made was not taken as open")
+	}
+	if e.p.Ledger.Holds[hex.EncodeToString(h2)] != nil {
+		t.Fatal("a hold lnd never made stays recorded")
+	}
+}
+
+// A payment lnd has no record of goes back after ten minutes even while
+// its stream looks open (it must not fill the in-flight limit for good).
+func TestUnknownToLndPaymentReleased(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	inv, s, _ := e.submarine(153, 100_000, 200_000, 153)
+	_, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	at = at.Add(11 * time.Minute)
+	e.p.Tick(context.Background())
+	if x := e.p.Ledger.Payments[s.PreimageHash]; x.State != PayFailed {
+		t.Fatalf("still %s", x.State)
+	}
+}
+
+// Refund finality by the sum of refunds not final: two 6M refunds ask the
+// depth of 12M (12 confirmations), not 6M's 6.
+func TestRefundFinalityByExposure(t *testing.T) {
+	e := newEnv(t)
+	r1, _, _ := e.reverse(154, 6_000_000, 154)
+	t1, _ := e.sent(r1, 154)
+	r2, _, _ := e.reverse(155, 6_000_000, 155)
+	e.sent(r2, 155)
+	e.chain.height = 1100
+	e.p.Tick(context.Background())
+	op := t1 + ":1"
+	e.chain.spenders[op].Confirmations = 6
+	e.p.Tick(context.Background())
+	_, h1 := preimage(154)
+	if e.ln.invoices[hex.EncodeToString(h1)].State == InvoiceCanceled {
+		t.Fatal("cancelled at 6 confirmations with 12M of refunds not final")
+	}
+	e.chain.spenders[op].Confirmations = 12
+	e.p.Tick(context.Background())
+	if e.ln.invoices[hex.EncodeToString(h1)].State != InvoiceCanceled {
+		t.Fatal("not cancelled at 12")
+	}
 }

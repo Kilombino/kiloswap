@@ -151,10 +151,9 @@ type Lightning interface {
 	// 3 failed) and its preimage once succeeded; 0 if lnd has no payment.
 	TrackPayment(ctx context.Context, hash []byte) (int32, string, error)
 	NewAddress(ctx context.Context) (string, error)
-	// FindWalletSend finds a transaction of lnd's own wallet paying sat to
-	// address (from startHeight on, unconfirmed too): its id, the output and
-	// its confirmations; "" if none.
-	FindWalletSend(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, error)
+	// WalletOwns tells whether txid, mined at height, was sent by lnd's own
+	// wallet.
+	WalletOwns(ctx context.Context, txid string, height int64) (bool, error)
 }
 
 // Output is one transaction output as the node sees it.
@@ -184,6 +183,16 @@ type Chain interface {
 	FeeRate(ctx context.Context) (float64, error) // sat/vB
 	Broadcast(ctx context.Context, rawHex string) (string, error)
 	Confirmations(ctx context.Context, txid string) (int64, error)
+	// FindOutputs lists the outputs paying sat to pkScript in the blocks
+	// from fromHeight on.
+	FindOutputs(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) ([]Found, error)
+}
+
+// Found is an output FindOutputs found.
+type Found struct {
+	TxID   string
+	Vout   uint32
+	Height int64
 }
 
 // Keys are the swaps' server keys, held by the guard alone.
@@ -522,21 +531,13 @@ func (p *Policy) available(ctx context.Context) (int64, error) {
 func (p *Policy) promised() int64 {
 	var s int64
 	for h, x := range p.Ledger.Holds {
-		if x.State != "open" && x.State != HoldCanceling {
+		if x.State != "open" && x.State != HoldCanceling && x.State != HoldCreating {
 			continue
 		}
 		if _, locked := p.Ledger.Lockups[h]; !locked {
 			s += x.Sat
 		}
 	}
-	// and those allowed whose creation lnd has not confirmed yet
-	p.pmu.Lock()
-	for _, r := range p.pending {
-		if r.method == "/invoicesrpc.Invoices/AddHoldInvoice" {
-			s += r.sat
-		}
-	}
-	p.pmu.Unlock()
 	return s
 }
 
@@ -545,6 +546,10 @@ func (p *Policy) promised() int64 {
 func (p *Policy) openHolds() int {
 	n := 0
 	for h, x := range p.Ledger.Holds {
+		if x.State == HoldCreating {
+			n++
+			continue
+		}
 		if x.State != "open" {
 			continue
 		}
@@ -555,13 +560,6 @@ func (p *Policy) openHolds() int {
 			n++
 		}
 	}
-	p.pmu.Lock()
-	for _, r := range p.pending {
-		if r.method == "/invoicesrpc.Invoices/AddHoldInvoice" {
-			n++
-		}
-	}
-	p.pmu.Unlock()
 	return n
 }
 
@@ -720,6 +718,17 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 	defer p.Ledger.Unlock()
 	if _, locked := p.Ledger.Lockups[l.Hash]; locked {
 		return refuse("that hold invoice already has a lockup")
+	}
+	if h := p.Ledger.Holds[l.Hash]; h == nil || h.State != "open" {
+		return refuse("the hold invoice is no longer open (being cancelled?)")
+	}
+	// and lnd still holds it paid, asked again under the lock
+	hb, _ := hex.DecodeString(l.Hash)
+	p.Ledger.Unlock()
+	inv, err := p.LN.LookupInvoice(ctx, hb)
+	p.Ledger.Lock()
+	if err != nil || inv == nil || inv.State != InvoiceAccepted || inv.PaidMsat < l.Sat*1000 {
+		return refuse("the hold invoice is no longer paid and held")
 	}
 	if h := p.Ledger.Holds[l.Hash]; h == nil || h.State != "open" {
 		return refuse("the hold invoice is no longer open (being cancelled?)")
@@ -972,6 +981,13 @@ func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHold
 	if promised := p.promised(); promised+sat > avail {
 		return refuse("%d sat more would not fit the coins left (%d promised, %d available)", sat, promised, avail)
 	}
+	// recorded before lnd is told yes: an answer lost on the way (a stream
+	// reset) leaves the hold known, and closeHolds settles it from lnd
+	p.Ledger.Holds[hh] = &Hold{Sat: sat, At: p.now(), State: HoldCreating}
+	if err := p.Ledger.save(); err != nil {
+		delete(p.Ledger.Holds, hh)
+		return refuse("ledger: %v", err)
+	}
 	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/AddHoldInvoice", hash: hh, sat: sat})
 	return nil
 }
@@ -1008,10 +1024,16 @@ func (p *Policy) cancel(requestID uint64, hash []byte) error {
 		return refuse("not a Kiloswap hold invoice")
 	}
 	if l, ok := p.Ledger.Lockups[h]; ok && l.State != LockRefunded && l.State != LockExpired {
+		// (an allowed lockup never seen is not "expired" until lnd itself
+		// dropped the HTLCs: findApproved)
 		return refuse("its lockup is %s: the invoice stays until the lockup is refunded", l.State)
 	}
 	if hold.State == "open" {
 		hold.State = HoldCanceling // no lockup from now on; back to open if lnd refuses
+		if err := p.Ledger.save(); err != nil {
+			hold.State = "open"
+			return refuse("ledger: %v", err)
+		}
 	}
 	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/CancelInvoice", hash: h})
 	return nil
@@ -1088,24 +1110,31 @@ func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
 			p.Ledger.Unlock()
 		}
 	case "/invoicesrpc.Invoices/AddHoldInvoice":
-		p.done(requestID)
-		if isErr {
-			return
-		}
 		p.Ledger.Lock()
-		p.Ledger.Holds[r.hash] = &Hold{Sat: r.sat, At: p.now(), State: "open"}
-		_ = p.Ledger.save()
+		if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCreating {
+			if isErr {
+				delete(p.Ledger.Holds, r.hash) // lnd did not create it
+			} else {
+				h.State = "open"
+			}
+			_ = p.Ledger.save()
+		}
 		p.Ledger.Unlock()
-	case "/invoicesrpc.Invoices/CancelInvoice", "/invoicesrpc.Invoices/SettleInvoice":
 		p.done(requestID)
+	case "/invoicesrpc.Invoices/CancelInvoice", "/invoicesrpc.Invoices/SettleInvoice":
+		// the hold's state changes before the call stops counting as
+		// pending: nothing may see neither
+		defer p.done(requestID)
 		if isErr {
 			if r.method == "/invoicesrpc.Invoices/CancelInvoice" {
+				p.mu.Lock()
 				p.Ledger.Lock()
 				if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCanceling {
 					h.State = "open" // lnd did not cancel it
 					_ = p.Ledger.save()
 				}
 				p.Ledger.Unlock()
+				p.mu.Unlock()
 			}
 			return
 		}
@@ -1215,16 +1244,9 @@ func (p *Policy) ResetPending() {
 	old := p.pending
 	p.pending = map[uint64]pendingReq{}
 	p.pmu.Unlock()
-	p.Ledger.Lock()
-	for _, r := range old {
-		if r.method == "/invoicesrpc.Invoices/CancelInvoice" {
-			if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCanceling {
-				h.State = "open" // closeHolds settles it from lnd's own record
-			}
-		}
-	}
-	_ = p.Ledger.save()
-	p.Ledger.Unlock()
+	_ = old // holds, lockups and payments of those calls are on the ledger:
+	// closeHolds, watchLockups and reconcilePayments resolve them from lnd
+	// and the chain
 }
 
 // heavyCalls are calls cheap to ask and dear to answer (the whole graph,
@@ -1320,6 +1342,10 @@ func (p *Policy) Forget(requestID uint64) {
 	case "/invoicesrpc.Invoices/CancelInvoice":
 		if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCanceling {
 			h.State = "open"
+		}
+	case "/invoicesrpc.Invoices/AddHoldInvoice":
+		if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCreating {
+			delete(p.Ledger.Holds, r.hash)
 		}
 	case "/routerrpc.Router/SendPaymentV2":
 		if x := p.Ledger.Payments[r.hash]; x != nil && x.Request == requestID && x.State == PayInflight {

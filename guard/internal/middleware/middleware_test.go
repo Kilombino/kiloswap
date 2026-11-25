@@ -84,3 +84,14 @@ func TestJudgmentsConcurrent(t *testing.T) {
 		t.Fatalf("judgments queued: %v", d)
 	}
 }
+
+// A request bigger than MaxRequestBytes is refused without being parsed.
+func TestOversizedRequestRefused(t *testing.T) {
+	j := &slowJudge{}
+	req := &lnrpc.RPCMiddlewareRequest{RequestId: 9, MsgId: 9, InterceptType: &lnrpc.RPCMiddlewareRequest_Request{
+		Request: &lnrpc.RPCMessage{MethodFullUri: "/lnrpc.Lightning/DecodePayReq", Serialized: make([]byte, MaxRequestBytes+1)}}}
+	fb := judge(context.Background(), j, req, log.New(io.Discard, "", 0))
+	if !strings.Contains(fb.Error, "over") {
+		t.Fatalf("not refused: %q", fb.Error)
+	}
+}

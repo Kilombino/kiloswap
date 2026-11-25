@@ -104,28 +104,31 @@ func (l LN) Balance(ctx context.Context) (policy.Balance, error) {
 	return policy.Balance{Confirmed: r.ConfirmedBalance, Locked: r.LockedBalance, AnchorReserve: r.ReservedBalanceAnchorChan}, nil
 }
 
-// FindWalletSend finds a transaction of lnd's own wallet (from startHeight,
-// unconfirmed ones too) paying sat to address: a lockup lnd sent. Only the
-// wallet's own transactions count: anyone can pay the same address.
-func (l LN) FindWalletSend(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, error) {
-	ctx, cancel := call(ctx)
-	defer cancel()
-	var r lnrpc.TransactionDetails
-	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/GetTransactions",
-		&lnrpc.GetTransactionsRequest{StartHeight: int32(max(startHeight, 0)), EndHeight: -1, MaxTransactions: 2000}, &r); err != nil {
-		return "", 0, 0, err
-	}
-	for _, t := range r.Transactions {
-		if t.Amount >= 0 { // not a send of ours
-			continue
+// WalletOwns tells whether txid, mined at height, is a transaction lnd's
+// own wallet sent: it asks only for that block's transactions (paged), so
+// a flood of others cannot push it out of the answer.
+func (l LN) WalletOwns(ctx context.Context, txid string, height int64) (bool, error) {
+	var offset uint32
+	for page := 0; page < 50; page++ {
+		cctx, cancel := call(ctx)
+		var r lnrpc.TransactionDetails
+		err := l.Conn.Invoke(cctx, "/lnrpc.Lightning/GetTransactions",
+			&lnrpc.GetTransactionsRequest{StartHeight: int32(height), EndHeight: int32(height), IndexOffset: offset, MaxTransactions: 500}, &r)
+		cancel()
+		if err != nil {
+			return false, err
 		}
-		for _, o := range t.OutputDetails {
-			if !o.IsOurAddress && o.Address == address && o.Amount == sat {
-				return t.TxHash, uint32(o.OutputIndex), int64(t.NumConfirmations), nil
+		for _, t := range r.Transactions {
+			if strings.EqualFold(t.TxHash, txid) {
+				return t.Amount < 0, nil
 			}
 		}
+		if len(r.Transactions) < 500 {
+			return false, nil
+		}
+		offset = uint32(r.LastIndex)
 	}
-	return "", 0, 0, nil
+	return false, nil
 }
 
 func (l LN) LookupInvoice(ctx context.Context, hash []byte) (*policy.InvoiceInfo, error) {
@@ -437,6 +440,41 @@ func (c Chain) Spender(ctx context.Context, txid string, vout uint32, fromHeight
 
 // maxScan bounds how many blocks one search reads.
 const maxScan = 1500
+
+// FindOutputs lists every output paying sat to pkScript in the blocks from
+// fromHeight on (at most maxScan of them), with the height of each.
+func (c Chain) FindOutputs(ctx context.Context, pkScript []byte, sat int64, fromHeight int64) ([]policy.Found, error) {
+	want := hex.EncodeToString(pkScript)
+	tip, err := c.Height(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if fromHeight < 1 || tip-fromHeight > maxScan {
+		fromHeight = tip - maxScan
+	}
+	var out []policy.Found
+	for h := fromHeight; h <= tip; h++ {
+		var hash string
+		if err := c.rpc(ctx, "getblockhash", []any{h}, &hash); err != nil {
+			return nil, err
+		}
+		var b struct {
+			Tx []rawTx `json:"tx"`
+		}
+		if err := c.rpc(ctx, "getblock", []any{hash, 2}, &b); err != nil {
+			return nil, err
+		}
+		for _, t := range b.Tx {
+			for _, o := range t.Vout {
+				v, err := sats(o.Value)
+				if err == nil && v == sat && strings.EqualFold(o.ScriptPubKey.Hex, want) {
+					out = append(out, policy.Found{TxID: t.Txid, Vout: o.N, Height: h})
+				}
+			}
+		}
+	}
+	return out, nil
+}
 
 // LSP reads the LSP's state file. Requests waiting for payment or paid
 // hold their amount until the channel's funding transaction is out (then
