@@ -136,7 +136,7 @@ start_guard() {
 		-e LND_GRPC=lnd-swap:10009 -e LND_TLSCERT=/lnd/tls.cert -e LND_MACAROON=/lnd/kiloswap-guard.macaroon \
 		-e DATABASE_URL=postgres://kiloswap_guard:guardlab@postgres:5432/boltz \
 		-e LSP_STATE=/lsp/state.json -e LEDGER=/state/ledger.json -e NETWORK=regtest \
-		-e SWAP_MNEMONIC_FILE=/seed/swap-seed -e API_ADDR=:8091 -e API_TOKEN=labtoken \
+		-e SWAP_MNEMONIC_FILE=/seed/swap-seed -e API_ADDR=$GUARD:8091 -e API_TOKEN=labtoken \
 		-e CHAIN_RPC_URL=http://shim:8332/ -e CHAIN_RPC_USER=lab -e CHAIN_RPC_PASSWORD=lab "$@" \
 		alpine:3.22 /kiloswap-guard >/dev/null
 	for _ in $(seq 1 30); do docker logs $GUARD 2>&1 | grep -q registered && return 0; sleep 1; done
@@ -287,6 +287,26 @@ log "pending reverse swaps capped"
 start_guard -e MAX_PENDING_REVERSE=0
 refused "a hold invoice past the pending limit" KS addholdinvoice "$h2" --amt 20000
 start_guard
+
+log "the second review's scenarios"
+# a backend (superuser here, as Paul's lab) locks the swap tables: the guard
+# refuses fast (deadline), lnd keeps answering other calls
+( psql -c 'BEGIN; LOCK TABLE swaps, "reverseSwaps" IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(25); COMMIT;' >/dev/null 2>&1 & )
+sleep 2
+t0=$(date +%s%N)
+refused "SendCoins while the tables are locked" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 2 --force
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$ms" -lt 3000 ] && ok "refused in ${ms} ms (no queueing behind the lock)" || bad "took ${ms} ms"
+t0=$(date +%s%N)
+allowed "GetInfo meanwhile" KS getinfo
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+[ "$ms" -lt 2000 ] && ok "answered in ${ms} ms while the tables are locked" || bad "GetInfo took ${ms} ms"
+docker logs $GUARD 2>&1 | grep -q -E 'guard_stall|canceling statement|lock timeout|statement timeout' \
+	&& ok "the slow query was cut and reported" || bad "no stall/timeout in the guard's log"
+sleep 25
+h3=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
+refused "a hold invoice asking a cltv_expiry over the cap" KS addholdinvoice "$h3" --amt 20000 --cltv_expiry_delta 1000
+refused "a lockup paying the miners 20x the estimate" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 20 --force
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
