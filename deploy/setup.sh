@@ -62,5 +62,5 @@ Secrets in $R/secrets (600). Backend config: $R/boltz/boltz.conf.
 
 For the node's bitcoin.conf (in the maintenance window, see RUNBOOK.md):
 $(auth kiloswap "$rpc")
-$(auth kiloswap-guard "$(cat "$R/secrets/guard_rpc_password")")
+$(auth kiloswap-guard "$(sudo cat "$R/secrets/guard_rpc_password")")
 MSG
