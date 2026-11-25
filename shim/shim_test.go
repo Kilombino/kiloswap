@@ -26,6 +26,7 @@ type fakeNode struct {
 	pruneHeight int64
 	calls       []string
 	paths       []string
+	bodies      []string          // Kiloswap: exactly what the node received
 	prev        map[string]string // block hash -> previous block hash
 	heights     map[string]int    // block hash -> height, stale blocks too
 	// onRequest, when set, runs before each request is answered, with the
@@ -65,6 +66,7 @@ func (n *fakeNode) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.paths = append(n.paths, r.URL.RequestURI())
+	n.bodies = append(n.bodies, string(body))
 	trimmed := bytes.TrimSpace(body)
 	if trimmed[0] == '[' {
 		var reqs []rpcRequest
@@ -271,9 +273,9 @@ func TestProxyAddsTheBlockHash(t *testing.T) {
 		t.Fatalf("verbose flag not kept: %s", last)
 	}
 
-	// Named parameters.
+	// Kiloswap: named parameters are refused (positional only).
 	status, out = h.post(t, `{"id":"x","method":"getrawtransaction","params":{"txid":"`+txid+`"}}`)
-	if status != http.StatusOK || !strings.Contains(out, "block:") {
+	if status != http.StatusBadRequest {
 		t.Fatalf("named: %d %s", status, out)
 	}
 
@@ -500,7 +502,7 @@ func TestReorganisationDuringSync(t *testing.T) {
 
 func TestProxyKeepsTheWalletPath(t *testing.T) {
 	h := newHarness(t, 5, 10)
-	req, _ := http.NewRequest(http.MethodPost, h.shim.URL+"/wallet/kiloswap-empty?x=1", strings.NewReader(`{"id":1,"method":"gettransaction","params":[]}`))
+	req, _ := http.NewRequest(http.MethodPost, h.shim.URL+"/wallet/kiloswap-empty?x=1", strings.NewReader(`{"id":1,"method":"gettransaction","params":["`+hash32("ab", 1)+`"]}`))
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -627,7 +629,7 @@ func TestProxyPatchesBatches(t *testing.T) {
 		{"id":1,"method":"getrawtransaction","params":["`+hash32("ca", 21)+`"]},
 		{"id":2,"method":"getrawtransaction","params":["`+hash32("e", 1)+`"]},
 		{"id":3,"method":"getrawtransaction","params":["`+hash32("f", 9)+`"]},
-		{"id":4,"method":"getrawtransaction","params":["`+hash32("da", 29)+`",1]}
+		{"id":4,"method":"getrawtransaction","params":["`+hash32("da", 29)+`",0]}
 	]`)
 	if status != http.StatusOK {
 		t.Fatal(status)
@@ -679,3 +681,125 @@ func TestBatchWithDuplicateIDs(t *testing.T) {
 
 // An index entry whose block left the active chain is not used, even
 // before the index has caught up with the reorganisation.
+
+// Kiloswap: strict reading (duplicate keys, unknown fields, named params),
+// per-method parameters (no verbosity 2, raw blocks only in batches, at most
+// ten of them) and a canonical request forwarded.
+func TestProxyStrictParams(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	bh := hash32("ba", 3)
+	refused := map[string]string{
+		"duplicate method":    `{"id":1,"method":"getblockcount","method":"stop","params":[]}`,
+		"duplicate in params": `{"id":1,"method":"gettxspendingprevout","params":[[{"txid":"` + bh + `","vout":0,"vout":1}]]}`,
+		"unknown field":       `{"id":1,"method":"getblockcount","params":[],"wallet":"x"}`,
+		"named params":        `{"id":1,"method":"getblock","params":{"blockhash":"` + bh + `"}}`,
+		"verbosity 2":         `{"id":1,"method":"getblock","params":["` + bh + `",2]}`,
+		"verbosity 3":         `{"id":1,"method":"getblock","params":["` + bh + `",3]}`,
+		"not a hash":          `{"id":1,"method":"getblock","params":["x"]}`,
+		"verbose mempool":     `{"id":1,"method":"getrawmempool","params":[true]}`,
+		"tx verbosity 2":      `{"id":1,"method":"getrawtransaction","params":["` + bh + `",2]}`,
+		"fee target":          `{"id":1,"method":"estimatesmartfee","params":[100000]}`,
+		"extra param":         `{"id":1,"method":"getblockcount","params":[1]}`,
+		"trailing data":       `{"id":1,"method":"getblockcount","params":[]} {"id":2,"method":"stop"}`,
+		"verbose in batch":    `[{"id":1,"method":"getblock","params":["` + bh + `",1]}]`,
+		"default in batch":    `[{"id":1,"method":"getblock","params":["` + bh + `"]}]`,
+		"verbose tx batch":    `[{"id":1,"method":"getrawtransaction","params":["` + bh + `",true]}]`,
+		"11 blocks in batch":  "[" + strings.Repeat(`{"id":1,"method":"getblock","params":["`+bh+`",0]},`, 10) + `{"id":1,"method":"getblock","params":["` + bh + `",0]}]`,
+	}
+	for name, body := range refused {
+		h.node.mu.Lock()
+		before := len(h.node.bodies)
+		h.node.mu.Unlock()
+		if status, out := h.post(t, body); status < 400 {
+			t.Errorf("%s: allowed (%d %s)", name, status, out)
+		}
+		h.node.mu.Lock()
+		if len(h.node.bodies) != before {
+			t.Errorf("%s: reached the node", name)
+		}
+		h.node.mu.Unlock()
+	}
+	allowed := []string{
+		`{"id":1,"method":"getblock","params":["` + bh + `"]}`,
+		`{"id":1,"method":"getblock","params":["` + bh + `",1]}`,
+		`{"method":"getblock","params":["` + bh + `",1]}`,
+		`{"method":"getblockchaininfo","params":null}`,
+		"[" + strings.Repeat(`{"method":"getblock","params":["`+bh+`",0]},`, 9) + `{"method":"getblock","params":["` + bh + `",0]}]`,
+		"[" + strings.Repeat(`{"method":"getblockhash","params":[1]},`, 63) + `{"method":"getblockhash","params":[2]}]`,
+	}
+	for _, body := range allowed {
+		if status, out := h.post(t, body); status >= 400 && status != http.StatusInternalServerError {
+			t.Errorf("refused %s: %d %s", body[:min(80, len(body))], status, out)
+		}
+	}
+	// what reaches the node is the shim's re-written request
+	h.post(t, "{ \"params\" : [ \""+bh+"\" , 1 ] , \"id\":9, \"method\":\"getblock\" }")
+	h.node.mu.Lock()
+	last := h.node.bodies[len(h.node.bodies)-1]
+	h.node.mu.Unlock()
+	if last != `{"id":9,"method":"getblock","params":["`+bh+`",1]}` {
+		t.Fatalf("not canonical: %s", last)
+	}
+}
+
+// Kiloswap: an answer larger than maxResponse is never passed on (nor held
+// whole in memory).
+func TestProxyResponseCap(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	old := maxResponse
+	maxResponse = 64
+	defer func() { maxResponse = old }()
+	if status, _ := h.post(t, `{"id":1,"method":"getblockhash","params":[3]}`); status != http.StatusBadGateway {
+		t.Fatalf("an oversized answer: %d", status)
+	}
+}
+
+// Kiloswap: a forward relays at most maxForwardConns connections at once.
+func TestForwardConnectionCap(t *testing.T) {
+	up, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+	go func() {
+		for {
+			c, err := up.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c) }()
+		}
+	}()
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	addr := l.Addr().String()
+	l.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = forward(ctx, addr, up.Addr().String()) }()
+	time.Sleep(100 * time.Millisecond)
+	var conns []net.Conn
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+	for i := 0; i < maxForwardConns; i++ {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, c)
+	}
+	time.Sleep(100 * time.Millisecond)
+	extra, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer extra.Close()
+	_ = extra.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("connection over the cap not closed: %v", err)
+	}
+}

@@ -105,7 +105,10 @@ func (p *proxy) forward(r *http.Request, body []byte) (int, []byte, error) {
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
-	out, err := io.ReadAll(resp.Body)
+	out, err := io.ReadAll(io.LimitReader(resp.Body, int64(maxResponse)+1))
+	if err == nil && len(out) > maxResponse {
+		return 0, nil, errors.New("the node's answer is too large")
+	}
 	return resp.StatusCode, out, err
 }
 
@@ -250,34 +253,67 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trimmedIn := bytes.TrimSpace(body)
+	if err := noDuplicateKeys(trimmedIn); err != nil {
+		http.Error(w, "unreadable request: "+err.Error(), http.StatusBadRequest)
+		return
+	}
 	var reqs []rpcRequest
+	batch := false
 	switch {
 	case len(trimmedIn) > 0 && trimmedIn[0] == '{':
-		req0, err := parseRequest(trimmedIn)
+		req0, err := strictRequest(trimmedIn, false)
 		if err != nil {
-			http.Error(w, "unreadable request", http.StatusBadRequest)
+			http.Error(w, "request refused: "+err.Error(), refusalStatus(err))
 			return
 		}
 		reqs = []rpcRequest{req0}
 	case len(trimmedIn) > 0 && trimmedIn[0] == '[':
 		// the backend's sidecar batches block lookups: each element is
-		// judged like a single request, and a batch is small
+		// judged like a single request (stricter), and a batch is small
+		batch = true
 		var raws []json.RawMessage
 		if json.Unmarshal(trimmedIn, &raws) != nil || len(raws) == 0 || len(raws) > maxBatch {
 			http.Error(w, "unreadable or oversized batch", http.StatusBadRequest)
 			return
 		}
+		blocks := 0
 		for _, raw := range raws {
-			req, err := parseRequest(raw)
+			req, err := strictRequest(raw, true)
 			if err != nil {
-				http.Error(w, "unreadable request in batch", http.StatusBadRequest)
+				http.Error(w, "request in batch refused: "+err.Error(), refusalStatus(err))
 				return
 			}
+			if req.Method == "getblock" {
+				blocks++
+			}
 			reqs = append(reqs, req)
+		}
+		if blocks > maxGetblockPerBatch {
+			http.Error(w, "too many whole blocks in one batch", http.StatusBadRequest)
+			return
 		}
 	default:
 		http.Error(w, "unreadable request", http.StatusBadRequest)
 		return
+	}
+	// the node reads what the shim read, re-written
+	var canon []json.RawMessage
+	for _, req := range reqs {
+		c, err := canonical(req)
+		if err != nil {
+			http.Error(w, "unreadable request", http.StatusBadRequest)
+			return
+		}
+		canon = append(canon, c)
+	}
+	if batch {
+		body, err = json.Marshal(canon)
+		if err != nil {
+			http.Error(w, "unreadable request", http.StatusBadRequest)
+			return
+		}
+	} else {
+		body = canon[0]
 	}
 	for _, req := range reqs {
 		switch {
@@ -320,6 +356,13 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_, _ = w.Write(out)
+}
+
+func refusalStatus(err error) int {
+	if errors.Is(err, errMethod) {
+		return http.StatusForbidden
+	}
+	return http.StatusBadRequest
 }
 
 func (p *proxy) patchBatch(r *http.Request, body, out []byte) []byte {

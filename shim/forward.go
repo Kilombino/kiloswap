@@ -31,6 +31,9 @@ func parseForwards(spec string) (map[string]string, error) {
 	return out, nil
 }
 
+// maxForwardConns caps the connections relayed on one forward at once.
+const maxForwardConns = 16
+
 // forward relays TCP connections on listen to target, byte for byte. The
 // swap backend finds the node's ZMQ endpoints through getzmqnotifications
 // and connects to them at the RPC host, which is this shim, so the shim
@@ -45,6 +48,7 @@ func forward(ctx context.Context, listen, target string) error {
 		ln.Close()
 	}()
 	log.Printf("forwarding %s to %s", listen, target)
+	conns := make(chan struct{}, maxForwardConns)
 	backoff := 5 * time.Millisecond
 	for {
 		conn, err := ln.Accept()
@@ -64,7 +68,18 @@ func forward(ctx context.Context, listen, target string) error {
 			return err
 		}
 		backoff = 5 * time.Millisecond
-		go relay(ctx, conn, target)
+		// Kiloswap: a few subscribers at most (the backend's handful of
+		// ZMQ sockets); more connections are closed at once
+		select {
+		case conns <- struct{}{}:
+			go func() {
+				defer func() { <-conns }()
+				relay(ctx, conn, target)
+			}()
+		default:
+			log.Printf("forward %s: over %d connections, closing one", listen, maxForwardConns)
+			conn.Close()
+		}
 	}
 }
 
