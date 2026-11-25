@@ -174,7 +174,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 
 	-keyout "$work/proxy.key" -out "$work/proxy.crt" 2>/dev/null
 chmod 644 "$work/proxy.key"
 sudo -n cp "$work/proxy.crt" "$LAB/data/lnd-swap/kiloswap-proxy.crt"
-sed 's/LND_HOST/lnd-swap/g' "$here/../deploy/lnd-proxy/nginx.conf" >"$work/lnd-proxy.conf"
+sed -e 's/LND_ADDR/lnd-swap/g' -e 's/LND_TLS_NAME/lnd-swap/g' "$here/../deploy/lnd-proxy/nginx.conf" >"$work/lnd-proxy.conf"
 sed -i 's#^  host = "lnd-swap"#  host = "lnd-proxy"#; s#certpath = "/lnd/tls.cert"#certpath = "/lnd/kiloswap-proxy.crt"#' boltz.conf
 sed -i 's#macaroonpath = "/lnd/boltz.macaroon"#macaroonpath = "/lnd/kiloswap.macaroon"#' boltz.conf
 # hold invoices within the hour, as the guard asks (deploy/boltz.conf.template)
@@ -185,7 +185,8 @@ services:
   lnd-proxy:
     image: nginx:1.27-alpine
     command: ["nginx", "-c", "/etc/lnd-proxy.conf", "-g", "daemon off;"]
-    tmpfs: [/tmp]
+    read_only: true
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
     volumes:
       - $work/lnd-proxy.conf:/etc/lnd-proxy.conf:ro
       - $work/proxy.crt:/certs/proxy.crt:ro
