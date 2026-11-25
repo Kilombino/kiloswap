@@ -302,7 +302,7 @@ func (p *Policy) confsFor(sat int64) int64 {
 
 // ClaimVbytes is what the guard's claim of a submarine lockup weighs at
 // most (one taproot script-path input with preimage, one output).
-const ClaimVbytes = 160
+const ClaimVbytes = 140
 
 type pendingReq struct {
 	method string
@@ -765,9 +765,15 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 		return refuse("the lockup has %d confirmations, %d needed for %d sat", o.Confirmations, need, o.Sat)
 	}
 	maxFeeMsat := int64(math.Ceil(math.Max(float64(pr.AmountMsat)*p.FeeRatio, float64(p.MinFeeSat*1000))))
-	// the lockup must cover the invoice, the most routing may cost and our
-	// claim at the highest fee rate, and leave more than dust
-	cover := sat + (maxFeeMsat+999)/1000 + ClaimVbytes*p.MaxFeeRate + dust + p.ClaimMarginSat
+	// the lockup must cover the invoice and our claim at the node's current
+	// fee rate (what the backend charges as the swap's miner fee); routing
+	// (at most FeeRatio or MinFeeSat) is the operator's cost by design, and
+	// MinInvoiceSat keeps a stream of tiny swaps from adding up
+	est, err := p.Chain.FeeRate(ctx)
+	if err != nil || est < 1 {
+		est = 1
+	}
+	cover := sat + max(p.ClaimMarginSat, int64(math.Ceil(float64(ClaimVbytes)*est)))
 	if o.Sat < cover {
 		return refuse("the lockup pays %d sat, less than the %d sat invoice plus routing and claim costs (%d)", o.Sat, sat, cover)
 	}

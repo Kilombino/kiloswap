@@ -143,7 +143,8 @@ guard stopped.
 - Lockups lnd sent without telling the guard are found on chain; payments
   are always asked about after two minutes.
 - Submarine: invoices of 10,000 sat or more, a lockup that covers the
-  invoice plus the most routing and claim may cost, a swap timeout at
+  invoice plus our claim at the node's fee rate (routing, at most 0.01 % or
+  121 sat, is the operator's cost by design), a swap timeout at
   least 144 blocks ahead, payments final 60 blocks before it, and the
   guard's claim replaced with higher fees (past `MAX_FEE_RATE`, up to 10 %
   of the lockup, in the last 24 blocks).

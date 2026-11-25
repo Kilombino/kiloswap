@@ -1040,3 +1040,19 @@ func TestUrgentClaimFee(t *testing.T) {
 		t.Fatalf("the urgent replacement stayed under MAX_FEE_RATE: %.1f", rate)
 	}
 }
+
+// ClaimVbytes really bounds the guard's claim.
+func TestClaimVbytesBound(t *testing.T) {
+	e := newEnv(t)
+	inv, s, pre := e.submarine(79, 100_000, 200_000, 79)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: hex.EncodeToString(pre)}, false)
+	if _, _, err := e.p.Claim(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	tx := e.chain.broadcast[0]
+	if v := (tx.SerializeSizeStripped()*3 + tx.SerializeSize() + 3) / 4; v > ClaimVbytes {
+		t.Fatalf("claim is %d vB, over ClaimVbytes %d", v, ClaimVbytes)
+	}
+}
