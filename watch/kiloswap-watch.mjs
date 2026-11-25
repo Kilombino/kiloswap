@@ -140,7 +140,13 @@ function text(s) {
   const [icon, what] = map[s.status] || ['•', s.status];
   const dir = s.kind === 'sub' ? 'On-chain → Lightning' : 'Lightning → on-chain';
   const lines = [`${icon} Kiloswap ${short(s.id)} · ${dir}`, what];
-  if (s.kind === 'sub') {
+  if (s.kind === 'sub' && s.status === 'transaction.lockupFailed') {
+    // nothing was paid: say what was expected, what arrived and when the
+    // user can take it back by the script path (the server signs nothing)
+    lines.push(`On-chain: debía enviar ${fmt(s.onchain)} sats${s.locked ? ` y envió ${fmt(s.locked)}` : ''}`);
+    lines.push('Lightning: no se le paga nada');
+    if (s.timeout) lines.push(`Lo recupera con su clave de rescate (Rescue/Refund en la web) desde el bloque ${fmt(s.timeout)}`);
+  } else if (s.kind === 'sub') {
     lines.push(`On-chain: el usuario envía ${fmt(s.onchain)} sats`);
     lines.push(`Lightning: le pagamos ${fmt(s.ln)} sats`);
   } else {
@@ -176,8 +182,8 @@ function text(s) {
 
 let changed = false, lastBackup = 0;
 async function swaps() {
-  const subs = sql(`SELECT id, status, COALESCE("expectedAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("routingFee",0), COALESCE("failureReason",''), COALESCE("lockupTransactionId",'') FROM swaps WHERE "createdAt" > now() - interval '7 days'`)
-    .map(([id, status, onchain, ln, fee, rf, fr, tx]) => ({ kind: 'sub', id, status, onchain: +onchain, ln: +ln, fee: +fee, routingFeeMsat: +rf, failureReason: fr, lockupTx: tx }));
+  const subs = sql(`SELECT id, status, COALESCE("expectedAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("routingFee",0), COALESCE("failureReason",''), COALESCE("lockupTransactionId",''), COALESCE("onchainAmount",0), COALESCE("timeoutBlockHeight",0) FROM swaps WHERE "createdAt" > now() - interval '7 days'`)
+    .map(([id, status, onchain, ln, fee, rf, fr, tx, locked, timeout]) => ({ kind: 'sub', id, status, onchain: +onchain, ln: +ln, fee: +fee, routingFeeMsat: +rf, failureReason: fr, lockupTx: tx, locked: +locked, timeout: +timeout }));
   const revs = sql(`SELECT id, status, COALESCE("onchainAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("failureReason",''), COALESCE("transactionId",'') FROM "reverseSwaps" WHERE "createdAt" > now() - interval '7 days'`)
     .map(([id, status, onchain, ln, fee, fr, tx]) => ({ kind: 'rev', id, status, onchain: +onchain, ln: +ln, fee: +fee, failureReason: fr, lockupTx: tx }));
   for (const s of [...subs, ...revs]) {
