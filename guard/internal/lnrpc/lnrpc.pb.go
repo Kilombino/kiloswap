@@ -2466,7 +2466,7 @@ type AddInvoiceCheck struct {
 	Memo          string                 `protobuf:"bytes,1,opt,name=memo,proto3" json:"memo,omitempty"`
 	RPreimage     []byte                 `protobuf:"bytes,3,opt,name=r_preimage,json=rPreimage,proto3" json:"r_preimage,omitempty"`
 	Value         int64                  `protobuf:"varint,5,opt,name=value,proto3" json:"value,omitempty"`
-	Expiry        int64                  `protobuf:"varint,9,opt,name=expiry,proto3" json:"expiry,omitempty"`
+	Expiry        int64                  `protobuf:"varint,11,opt,name=expiry,proto3" json:"expiry,omitempty"`
 	ValueMsat     int64                  `protobuf:"varint,23,opt,name=value_msat,json=valueMsat,proto3" json:"value_msat,omitempty"`
 	Private       bool                   `protobuf:"varint,15,opt,name=private,proto3" json:"private,omitempty"`
 	unknownFields protoimpl.UnknownFields
@@ -2787,7 +2787,7 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\n" +
 	"r_preimage\x18\x03 \x01(\fR\trPreimage\x12\x14\n" +
 	"\x05value\x18\x05 \x01(\x03R\x05value\x12\x16\n" +
-	"\x06expiry\x18\t \x01(\x03R\x06expiry\x12\x1d\n" +
+	"\x06expiry\x18\v \x01(\x03R\x06expiry\x12\x1d\n" +
 	"\n" +
 	"value_msat\x18\x17 \x01(\x03R\tvalueMsat\x12\x18\n" +
 	"\aprivate\x18\x0f \x01(\bR\aprivate2\xa8\x03\n" +

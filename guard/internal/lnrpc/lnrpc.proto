@@ -278,7 +278,7 @@ message AddInvoiceCheck {
     string memo = 1;
     bytes r_preimage = 3;
     int64 value = 5;
-    int64 expiry = 9;
+    int64 expiry = 11;
     int64 value_msat = 23;
     bool private = 15;
 }

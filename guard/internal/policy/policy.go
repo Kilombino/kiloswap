@@ -288,6 +288,7 @@ type Policy struct {
 	pmu      sync.Mutex
 	pending  map[uint64]pendingReq
 	claimErr map[string]string // last claim error per payment hash
+	calls    map[string][]time.Time
 }
 
 // ConfTier is one step of ConfTiers.
@@ -407,8 +408,10 @@ func (p *Policy) intercept(ctx context.Context, condition string, requestID uint
 		return refuse("%s is not allowed", uri)
 	}
 	if uri == "/lnrpc.Lightning/AddInvoice" {
-		p.track(requestID, pendingReq{method: uri})
-		return nil
+		return p.addInvoice(requestID, m)
+	}
+	if lim, heavy := heavyCalls[uri]; heavy && !p.rate(uri, lim) {
+		return refuse("%s more than %d times a minute", uri, lim)
 	}
 	if !judged {
 		return nil
@@ -1061,7 +1064,7 @@ func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
 		if !isErr && proto.Unmarshal(m.GetSerialized(), &resp) == nil && len(resp.RHash) == 32 {
 			p.Ledger.Lock()
 			p.Ledger.Invoices[hex.EncodeToString(resp.RHash)] = p.now()
-			_ = p.Ledger.save()
+			p.Ledger.MarkDirty() // saved with the next round, not one write each
 			p.Ledger.Unlock()
 		}
 	case "/invoicesrpc.Invoices/AddHoldInvoice":
@@ -1203,6 +1206,70 @@ func (p *Policy) ResetPending() {
 	_ = p.Ledger.save()
 	p.Ledger.Unlock()
 }
+
+// heavyCalls are calls cheap to ask and dear to answer (the whole graph,
+// pathfinding, the wallet's history): at most so many a minute.
+var heavyCalls = map[string]int{
+	"/lnrpc.Lightning/DescribeGraph":   6,
+	"/lnrpc.Lightning/QueryRoutes":     120,
+	"/lnrpc.Lightning/GetTransactions": 60,
+	"/lnrpc.Lightning/GetNodeInfo":     240,
+}
+
+// rate is a per-call limit over the last minute.
+func (p *Policy) rate(key string, perMinute int) bool {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	if p.calls == nil {
+		p.calls = map[string][]time.Time{}
+	}
+	now := p.now()
+	cut := now.Add(-time.Minute)
+	ts := p.calls[key]
+	i := 0
+	for i < len(ts) && ts[i].Before(cut) {
+		i++
+	}
+	ts = ts[i:]
+	if len(ts) >= perMinute {
+		p.calls[key] = ts
+		return false
+	}
+	p.calls[key] = append(ts, now)
+	return true
+}
+
+// addInvoice judges AddInvoice: the backend receives with it (no money
+// leaves), but every one is remembered, so their number, size and life
+// are bounded.
+func (p *Policy) addInvoice(requestID uint64, m *lnrpc.RPCMessage) error {
+	var r lnrpc.AddInvoiceCheck
+	if err := proto.Unmarshal(m.GetSerialized(), &r); err != nil {
+		return refuse("unreadable invoice: %v", err)
+	}
+	sat := r.Value
+	if r.ValueMsat != 0 {
+		sat = (r.ValueMsat + 999) / 1000
+	}
+	switch {
+	case len(r.RPreimage) > 0:
+		return refuse("the preimage is lnd's to choose")
+	case sat < 0 || sat > p.MaxPerOpSat:
+		return refuse("%d sat is not within 0..%d", sat, p.MaxPerOpSat)
+	case r.Expiry < 0 || r.Expiry > 86400:
+		return refuse("expiry %d s over a day", r.Expiry)
+	case len(r.Memo) > 256:
+		return refuse("memo too long")
+	}
+	if !p.rate("AddInvoice", MaxInvoicesPerMinute) {
+		return refuse("more than %d invoices a minute", MaxInvoicesPerMinute)
+	}
+	p.track(requestID, pendingReq{method: "/lnrpc.Lightning/AddInvoice"})
+	return nil
+}
+
+// MaxInvoicesPerMinute caps AddInvoice.
+const MaxInvoicesPerMinute = 30
 
 // Stall reports a judgment that took too long or requests that came too
 // fast: the backend's database blocked or slowed down, or lnd flooded. The

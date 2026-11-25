@@ -1150,7 +1150,6 @@ func TestApprovedNeverSeenExpires(t *testing.T) {
 	mustAllow(t, err)
 }
 
-
 // Splitting one lockup's worth into many small outputs does not make them
 // shallow-safe: the depth asked is that of all payments not deep yet.
 func TestDepthByExposureDefeatsSplitting(t *testing.T) {
@@ -1189,7 +1188,6 @@ func TestMaxSubmarineTimeout(t *testing.T) {
 	_, err := e.call(payURI, payReq(inv))
 	mustRefuse(t, err, "at most 50")
 }
-
 
 // A big reverse lockup's refund cancels the hold invoice only at the depth
 // its amount asks; near the HTLCs' deadline the refund pays what it takes.
@@ -1236,4 +1234,46 @@ func TestRefundFinalityByAmountAndUrgency(t *testing.T) {
 	if rate := float64(feeOf(last, r2.OnchainAmount)) / float64(vsize); rate < float64(e.p.MaxFeeRate) {
 		t.Fatalf("urgent refund at %.1f sat/vB", rate)
 	}
+}
+
+// AddInvoice is judged: bounded amount, expiry and rate, no preimage of the
+// backend's choosing; its records are capped.
+func TestAddInvoiceJudged(t *testing.T) {
+	e := newEnv(t)
+	const uri = "/lnrpc.Lightning/AddInvoice"
+	_, err := e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1000, Expiry: 3600})
+	mustAllow(t, err)
+	_, err = e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1000, Expiry: 10 * 86400})
+	mustRefuse(t, err, "expiry")
+	_, err = e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1000, RPreimage: make([]byte, 32)})
+	mustRefuse(t, err, "preimage")
+	for i := 0; i < MaxInvoicesPerMinute; i++ {
+		e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1})
+	}
+	_, err = e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1})
+	mustRefuse(t, err, "a minute")
+	// the records are capped, oldest first
+	led, _ := OpenLedger(filepath.Join(t.TempDir(), "l.json"), nil)
+	for i := 0; i < MaxInvoices+100; i++ {
+		led.Invoices[fmt.Sprintf("%064x", i)] = time.Now().Add(time.Duration(i) * time.Second)
+	}
+	led.Lock()
+	led.MarkDirty()
+	led.Unlock()
+	if err := led.SaveIfDirty(); err != nil || len(led.Invoices) != MaxInvoices {
+		t.Fatalf("invoices %d, %v", len(led.Invoices), err)
+	}
+	if _, ok := led.Invoices[fmt.Sprintf("%064x", 0)]; ok {
+		t.Fatal("the oldest invoice was kept")
+	}
+}
+
+func TestHeavyCallsRateLimited(t *testing.T) {
+	e := newEnv(t)
+	for i := 0; i < 6; i++ {
+		_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
+		mustAllow(t, err)
+	}
+	_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
+	mustRefuse(t, err, "a minute")
 }

@@ -2,8 +2,10 @@ package policy
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -125,8 +127,20 @@ type Ledger struct {
 	Payments  map[string]*Payment  `json:"payments"`  // by payment hash
 	Outpoints map[string]string    `json:"outpoints"` // txid:vout -> payment hash
 	Invoices  map[string]time.Time `json:"invoices"`  // AddInvoice hashes
+	dirty     bool                 // invoices changed, saved with the next round
 	now       func() time.Time
 }
+
+// maxLedgerBytes bounds what the guard reads at start: its records are
+// capped, so a ledger this big means something is wrong.
+const maxLedgerBytes = 32 << 20
+
+// MaxInvoices caps the AddInvoice hashes remembered (oldest go first), and
+// invoiceKeep is how long one is remembered.
+const (
+	MaxInvoices = 5000
+	invoiceKeep = 7 * 24 * time.Hour
+)
 
 // keep is how long finished records are remembered.
 const keep = 30 * 24 * time.Hour
@@ -140,6 +154,9 @@ func OpenLedger(path string, now func() time.Time) (*Ledger, error) {
 	l.init()
 	if path == "" {
 		return l, nil
+	}
+	if st, err := os.Stat(path); err == nil && st.Size() > maxLedgerBytes {
+		return nil, fmt.Errorf("ledger %s is %d bytes, over %d: something filled it (see its invoices)", path, st.Size(), maxLedgerBytes)
 	}
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -217,11 +234,27 @@ func (l *Ledger) save() error {
 			delete(l.Outpoints, op)
 		}
 	}
+	icut := l.now().Add(-invoiceKeep)
 	for h, at := range l.Invoices {
-		if at.Before(cut) {
+		if at.Before(icut) {
 			delete(l.Invoices, h)
 		}
 	}
+	if len(l.Invoices) > MaxInvoices {
+		type hv struct {
+			h  string
+			at time.Time
+		}
+		all := make([]hv, 0, len(l.Invoices))
+		for h, at := range l.Invoices {
+			all = append(all, hv{h, at})
+		}
+		sort.Slice(all, func(i, j int) bool { return all[i].at.Before(all[j].at) })
+		for _, x := range all[:len(all)-MaxInvoices] {
+			delete(l.Invoices, x.h)
+		}
+	}
+	l.dirty = false
 	b, err := json.MarshalIndent(l, "", " ")
 	if err != nil {
 		return err
@@ -261,4 +294,18 @@ func (l *Ledger) since(t time.Time) int64 {
 		}
 	}
 	return s
+}
+
+// MarkDirty notes a change saved with the next SaveIfDirty (caller holds the
+// lock): records whose loss in a crash only costs a refused lookup.
+func (l *Ledger) MarkDirty() { l.dirty = true }
+
+// SaveIfDirty writes the ledger if MarkDirty was called since the last save.
+func (l *Ledger) SaveIfDirty() error {
+	l.Lock()
+	defer l.Unlock()
+	if !l.dirty {
+		return nil
+	}
+	return l.save()
 }

@@ -40,6 +40,7 @@ func (p *Policy) Tick(ctx context.Context) {
 	p.watchClaims(ctx)
 	p.watchLockups(ctx)
 	p.closeHolds(ctx)
+	_ = p.Ledger.SaveIfDirty()
 }
 
 func (p *Policy) reconcilePayments(ctx context.Context) {
