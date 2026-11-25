@@ -538,6 +538,7 @@ subswap() { # invoice -> creates the swap and pays its lockup; the backend pays 
 	done
 	sleep 10
 }
+attempts() { docker compose logs lnd-swap 2>&1 | grep -F "for payment $1 failed" | grep -c "Attempt" || true; }
 paystate() { LS listpayments --include_incomplete | jq -c --arg h "$1" '[.payments[] | select(.payment_hash == $h)] | last | {status, failure_reason, htlcs: (.htlcs | length)}'; }
 upb() { docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1; for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done; }
 read -r inv1 ph1 < <("$work/hintinv" 20000 "$upk" 60000 0 | paste -sd' ')
@@ -549,7 +550,8 @@ if subswap "$inv1"; then
 	KS payinvoice --pay_req "$inv1" --force --fee_limit 5000 --cltv_limit 40 >"$work/r1" 2>&1 || true
 	st1=$(paystate "$ph1")
 	grep -q '"status":"FAILED"' <<<"$st1" && grep -q '"htlcs":0' <<<"$st1" && grep -q NO_ROUTE <<<"$st1" \
-		&& ok "a 5000 sat fee limit through the attacker's 60 sat hop: lowered by the guard, no route, nothing sent ($st1)" \
+		&& [ "$(attempts "$ph1")" = 0 ] \
+		&& ok "a 5000 sat fee limit through the attacker's 60 sat hop: lowered by the guard, no route, never attempted ($st1)" \
 		|| bad "attacker route: $st1 $(head -c 200 "$work/r1")"
 	upb
 	# the backend retries every 15 s; the third "no route" gives the swap up
@@ -567,9 +569,11 @@ else bad "attacker swap not created"; upb; fi
 # fee, not on the route's length
 read -r inv2 ph2 < <("$work/hintinv" 20000 "$upk" 0 0 | paste -sd' ')
 if subswap "$inv2"; then
-	st2=$(paystate "$ph2")
-	[ -n "$st2" ] && ! grep -q '"htlcs":0' <<<"$st2" && [ "$st2" != null ] \
-		&& ok "a free hop is tried within the rewritten limit: $st2" || bad "the cheap route was not tried: $st2"
+	n2=$(attempts "$ph2")
+	[ "$n2" -gt 0 ] && ok "a free hop is attempted within the rewritten limit ($n2 attempts in lnd's log; its fake end fails them, as expected)" || {
+		bad "the cheap route was not attempted: $(paystate "$ph2")"
+		docker compose logs boltz 2>&1 | grep -E "$sid" | grep -iE "pay|cltv|fail" | tail -5 >&2
+	}
 else bad "cheap swap not created"; fi
 start_guard
 
