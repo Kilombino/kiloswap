@@ -415,7 +415,7 @@ memo=$(LS lookupinvoice "$nh" | jq -r .memo)
 KS cancelinvoice "$nh" >/dev/null 2>&1 || true
 shim() { docker compose exec -T knots sh -c "wget -q -O- --header 'content-type: application/json' --post-data '$2' http://lab:lab@shim:8332$1 2>&1 || true"; }
 shimcode() { docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null -w '%{http_code}' -u lab:lab -H 'content-type: application/json' -d "$2" "http://shim:8332$1"; }
-[ "$(shimcode / '[{"id":1,"method":"getblockcount","params":[]}]')" = 400 ] && ok "the shim refuses batches" || bad "the shim took a batch"
+[ "$(shimcode / '[{"id":1,"method":"getblockcount","params":[]},{"id":2,"method":"stop","params":[]}]')" = 403 ] && ok "the shim refuses a batch with a method outside its list" || bad "the shim took a batch with stop"
 [ "$(shimcode / '{"id":1,"method":"stop","params":[]}')" = 403 ] && ok "the shim refuses methods outside its list (stop)" || bad "the shim forwarded stop"
 [ "$(shimcode /wallet/other '{"id":1,"method":"listunspent","params":[]}')" = 403 ] && ok "the shim refuses other wallets" || bad "the shim reached another wallet"
 [ "$(shimcode / '{"id":1,"method":"getblockcount","params":[]}')" = 200 ] && ok "the shim still answers the backend's methods" || bad "the shim refused getblockcount"

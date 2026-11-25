@@ -69,8 +69,9 @@ services:
   # txindex, the shim also forwards ZMQ, as the backend expects it
   shim:
     image: kiloswap/txindex-shim:${SHIM_TAG:-dev}
-    # Paul's txindex shim with Kiloswap's limits (../shim): no batches, the
-    # backend's methods only, the empty wallet only, 8 calls at once
+    # Paul's txindex shim with Kiloswap's limits (../shim): the backend's
+    # methods only (batches judged per element, at most 100), the empty
+    # wallet only, 8 calls at once
     build: ../shim
     security_opt: [no-new-privileges:true]
     restart: unless-stopped

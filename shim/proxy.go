@@ -17,8 +17,9 @@ import (
 const maxBody = 512 << 10
 
 // Kiloswap: the methods the backend may call, and the wallet ones only on
-// its own empty wallet; no batches; at most maxInflight calls at the node
-// at once (it shares its RPC work queue with the operator's other services).
+// its own empty wallet (in batches too, each element judged); at most
+// maxInflight calls at the node at once (it shares its RPC work queue with
+// the operator's other services).
 var allowedMethods = map[string]bool{
 	"getblock": true, "getblockhash": true, "getblockheader": true, "getblockchaininfo": true,
 	"getbestblockhash": true, "getblockcount": true, "getrawtransaction": true, "gettxout": true,
@@ -33,6 +34,9 @@ var walletMethods = map[string]bool{"getnewaddress": true, "listunspent": true, 
 var WalletPath = "/wallet/kiloswap-empty"
 
 const maxInflight = 8
+
+// maxBatch caps the requests in one JSON-RPC batch.
+const maxBatch = 100
 
 // Bitcoin Core's "No such mempool or blockchain transaction", returned by
 // getrawtransaction without -txindex for anything outside the mempool.
@@ -246,21 +250,43 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	trimmedIn := bytes.TrimSpace(body)
-	if len(trimmedIn) == 0 || trimmedIn[0] != '{' {
-		http.Error(w, "one JSON-RPC request per call (no batches)", http.StatusBadRequest)
-		return
-	}
-	req0, err := parseRequest(trimmedIn)
-	if err != nil {
+	var reqs []rpcRequest
+	switch {
+	case len(trimmedIn) > 0 && trimmedIn[0] == '{':
+		req0, err := parseRequest(trimmedIn)
+		if err != nil {
+			http.Error(w, "unreadable request", http.StatusBadRequest)
+			return
+		}
+		reqs = []rpcRequest{req0}
+	case len(trimmedIn) > 0 && trimmedIn[0] == '[':
+		// the backend's sidecar batches block lookups: each element is
+		// judged like a single request, and a batch is small
+		var raws []json.RawMessage
+		if json.Unmarshal(trimmedIn, &raws) != nil || len(raws) == 0 || len(raws) > maxBatch {
+			http.Error(w, "unreadable or oversized batch", http.StatusBadRequest)
+			return
+		}
+		for _, raw := range raws {
+			req, err := parseRequest(raw)
+			if err != nil {
+				http.Error(w, "unreadable request in batch", http.StatusBadRequest)
+				return
+			}
+			reqs = append(reqs, req)
+		}
+	default:
 		http.Error(w, "unreadable request", http.StatusBadRequest)
 		return
 	}
-	switch {
-	case walletMethods[req0.Method] && r.URL.Path == WalletPath:
-	case allowedMethods[req0.Method] && (r.URL.Path == "/" || r.URL.Path == ""):
-	default:
-		http.Error(w, "method not allowed here: "+req0.Method, http.StatusForbidden)
-		return
+	for _, req := range reqs {
+		switch {
+		case walletMethods[req.Method] && r.URL.Path == WalletPath:
+		case allowedMethods[req.Method] && (r.URL.Path == "/" || r.URL.Path == ""):
+		default:
+			http.Error(w, "method not allowed here: "+req.Method, http.StatusForbidden)
+			return
+		}
 	}
 	if p.slots == nil {
 		p.slots = make(chan struct{}, maxInflight)

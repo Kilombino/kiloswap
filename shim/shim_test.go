@@ -303,14 +303,16 @@ func TestProxyAddsTheBlockHash(t *testing.T) {
 	}
 }
 
-// Kiloswap: batches are refused (the backend sends none; one request per
-// call keeps the method allowlist exact).
-func TestProxyRefusesBatches(t *testing.T) {
+// Kiloswap: batches are judged element by element and kept small.
+func TestProxyBatchLimits(t *testing.T) {
 	h := newHarness(t, 30, 10)
 	h.sync(t)
-	status, _ := h.post(t, `[{"id":1,"method":"getblockcount","params":[]}]`)
-	if status != http.StatusBadRequest {
-		t.Fatal(status)
+	if status, _ := h.post(t, `[{"id":1,"method":"getblockcount","params":[]},{"id":2,"method":"stop","params":[]}]`); status != http.StatusForbidden {
+		t.Fatalf("a batch with stop: %d", status)
+	}
+	big := "[" + strings.Repeat(`{"id":1,"method":"getblockcount","params":[]},`, maxBatch) + `{"id":1,"method":"getblockcount","params":[]}]`
+	if status, _ := h.post(t, big); status != http.StatusBadRequest {
+		t.Fatalf("an oversized batch: %d", status)
 	}
 }
 
@@ -615,3 +617,65 @@ func TestSyncRecordsWhenItReachedTheTip(t *testing.T) {
 		t.Fatal("not recorded")
 	}
 }
+
+func TestProxyPatchesBatches(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	h.node.mempool[hash32("e", 1)] = true
+
+	status, out := h.post(t, `[
+		{"id":1,"method":"getrawtransaction","params":["`+hash32("ca", 21)+`"]},
+		{"id":2,"method":"getrawtransaction","params":["`+hash32("e", 1)+`"]},
+		{"id":3,"method":"getrawtransaction","params":["`+hash32("f", 9)+`"]},
+		{"id":4,"method":"getrawtransaction","params":["`+hash32("da", 29)+`",1]}
+	]`)
+	if status != http.StatusOK {
+		t.Fatal(status)
+	}
+	var resps []rawResponse
+	if err := json.Unmarshal([]byte(out), &resps); err != nil {
+		t.Fatal(err)
+	}
+	if len(resps) != 4 {
+		t.Fatalf("%d responses", len(resps))
+	}
+	byID := map[string]rawResponse{}
+	for _, r := range resps {
+		byID[string(r.ID)] = r
+	}
+	if !strings.Contains(string(byID["1"].Result), "block:"+hash32("ba", 21)) {
+		t.Fatalf("1: %s", byID["1"].Result)
+	}
+	if !strings.Contains(string(byID["2"].Result), "mempool:") {
+		t.Fatalf("2: %s", byID["2"].Result)
+	}
+	if byID["3"].Error == nil || byID["3"].Error.Code != -5 {
+		t.Fatalf("3 should still be not found")
+	}
+	if !strings.Contains(string(byID["4"].Result), "block:"+hash32("ba", 29)) {
+		t.Fatalf("4: %s", byID["4"].Result)
+	}
+}
+
+func TestBatchWithDuplicateIDs(t *testing.T) {
+	h := newHarness(t, 30, 10)
+	h.sync(t)
+	a, b := hash32("ca", 28), hash32("ca", 29)
+	_, out := h.post(t, `[{"id":1,"method":"getrawtransaction","params":["`+a+`"]},{"id":1,"method":"getrawtransaction","params":["`+b+`"]}]`)
+	var resps []rawResponse
+	if err := json.Unmarshal([]byte(out), &resps); err != nil {
+		t.Fatal(err)
+	}
+	if len(resps) != 2 {
+		t.Fatalf("%s", out)
+	}
+	if got := string(resps[0].Result); !strings.Contains(got, a) {
+		t.Errorf("first answer is %s, not for %s", got, a)
+	}
+	if got := string(resps[1].Result); !strings.Contains(got, b) {
+		t.Errorf("second answer is %s, not for %s", got, b)
+	}
+}
+
+// An index entry whose block left the active chain is not used, even
+// before the index has caught up with the reorganisation.
