@@ -701,8 +701,8 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 		return refuse("a fee limit is required")
 	case r.CltvLimit <= 0:
 		return refuse("a cltv_limit is required")
-	case r.TimeoutSeconds < 60 || r.TimeoutSeconds > 120:
-		return refuse("timeout_seconds must be within 60..120")
+	case r.TimeoutSeconds < 60 || r.TimeoutSeconds > 300:
+		return refuse("timeout_seconds must be within 60..300 (the backend asks 300)")
 	}
 	pr, err := p.LN.DecodePayReq(ctx, r.PaymentRequest)
 	if err != nil {
