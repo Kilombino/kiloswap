@@ -158,6 +158,8 @@ allowed "GetInfo through the guard" KS getinfo
 log "backend on the guarded macaroon and the xpub: the e2e scenarios"
 cp boltz.conf "$work/boltz.conf.orig"
 sed -i 's#macaroonpath = "/lnd/boltz.macaroon"#macaroonpath = "/lnd/kiloswap.macaroon"#' boltz.conf
+# hold invoices within the hour, as the guard asks (deploy/boltz.conf.template)
+grep -q '^invoiceExpiry' boltz.conf || sed -i '0,/^swapTypes = .*/s//&\ninvoiceExpiry = 3600/' boltz.conf
 grep -q kiloswap.macaroon boltz.conf || { bad "boltz.conf not switched"; exit 1; }
 cat >"$work/override.yml" <<YML
 services:
@@ -256,7 +258,7 @@ psql -c "DELETE FROM \"reverseSwaps\" WHERE id='forged4'" >/dev/null
 # 4. that foreign hold invoice cannot be cancelled or settled, nor claimed as
 #    its own by adding it again
 refused "cancel a foreign held invoice (bridge-like)" KS cancelinvoice "$fhash"
-refused "add a hold invoice with an existing hash" KS addholdinvoice "$fhash" --amt 1000
+refused "add a hold invoice with an existing hash" KS addholdinvoice "$fhash" --amt 1000 --expiry 3600
 refused "...and cancel it afterwards" KS cancelinvoice "$fhash"
 LS cancelinvoice "$fhash" >/dev/null 2>&1 || true
 # 5. another service's ordinary invoice cannot be looked up (its preimage)
@@ -266,7 +268,7 @@ refused "look up another service's invoice" KS lookupinvoice "$orh"
 refused "SendCoins with a confirmation target instead of a fee rate" KS sendcoins --addr "$addr" --amt 100000 --conf_target 2 --force
 
 own=$(openssl rand -hex 32); ownhash=$(printf %s "$own" | xxd -r -p | sha256sum | cut -d' ' -f1)
-allowed "a hold invoice of its own (within the limits)" KS addholdinvoice "$ownhash" --amt 20000
+allowed "a hold invoice of its own (within the limits)" KS addholdinvoice "$ownhash" --amt 20000 --expiry 3600
 allowed "cancel its own hold invoice" KS cancelinvoice "$ownhash"
 
 log "the LSP's reserve"
@@ -278,15 +280,15 @@ path, conf = sys.argv[1], int(sys.argv[2])
 json.dump({"orders": {"lab": {"sats": conf - 50_000_000 - 10_000, "status": "paid"}}, "channels": {}}, open(path, "w"))
 PY
 h2=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
-refused "a hold invoice the coins left cannot back" KS addholdinvoice "$h2" --amt 20000
+refused "a hold invoice the coins left cannot back" KS addholdinvoice "$h2" --amt 20000 --expiry 3600
 echo '{"orders":{},"channels":{}}' >"$work/lsp-state.json"
 echo 'not json' >"$work/lsp-state.json"
-refused "anything on-chain with the LSP state unreadable" KS addholdinvoice "$h2" --amt 20000
+refused "anything on-chain with the LSP state unreadable" KS addholdinvoice "$h2" --amt 20000 --expiry 3600
 echo '{"orders":{},"channels":{}}' >"$work/lsp-state.json"
 
 log "pending reverse swaps capped"
 start_guard -e MAX_PENDING_REVERSE=0
-refused "a hold invoice past the pending limit" KS addholdinvoice "$h2" --amt 20000
+refused "a hold invoice past the pending limit" KS addholdinvoice "$h2" --amt 20000 --expiry 3600
 start_guard
 
 log "the second review's scenarios"
@@ -306,7 +308,7 @@ docker logs $GUARD 2>&1 | grep -q -E 'guard_stall|canceling statement|lock timeo
 	&& ok "the slow query was cut and reported" || bad "no stall/timeout in the guard's log"
 sleep 25
 h3=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
-refused "a hold invoice asking a cltv_expiry over the cap" KS addholdinvoice "$h3" --amt 20000 --cltv_expiry_delta 1000
+refused "a hold invoice asking a cltv_expiry over the cap" KS addholdinvoice "$h3" --amt 20000 --cltv_expiry_delta 1000 --expiry 3600
 refused "a lockup paying the miners 20x the estimate" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 20 --force
 
 log "the third review: a cancel and a lockup of one hold invoice at once"

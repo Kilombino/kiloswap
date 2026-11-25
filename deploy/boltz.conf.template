@@ -55,6 +55,9 @@ base = "BTC"
 quote = "BTC"
 rate = 1
 swapTypes = ["submarine", "reverse"]
+# reverse swaps' hold invoices expire within the hour (the guard refuses
+# longer ones: an unpaid one must not hold a slot or a promise for long)
+invoiceExpiry = 3600
 # Lightning → on-chain (reverse): 0.15 %
 fee = 0.15
 # On-chain → Lightning (submarine): 0.01 %
