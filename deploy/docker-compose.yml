@@ -9,9 +9,11 @@
 #     backend gets the extended public key and asks the guard for claims and
 #     refunds; its own seed.dat is a fresh, unrelated one;
 #   - the backend sits on an internal network: postgres, the shim (node RPC
-#     and ZMQ), the guard's API and lnd's gRPC port through lnd-proxy, which
-#     answers to lnd's name so its certificate still matches. No route to
-#     lnd-net (tor-lnd), the host's LAN or the internet;
+#     and ZMQ, limited to the backend's methods), the guard's API and lnd's
+#     gRPC port through lnd-proxy (nginx's gRPC proxy, with its own
+#     certificate the backend trusts; requests over 256 KiB stop there).
+#     The internal network is isolated: no route to lnd-net (tor-lnd), the
+#     host's services, the LAN or the internet;
 #   - nothing is published but the web front on 127.0.0.1 (a tunnel and an
 #     onion service in front of it).
 #
