@@ -121,10 +121,13 @@ services:
       LSP_STATE: /lsp/state.json
       LEDGER: /state/ledger.json
       ALERT_URL: ${ALERT_URL:-}
-      MAX_PER_OP_SAT: ${MAX_PER_OP_SAT:-100000000}
-      DAILY_SAT: ${DAILY_SAT:-200000000}
+      # launch limits by default (0.1 BTC per operation, 0.25 BTC a day);
+      # the later 1 / 2 BTC only by setting both explicitly in .env
+      MAX_PER_OP_SAT: ${MAX_PER_OP_SAT:-10000000}
+      DAILY_SAT: ${DAILY_SAT:-25000000}
       RESERVE_SAT: ${RESERVE_SAT:-50000000}
       MAX_PENDING_REVERSE: ${MAX_PENDING_REVERSE:-5}
+      MAX_UNRESOLVED: ${MAX_UNRESOLVED:-2}
       FEE_RATIO: ${FEE_RATIO:-0.0001}
       REQUIRED_CONFS: ${REQUIRED_CONFS:-3}
       HOLD_EXPIRY_DELTA: "18"

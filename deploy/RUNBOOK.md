@@ -33,6 +33,14 @@ datos en `${KILOSWAP_ROOT}`.
    token del API del guardián y las dos líneas `rpcauth=` para el nodo
    (`kiloswap` para el backend y el shim, `kiloswap-guard` para el
    guardián).
+   **Límites de lanzamiento por defecto**: 0,1 BTC por operación
+   (`MAX_PER_OP_SAT=10000000`) y 0,25 BTC al día (`DAILY_SAT=25000000`),
+   con 2 depósitos sin confirmar como mucho (`MAX_UNRESOLVED=2`). Vienen
+   así en `docker-compose.yml`, en `.env.example` y en el guardián aunque
+   falte la variable; `./test-defaults.sh` lo comprueba. Subirlos es una
+   decisión expresa (cambiar `.env`), nunca un olvido. Al arrancar, el
+   guardián escribe en el log y avisa por Telegram (`guard_limits`) de los
+   límites en vigor: comprobar ese aviso tras cada despliegue.
 4. **Cartera vacía del backend en el nodo**, en caliente:
    `bitcoin-cli createwallet kiloswap-empty true true`
    (sin claves y en blanco, solo para los caminos raros del backend).
