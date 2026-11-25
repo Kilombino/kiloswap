@@ -883,12 +883,13 @@ func (x *PaymentHash) GetRHash() []byte {
 
 // Only what the guard reads of an invoice; the rest is skipped.
 type Invoice struct {
-	state       protoimpl.MessageState `protogen:"open.v1"`
-	RHash       []byte                 `protobuf:"bytes,4,opt,name=r_hash,json=rHash,proto3" json:"r_hash,omitempty"`
-	Value       int64                  `protobuf:"varint,5,opt,name=value,proto3" json:"value,omitempty"`
-	ValueMsat   int64                  `protobuf:"varint,23,opt,name=value_msat,json=valueMsat,proto3" json:"value_msat,omitempty"`
-	AmtPaidSat  int64                  `protobuf:"varint,19,opt,name=amt_paid_sat,json=amtPaidSat,proto3" json:"amt_paid_sat,omitempty"`
-	AmtPaidMsat int64                  `protobuf:"varint,20,opt,name=amt_paid_msat,json=amtPaidMsat,proto3" json:"amt_paid_msat,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	RHash        []byte                 `protobuf:"bytes,4,opt,name=r_hash,json=rHash,proto3" json:"r_hash,omitempty"`
+	Value        int64                  `protobuf:"varint,5,opt,name=value,proto3" json:"value,omitempty"`
+	CreationDate int64                  `protobuf:"varint,7,opt,name=creation_date,json=creationDate,proto3" json:"creation_date,omitempty"`
+	ValueMsat    int64                  `protobuf:"varint,23,opt,name=value_msat,json=valueMsat,proto3" json:"value_msat,omitempty"`
+	AmtPaidSat   int64                  `protobuf:"varint,19,opt,name=amt_paid_sat,json=amtPaidSat,proto3" json:"amt_paid_sat,omitempty"`
+	AmtPaidMsat  int64                  `protobuf:"varint,20,opt,name=amt_paid_msat,json=amtPaidMsat,proto3" json:"amt_paid_msat,omitempty"`
 	// OPEN = 0, SETTLED = 1, CANCELED = 2, ACCEPTED = 3
 	State         int32          `protobuf:"varint,21,opt,name=state,proto3" json:"state,omitempty"`
 	Htlcs         []*InvoiceHTLC `protobuf:"bytes,22,rep,name=htlcs,proto3" json:"htlcs,omitempty"`
@@ -936,6 +937,13 @@ func (x *Invoice) GetRHash() []byte {
 func (x *Invoice) GetValue() int64 {
 	if x != nil {
 		return x.Value
+	}
+	return 0
+}
+
+func (x *Invoice) GetCreationDate() int64 {
+	if x != nil {
+		return x.CreationDate
 	}
 	return 0
 }
@@ -2624,10 +2632,11 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\vPaymentHash\x12\x1c\n" +
 	"\n" +
 	"r_hash_str\x18\x01 \x01(\tR\brHashStr\x12\x15\n" +
-	"\x06r_hash\x18\x02 \x01(\fR\x05rHash\"\xdb\x01\n" +
+	"\x06r_hash\x18\x02 \x01(\fR\x05rHash\"\x80\x02\n" +
 	"\aInvoice\x12\x15\n" +
 	"\x06r_hash\x18\x04 \x01(\fR\x05rHash\x12\x14\n" +
-	"\x05value\x18\x05 \x01(\x03R\x05value\x12\x1d\n" +
+	"\x05value\x18\x05 \x01(\x03R\x05value\x12#\n" +
+	"\rcreation_date\x18\a \x01(\x03R\fcreationDate\x12\x1d\n" +
 	"\n" +
 	"value_msat\x18\x17 \x01(\x03R\tvalueMsat\x12 \n" +
 	"\famt_paid_sat\x18\x13 \x01(\x03R\n" +

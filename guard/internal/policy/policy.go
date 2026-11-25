@@ -126,8 +126,10 @@ type Swap struct {
 
 // InvoiceInfo is lnd's own record of an invoice.
 type InvoiceInfo struct {
-	State    int32
-	PaidMsat int64
+	State     int32
+	PaidMsat  int64
+	ValueMsat int64
+	Created   time.Time
 	// Expiry heights of the HTLCs held (accepted, not cancelled)
 	HTLCExpiries []int32
 }
@@ -153,6 +155,9 @@ type Lightning interface {
 	// WalletOwns tells whether txid, mined at height, was sent by lnd's own
 	// wallet.
 	WalletOwns(ctx context.Context, txid string, height int64) (bool, error)
+	// WalletPaid finds among all of lnd's wallet transactions from
+	// startHeight on (unconfirmed too) one paying sat to address.
+	WalletPaid(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, bool, error)
 }
 
 // Output is one transaction output as the node sees it.
@@ -296,6 +301,7 @@ type Policy struct {
 	Notify func(event string, kv map[string]any)
 
 	mu          sync.Mutex // judgments that touch the ledger, one at a time
+	smu         sync.Mutex // the guard's own spends (claims, refunds, bumps), one at a time
 	pmu         sync.Mutex
 	pending     map[uint64]pendingReq
 	claimErr    map[string]string // last claim error per payment hash
@@ -455,6 +461,9 @@ func (p *Policy) intercept(ctx context.Context, condition string, requestID uint
 	}
 	if lim, heavy := heavyCalls[uri]; heavy && !p.rate(uri, lim) {
 		return refuse("%s more than %d times a minute", uri, lim)
+	}
+	if uri == "/lnrpc.Lightning/NewAddress" && !p.rateWindow(uri, 30, time.Hour) {
+		return refuse("NewAddress more than 30 times an hour")
 	}
 	if !judged {
 		return nil
@@ -640,6 +649,10 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 		}
 		if cap := math.Max(2, math.Ceil(est*p.LockupFeeFactor)); rate > cap {
 			return refuse("fee rate %.0f sat/vB over %.0f (%.1fx the node's estimate)", rate, cap, p.LockupFeeFactor)
+		}
+		// nor so low that the lockup sits unconfirmed past its timeout
+		if floor := math.Max(1, math.Floor(est*0.8)); rate < floor {
+			return refuse("fee rate %.0f sat/vB under %.0f (the node's estimate)", rate, floor)
 		}
 	}
 	want, err := p.addrScript(r.Addr)
@@ -1196,9 +1209,9 @@ func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
 				l.State, l.TxID = LockSent, resp.Txid
 				p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": l.TxID})
 			} else if isErr {
-				// lnd refused the send: nothing left the wallet
-				delete(p.Ledger.Lockups, r.hash)
-				delete(p.Ledger.Entries, "send:"+r.hash)
+				// lnd said no; whether anything left the wallet is settled
+				// from lnd's own history (findApproved), not from the error
+				l.Note = "lnd answered an error"
 			}
 		}
 		_ = p.Ledger.save()
@@ -1290,18 +1303,22 @@ var heavyCalls = map[string]int{
 	"/lnrpc.Lightning/QueryRoutes":     120,
 	"/lnrpc.Lightning/GetTransactions": 60,
 	"/lnrpc.Lightning/GetNodeInfo":     240,
-	"/lnrpc.Lightning/NewAddress":      30,
 }
 
 // rate is a per-call limit over the last minute.
 func (p *Policy) rate(key string, perMinute int) bool {
+	return p.rateWindow(key, perMinute, time.Minute)
+}
+
+// rateWindow is a per-call limit over the last window.
+func (p *Policy) rateWindow(key string, perMinute int, window time.Duration) bool {
 	p.pmu.Lock()
 	defer p.pmu.Unlock()
 	if p.calls == nil {
 		p.calls = map[string][]time.Time{}
 	}
 	now := p.now()
-	cut := now.Add(-time.Minute)
+	cut := now.Add(-window)
 	ts := p.calls[key]
 	i := 0
 	for i < len(ts) && ts[i].Before(cut) {

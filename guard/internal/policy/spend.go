@@ -121,8 +121,8 @@ func (p *Policy) Claim(ctx context.Context, swapID string) (string, int64, error
 }
 
 func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.smu.Lock()
+	defer p.smu.Unlock()
 	p.Ledger.Lock()
 	state, claimTx, fee, pre := x.State, x.ClaimTx, x.ClaimFee, x.Preimage
 	p.Ledger.Unlock()
@@ -318,7 +318,25 @@ func (p *Policy) watchLockups(ctx context.Context) {
 		}
 	}
 	for _, l := range todo {
-		if err := p.watchLockup(ctx, l, height); err != nil && !errors.Is(err, ErrNotYet) {
+		err := p.watchLockup(ctx, l, height)
+		// a lockup not confirmed, or a step that keeps saying "not yet",
+		// for more than six blocks is the operator's to look at
+		p.Ledger.Lock()
+		state, txid := l.State, l.TxID
+		p.Ledger.Unlock()
+		stuck := errors.Is(err, ErrNotYet) || (state == LockSent && txid != "" && p.unconfirmed(ctx, txid))
+		p.Ledger.Lock()
+		switch {
+		case !stuck:
+			l.StuckSince = 0
+		case l.StuckSince == 0:
+			l.StuckSince = height
+		case height-l.StuckSince > 6 && !l.StuckAlerted:
+			l.StuckAlerted = true
+			p.notify("guard_lockup_stuck", map[string]any{"swap": l.SwapID, "blocks": height - l.StuckSince})
+		}
+		p.Ledger.Unlock()
+		if err != nil && !errors.Is(err, ErrNotYet) {
 			p.Ledger.Lock()
 			repeat := l.Note == err.Error()
 			l.Note = err.Error()
@@ -343,8 +361,7 @@ func (p *Policy) watchLockups(ctx context.Context) {
 // itself shows the invoice cancelled or settled and the timeout is well
 // past (then nothing of ours can be at stake).
 func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool {
-	txid, vout, ok := p.findOwnLockup(ctx, l)
-	if ok {
+	adopt := func(txid string, vout uint32) bool {
 		p.Ledger.Lock()
 		if l.State == LockApproved {
 			l.State, l.TxID, l.Vout = LockSent, txid, int32(vout)
@@ -353,6 +370,30 @@ func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool
 		p.Ledger.Unlock()
 		p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": txid, "found": true})
 		return true
+	}
+	if txid, vout, ok := p.findOwnLockup(ctx, l, height); ok {
+		return adopt(txid, vout)
+	}
+	// lnd's own truth: every transaction of its wallet since, unconfirmed
+	// too (every page)
+	txid, vout, _, found, err := p.LN.WalletPaid(ctx, l.Address, l.Sat, l.SentAt-1)
+	switch {
+	case err != nil:
+		// unknown: keep everything held
+	case found:
+		return adopt(txid, vout)
+	case p.now().Sub(l.At) > ApprovalWindow:
+		// lnd's call is long over (rpcmiddleware.intercepttimeout and the
+		// send itself) and its wallet never paid the lockup: nothing left
+		p.Ledger.Lock()
+		if l.State == LockApproved {
+			delete(p.Ledger.Lockups, l.Hash)
+			delete(p.Ledger.Entries, "send:"+l.Hash)
+			_ = p.Ledger.save()
+		}
+		p.Ledger.Unlock()
+		p.notify("lockup_dropped", map[string]any{"swap": l.SwapID, "sat": l.Sat})
+		return false
 	}
 	if p.ApprovedExpireBlocks > 0 && height-l.SentAt > p.ApprovedExpireBlocks && height > int64(l.Timeout)+p.ReverseMarginBlocks+p.HoldExpiryDelta {
 		hash, _ := hex.DecodeString(l.Hash)
@@ -371,16 +412,34 @@ func (p *Policy) findApproved(ctx context.Context, l *Lockup, height int64) bool
 	return false
 }
 
+// ApprovalWindow is how long after an allowed lockup lnd's wallet must show
+// it before the approval is dropped: well past rpcmiddleware's intercept
+// timeout and lnd's own send.
+const ApprovalWindow = 5 * time.Minute
+
 // findOwnLockup scans the blocks since l was allowed for an output paying
 // its rebuilt script and amount, sent by lnd's wallet.
-func (p *Policy) findOwnLockup(ctx context.Context, l *Lockup) (string, uint32, bool) {
+func (p *Policy) findOwnLockup(ctx context.Context, l *Lockup, height int64) (string, uint32, bool) {
 	pk, err := p.addrScript(l.Address)
 	if err != nil {
 		return "", 0, false
 	}
-	found, err := p.Chain.FindOutputs(ctx, pk, l.Sat, l.SentAt-1)
+	// from where the last scan stopped (a few blocks back for reorgs), not
+	// from the start every round
+	from := l.SentAt - 1
+	p.Ledger.Lock()
+	if l.ScanFrom > from {
+		from = l.ScanFrom
+	}
+	p.Ledger.Unlock()
+	found, err := p.Chain.FindOutputs(ctx, pk, l.Sat, from)
 	if err != nil {
 		return "", 0, false
+	}
+	if height > 0 {
+		p.Ledger.Lock()
+		l.ScanFrom = max(height-6, l.SentAt-1)
+		p.Ledger.Unlock()
 	}
 	for _, f := range found {
 		if own, err := p.LN.WalletOwns(ctx, f.TxID, f.Height); err == nil && own {
@@ -434,7 +493,7 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 	if errors.Is(err, ErrNotYet) && height-l.SentAt > bumpEvery*2 {
 		// the transaction lnd named is not on chain (replaced?): look on
 		// chain for what lnd's wallet paid the lockup with instead
-		if txid, v, ok := p.findOwnLockup(ctx, l); ok && !strings.EqualFold(txid, l.TxID) {
+		if txid, v, ok := p.findOwnLockup(ctx, l, height); ok && !strings.EqualFold(txid, l.TxID) {
 			p.Ledger.Lock()
 			l.TxID, l.Vout = txid, int32(v)
 			_ = p.Ledger.save()
@@ -584,8 +643,8 @@ func (p *Policy) Refund(ctx context.Context, swapID string) (string, int64, erro
 }
 
 func (p *Policy) refund(ctx context.Context, l *Lockup, out *swapscript.Output, o *Output, vout uint32) (string, int64, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.smu.Lock()
+	defer p.smu.Unlock()
 	p.Ledger.Lock()
 	refundTx, dest := l.RefundTx, l.Bump.Dest
 	p.Ledger.Unlock()
@@ -662,8 +721,8 @@ func replacementRate(b Bump, height int64, inMempool bool, max float64) (float64
 // blocks (inMempool) or fell out of the mempool (rebroadcast at once, at
 // least at the last fee rate).
 func (p *Policy) bumpRefund(ctx context.Context, l *Lockup, out *swapscript.Output, o *Output, vout uint32, height int64, inMempool bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.smu.Lock()
+	defer p.smu.Unlock()
 	p.Ledger.Lock()
 	b := l.Bump
 	p.Ledger.Unlock()
@@ -780,8 +839,8 @@ func (p *Policy) watchClaim(ctx context.Context, x *Payment, height int64) error
 }
 
 func (p *Policy) bumpClaim(ctx context.Context, x *Payment, height int64, inMempool bool) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.smu.Lock()
+	defer p.smu.Unlock()
 	p.Ledger.Lock()
 	b, pre := x.Bump, x.Preimage
 	p.Ledger.Unlock()
@@ -895,9 +954,16 @@ func (p *Policy) closeHold(ctx context.Context, h string) {
 	case x == nil:
 		return
 	case state == HoldCreating:
+		p.Ledger.Lock()
+		sat := x.Sat
+		p.Ledger.Unlock()
 		switch {
-		case inv != nil:
+		case inv != nil && (inv.ValueMsat+999)/1000 == sat && !inv.Created.Before(at.Add(-2*time.Minute)):
 			set([]string{HoldCreating}, "open") // lnd made it; the rest next round
+		case inv != nil:
+			// an invoice with that hash that is not the one asked for (its
+			// amount or age differ: another service's): ours never was made
+			set([]string{HoldCreating}, "")
 		case p.now().Sub(at) > 2*time.Minute && !p.pendingHold(h):
 			set([]string{HoldCreating}, "") // lnd never made it
 		}
@@ -1025,4 +1091,15 @@ func (p *Policy) saveOrAlert() {
 			p.notify("guard_ledger_error", map[string]any{"error": err.Error()})
 		}
 	}
+}
+
+// unconfirmed tells whether a transaction is still in no block (the cache
+// keeps it to one call per block).
+func (p *Policy) unconfirmed(ctx context.Context, txid string) bool {
+	h, err := p.Chain.Height(ctx)
+	if err != nil {
+		return false
+	}
+	c, err := p.cachedConfs(ctx, txid, h, true)
+	return err == nil && c < 1
 }

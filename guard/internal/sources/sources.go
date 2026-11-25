@@ -131,6 +131,38 @@ func (l LN) WalletOwns(ctx context.Context, txid string, height int64) (bool, er
 	return false, nil
 }
 
+// WalletPaid finds, among ALL of lnd's own wallet transactions from
+// startHeight on (unconfirmed too, every page), one paying sat to address:
+// lnd's own truth about whether it sent a lockup.
+func (l LN) WalletPaid(ctx context.Context, address string, sat int64, startHeight int64) (string, uint32, int64, bool, error) {
+	var offset uint32
+	for page := 0; page < 200; page++ {
+		cctx, cancel := call(ctx)
+		var r lnrpc.TransactionDetails
+		err := l.Conn.Invoke(cctx, "/lnrpc.Lightning/GetTransactions",
+			&lnrpc.GetTransactionsRequest{StartHeight: int32(max(startHeight, 0)), EndHeight: -1, IndexOffset: offset, MaxTransactions: 200}, &r)
+		cancel()
+		if err != nil {
+			return "", 0, 0, false, err
+		}
+		for _, t := range r.Transactions {
+			if t.Amount >= 0 {
+				continue
+			}
+			for _, o := range t.OutputDetails {
+				if !o.IsOurAddress && o.Address == address && o.Amount == sat {
+					return t.TxHash, uint32(o.OutputIndex), int64(t.NumConfirmations), true, nil
+				}
+			}
+		}
+		if len(r.Transactions) < 200 {
+			return "", 0, 0, false, nil
+		}
+		offset = uint32(r.LastIndex)
+	}
+	return "", 0, 0, false, fmt.Errorf("lnd's wallet history is too long to read")
+}
+
 func (l LN) LookupInvoice(ctx context.Context, hash []byte) (*policy.InvoiceInfo, error) {
 	ctx, cancel := call(ctx)
 	defer cancel()
@@ -141,7 +173,10 @@ func (l LN) LookupInvoice(ctx context.Context, hash []byte) (*policy.InvoiceInfo
 		}
 		return nil, err
 	}
-	info := &policy.InvoiceInfo{State: r.State, PaidMsat: r.AmtPaidMsat}
+	info := &policy.InvoiceInfo{State: r.State, PaidMsat: r.AmtPaidMsat, ValueMsat: r.ValueMsat, Created: time.Unix(r.CreationDate, 0)}
+	if info.ValueMsat == 0 {
+		info.ValueMsat = r.Value * 1000
+	}
 	for _, h := range r.Htlcs {
 		if h.State == 0 || h.State == 1 { // accepted or settled
 			info.HTLCExpiries = append(info.HTLCExpiries, h.ExpiryHeight)

@@ -47,6 +47,11 @@ type Lockup struct {
 	Preimage string    `json:"preimage,omitempty"`
 	Note     string    `json:"note,omitempty"`
 	Bump     Bump      `json:"refundBump,omitempty"`
+	ScanFrom int64     `json:"scanFrom,omitempty"` // where the chain scan for it resumes
+	// StuckSince is the height a lockup was first seen stuck (not
+	// confirmed, or "not yet" again and again); alerted once
+	StuckSince   int64 `json:"stuckSince,omitempty"`
+	StuckAlerted bool  `json:"stuckAlerted,omitempty"`
 }
 
 // Bump is what the guard needs to replace one of its own spends that did not

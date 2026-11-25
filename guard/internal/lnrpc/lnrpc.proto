@@ -113,6 +113,7 @@ message PaymentHash {
 message Invoice {
     bytes r_hash = 4;
     int64 value = 5;
+    int64 creation_date = 7;
     int64 value_msat = 23;
     int64 amt_paid_sat = 19;
     int64 amt_paid_msat = 20;

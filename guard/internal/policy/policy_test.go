@@ -38,6 +38,7 @@ type fakeLN struct {
 	balance     Balance
 	addr        string
 	walletSends []walletSend
+	walletErr   error
 }
 
 func (f *fakeLN) LookupInvoice(_ context.Context, h []byte) (*InvoiceInfo, error) {
@@ -90,7 +91,23 @@ func (f *fakeLN) WalletOwns(_ context.Context, txid string, _ int64) (bool, erro
 }
 
 type walletSend struct {
-	txid string
+	txid    string
+	address string
+	sat     int64
+	vout    uint32
+	confs   int64
+}
+
+func (f *fakeLN) WalletPaid(_ context.Context, address string, sat int64, _ int64) (string, uint32, int64, bool, error) {
+	if f.walletErr != nil {
+		return "", 0, 0, false, f.walletErr
+	}
+	for _, w := range f.walletSends {
+		if w.address == address && w.sat == sat {
+			return w.txid, w.vout, w.confs, true, nil
+		}
+	}
+	return "", 0, 0, false, nil
 }
 
 type fakeChain struct {
@@ -101,6 +118,7 @@ type fakeChain struct {
 	height    int64
 	broadcast []*wire.MsgTx
 	confs     map[string]int64
+	feeRate   float64
 }
 
 func (c *fakeChain) Outputs(_ context.Context, txid string) ([]Output, error) {
@@ -130,7 +148,12 @@ func (c *fakeChain) Spender(_ context.Context, txid string, vout uint32, _ int64
 	defer c.mu.Unlock()
 	return c.spenders[fmt.Sprintf("%s:%d", txid, vout)], nil
 }
-func (c *fakeChain) FeeRate(context.Context) (float64, error) { return 2, nil }
+func (c *fakeChain) FeeRate(context.Context) (float64, error) {
+	if c.feeRate > 0 {
+		return c.feeRate, nil
+	}
+	return 2, nil
+}
 func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
 	b, _ := hex.DecodeString(raw)
 	var tx wire.MsgTx
@@ -1134,31 +1157,52 @@ func TestLockupCheckedBeforeCancelRefused(t *testing.T) {
 	mustRefuse(t, err, "no longer open")
 }
 
-// An allowed lockup never seen on chain is NOT given up while its hold
-// invoice is held: no cancel, its reserve and daily share stay. Only once lnd
-// dropped the HTLCs and the timeout is well past is it expired.
-func TestApprovedNeverSeenKeptUntilHTLCsGone(t *testing.T) {
+// An allowed lockup lnd's wallet cannot vouch for is kept (reserve, daily
+// share, no cancel) while lnd's history is unknown; once lnd's whole wallet
+// history shows no payment to the lockup, the approval is dropped; and one
+// whose HTLCs lnd dropped expires.
+func TestApprovedLockupResolvedFromLndTruth(t *testing.T) {
 	e := newEnv(t)
-	e.p.ApprovedExpireBlocks = 72
 	at := time.Unix(1_800_000_000, 0)
 	e.p.Now = func() time.Time { return at }
 	r, _, _ := e.reverse(103, 1_000_000, 103)
 	_, err := e.call(sendURI, sendReq(r))
 	mustAllow(t, err)
 	_, hash := preimage(103)
+	h := hex.EncodeToString(hash)
+	e.ln.walletErr = fmt.Errorf("lnd unreachable")
 	at = at.Add(time.Hour)
-	e.chain.height = 1300 // well past the timeout and the expiry window
 	e.p.Tick(context.Background())
-	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockApproved {
-		t.Fatalf("given up while the invoice is held: %s", l.State)
+	if l := e.p.Ledger.Lockups[h]; l == nil || l.State != LockApproved {
+		t.Fatal("dropped while lnd's history is unknown")
 	}
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
 	mustRefuse(t, err, "stays until")
-	// lnd itself dropped the HTLCs: now it may go
-	e.ln.invoices[hex.EncodeToString(hash)].State = InvoiceCanceled
+	// lnd answers: its wallet never paid the lockup
+	e.ln.walletErr = nil
 	e.p.Tick(context.Background())
-	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockExpired || e.p.Ledger.since(time.Time{}) != 0 {
-		t.Fatalf("not expired after the HTLCs went: %s", l.State)
+	if e.p.Ledger.Lockups[h] != nil || e.p.Ledger.since(time.Time{}) != 0 {
+		t.Fatal("an approval lnd never acted on was kept")
+	}
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustAllow(t, err)
+}
+
+// Within the window the approval waits for lnd; a lockup lnd's wallet shows
+// (unconfirmed) is followed.
+func TestApprovedLockupFoundUnconfirmedInWallet(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	r, _, _ := e.reverse(104, 1_000_000, 104)
+	_, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	at = at.Add(3 * time.Minute)
+	e.ln.walletSends = append(e.ln.walletSends, walletSend{txid: strings.Repeat("ab", 32), address: r.LockupAddress, sat: r.OnchainAmount, vout: 0})
+	e.p.Tick(context.Background())
+	_, hash := preimage(104)
+	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockSent || l.TxID != strings.Repeat("ab", 32) {
+		t.Fatalf("not followed: %+v", l)
 	}
 }
 
@@ -1405,7 +1449,7 @@ func TestHoldRecordedBeforeAnswer(t *testing.T) {
 		t.Fatal("not recorded before the answer")
 	}
 	e.p.ResetPending() // the stream reset: both answers lost
-	e.ln.invoices[hex.EncodeToString(h1)] = &InvoiceInfo{State: InvoiceOpen}
+	e.ln.invoices[hex.EncodeToString(h1)] = &InvoiceInfo{State: InvoiceOpen, ValueMsat: 50_000_000, Created: at}
 	at = at.Add(3 * time.Minute)
 	e.p.Tick(context.Background())
 	if x := e.p.Ledger.Holds[hex.EncodeToString(h1)]; x == nil || x.State != "open" {
@@ -1484,4 +1528,40 @@ func TestHoldExpiryCapped(t *testing.T) {
 	mustRefuse(t, err, "expiry")
 	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
 	mustRefuse(t, err, "expiry")
+}
+
+// A lockup paying under the node's estimate is refused (it would sit past
+// its timeout); lnd answering an error does not drop the approval: lnd's
+// wallet history decides.
+func TestLockupFeeFloorAndErrorKeepsApproval(t *testing.T) {
+	e := newEnv(t)
+	e.chain.feeRate = 10
+	r, _, _ := e.reverse(105, 1_000_000, 105)
+	_, err := e.call(sendURI, sendReq(r)) // 2 sat/vB
+	mustRefuse(t, err, "under")
+	e.chain.feeRate = 2
+	id, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	e.answer(id, nil, true)
+	_, hash := preimage(105)
+	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l == nil || l.State != LockApproved {
+		t.Fatal("an error answer dropped the approval before lnd's history was asked")
+	}
+}
+
+// A 'creating' hold whose hash lnd knows from another invoice (another
+// service's: other amount or older) is not taken as ours.
+func TestCreatingHoldNotConfusedWithForeignInvoice(t *testing.T) {
+	e := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e.p.Now = func() time.Time { return at }
+	_, h := preimage(158)
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h, Value: 50_000, Expiry: 3600})
+	mustAllow(t, err)
+	e.p.ResetPending()
+	e.ln.invoices[hex.EncodeToString(h)] = &InvoiceInfo{State: InvoiceAccepted, ValueMsat: 7_000_000, Created: at.Add(-time.Hour)}
+	e.p.Tick(context.Background())
+	if e.p.Ledger.Holds[hex.EncodeToString(h)] != nil {
+		t.Fatal("another service's invoice taken for our hold")
+	}
 }
