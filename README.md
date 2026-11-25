@@ -112,16 +112,46 @@ guard stopped.
 ## Known limits
 
 - The guard trusts lnd and the node it asks. Both are the operator's own.
+- **Middleware impersonation while the guard is down.** lnd refuses the
+  backend's macaroon while no middleware is registered for the `kiloswap`
+  caveat, but anything holding a macaroon allowed to register middleware
+  (an admin macaroon) could register under that caveat itself and allow
+  the backend's calls. lnd offers no way to list registered middleware, so
+  the guard cannot check it; keep admin macaroons off this stack and watch
+  the guard's `registered` / `stream ended` log lines.
 - Privacy, not funds: the backend's macaroon still reads the node's
   channels, peers and on-chain transactions (`ListChannels`, `ListPeers`,
   `GetTransactions`, which the backend uses), and its node RPC user can read
   any loaded wallet of the node (`listunspent`, `gettransaction`): the
   node's RPC whitelist is per method, not per wallet.
-- No cooperative refunds: a failed submarine swap waits for its timeout.
-- The guard's refunds are not fee-bumped; it pays the node's estimate (the
-  chain's fees are low). A stuck refund would need a manual replacement.
-- The web app is set to `cooperativeDisabled` (branch `kiloswap`); that
-  build was not run through the UI tests yet.
+- No cooperative refunds: a failed submarine swap waits for its timeout
+  (the web app says so, in English and Spanish).
+- `HOLD_EXPIRY_DELTA` must equal lnd's `invoices.holdexpirydelta` (18): lnd
+  does not report it, so the guard cannot check it. Change both together.
+- Confirmations scale with the amount (`CONF_TIERS`, default 3 up to 1M
+  sat, 6 up to 10M, 12 above, because about half of the chain's hash rate
+  sits in one pool). The backend's own `requiredConfirmations` is lower, so
+  a big lockup's payment is refused by the guard until it is deep enough
+  and the backend tries again.
+
+### What the guard does about slow or hostile backends
+
+- Each lnd interception is judged in its own goroutine with a 1.5 s
+  deadline; a late judgment is a refusal and is undone. The guard's
+  database connection has `statement_timeout` and `lock_timeout` and is
+  read-only, under its own non-superuser role.
+- Lockups lnd sent without telling the guard are found on chain; payments
+  are always asked about after two minutes.
+- Submarine: invoices of 10,000 sat or more, a lockup that covers the
+  invoice plus the most routing and claim may cost, a swap timeout at
+  least 144 blocks ahead, payments final 60 blocks before it, and the
+  guard's claim replaced with higher fees (past `MAX_FEE_RATE`, up to 10 %
+  of the lockup, in the last 24 blocks).
+- Reverse: lockup fee rate at most 2x the node's estimate, timeouts within
+  72..288 blocks, hold invoices with at most 16 HTLCs, a cltv_expiry of at
+  most 432 and every HTLC expiring 18 + 36 blocks after the timeout.
+- The guard's own spends are done at 3 confirmations (reorgs) and are
+  replaced (RBF) when stuck or dropped.
 
 ## Layout
 

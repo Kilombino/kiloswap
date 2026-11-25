@@ -11,6 +11,7 @@ umask 077
 mkdir -p "$R"/{secrets,postgres,shim,boltz,guard,macaroons,webapp,backups}
 gen() { [ -s "$R/secrets/$1" ] || openssl rand -hex 24 >"$R/secrets/$1"; }
 gen postgres_password
+gen postgres_admin_password
 gen guard_db_password
 gen node_rpc_password
 gen guard_rpc_password

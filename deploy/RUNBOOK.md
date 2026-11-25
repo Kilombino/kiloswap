@@ -116,7 +116,9 @@ en él.
 
 1. `docker compose up -d postgres shim lnd-proxy guard`
    - Los logs del guardián deben decir `registered with lnd for the
-     "kiloswap" caveat`.
+     "kiloswap" caveat` (la caveat personalizada `kiloswap` con la
+     condición `v1`, que lleva el macaroon del backend: compruébalo con
+     `lncli printmacaroon --macaroon_file kiloswap.macaroon`).
    - El guardián hace él mismo los cobros de los swaps submarinos (tras el
      pago, por la hoja de cobro) y los reembolsos de los inversos (tras el
      plazo, por la hoja de reembolso), siempre a direcciones de LND, y
@@ -182,3 +184,29 @@ en él.
 - **Sin cooperativo:** el servidor no firma nada. Un usuario cuyo swap
   submarino falla recupera sus fondos con su clave de rescate **cuando
   vence el plazo** (unos 3 días), no al momento.
+
+
+## Red interna y cortafuegos (revisión 2)
+
+- La red `internal` del compose lleva
+  `com.docker.network.bridge.gateway_mode_ipv4: isolated`: sin ella, un
+  contenedor de una red `internal` de Docker llega a los servicios del host
+  por la IP de la pasarela. Probado el 25 nov 2026 (Docker 29)
+  con una red de prueba: sin `isolated`, la pasarela daba acceso a :3021
+  (Thunderhub) y :7160 (MRR Command Center); con `isolated`, todo
+  bloqueado (:3021, :5984, :7160, :10009, :8280 y la IP de la red local).
+- **Propuesta, sin aplicar en producción:** la regla de UFW que deja pasar
+  a `172.16.0.0/12` es más amplia de lo necesario. Lo justo sería permitir
+  solo las subredes que lo necesitan (la del compose `172.30.91.0/24` al
+  RPC del nodo y a ZMQ; las de LND y mempool a sus puertos) y quitar el
+  /12 entero. Hay que revisarlo con calma, porque otros servicios de
+  el host dependen hoy de esa regla.
+
+## Base de datos: roles
+
+- El backend no debe ser superusuario: `boltz` pasa a ser un rol normal,
+  dueño de su base de datos (ver `db-roles.sh`). Un superusuario puede
+  bloquear tablas de todo el servidor y saltarse los permisos.
+- El guardián entra con `kiloswap_guard`, solo lectura de las dos tablas de
+  swaps, y su conexión fija `statement_timeout`, `lock_timeout` y
+  transacciones de solo lectura.

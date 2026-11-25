@@ -29,6 +29,10 @@ networks:
       config: [{subnet: "${KILOSWAP_SUBNET:-172.30.91.0/24}"}]
   internal:
     internal: true
+    # no route to the host either: services on the host's addresses
+    # (Thunderhub, LNDg, lnd's REST, ...) are unreachable from this network
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
     ipam:
       config: [{subnet: "${KILOSWAP_INTERNAL_SUBNET:-172.30.92.0/24}"}]
   lnd:
@@ -44,14 +48,18 @@ services:
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
     environment:
-      POSTGRES_DB: boltz
-      POSTGRES_USER: boltz
-      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      # the superuser is for maintenance only; the backend's role "boltz" is
+      # an ordinary owner of its database (postgres-init/10-boltz-role.sh)
+      POSTGRES_DB: postgres
+      POSTGRES_USER: pgadmin
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_admin_password
     command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=40"]
     networks: [internal]
     volumes:
       - ${KILOSWAP_ROOT:?}/postgres:/var/lib/postgresql
       - ${KILOSWAP_ROOT:?}/secrets/postgres_password:/run/secrets/postgres_password:ro
+      - ${KILOSWAP_ROOT:?}/secrets/postgres_admin_password:/run/secrets/postgres_admin_password:ro
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
     logging: *logging
     mem_limit: 256m
 
@@ -83,7 +91,11 @@ services:
     depends_on: [postgres]
     # internal: postgres and the backend's calls to its API; lnd: register
     # as middleware; default: the node's RPC on the host (its own user)
-    networks: [internal, lnd, default]
+    networks:
+      internal:
+        ipv4_address: ${KILOSWAP_GUARD_IP:-172.30.92.10}
+      lnd: {}
+      default: {}
     environment:
       LND_GRPC: ${LND_HOST:-lnd-blake2b}:10009
       LND_TLSCERT: /lnd/tls.cert
@@ -95,7 +107,8 @@ services:
       NETWORK: mainnet
       SWAP_MNEMONIC_FILE: /run/secrets/swap_seed
       SWAP_KEY_PATH: m/0/0
-      API_ADDR: ":8091"
+      # the claims-and-refunds API on the internal network only
+      API_ADDR: "${KILOSWAP_GUARD_IP:-172.30.92.10}:8091"
       API_TOKEN_FILE: /run/secrets/guard_api_token
       LSP_STATE: /lsp/state.json
       LEDGER: /state/ledger.json
