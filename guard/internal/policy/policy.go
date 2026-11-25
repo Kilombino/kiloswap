@@ -302,7 +302,7 @@ func (p *Policy) confsFor(sat int64) int64 {
 
 // ClaimVbytes is what the guard's claim of a submarine lockup weighs at
 // most (one taproot script-path input with preimage, one output).
-const ClaimVbytes = 140
+const ClaimVbytes = 151
 
 type pendingReq struct {
 	method string
