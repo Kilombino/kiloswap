@@ -997,9 +997,13 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if err != nil || est < 1 {
 		est = 1
 	}
-	cover := sat + max(p.ClaimMarginSat, int64(math.Ceil(float64(ClaimVbytes)*est)))
+	// the backend priced the swap's miner fee at its estimate when the swap
+	// was created; the node's estimate moves, so accept down to 75% of
+	// today's claim cost (a few sats at most are the operator's)
+	claimCost := max(p.ClaimMarginSat, int64(math.Ceil(float64(ClaimVbytes)*est)))
+	cover := sat + max(p.ClaimMarginSat, int64(math.Ceil(float64(ClaimVbytes)*est*0.75)))
 	if o.Sat < cover {
-		return refuse("the lockup pays %d sat, less than the %d sat invoice plus routing and claim costs (%d)", o.Sat, sat, cover)
+		return refuse("the lockup pays %d sat, less than the %d sat invoice plus our claim cost (%d)", o.Sat, sat, cover)
 	}
 	unspent, err := p.Chain.Unspent(ctx, s.LockupTxID, vout)
 	if err != nil {
@@ -1041,7 +1045,7 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	// it, never refused
 	wantFee = min(feeMsat, maxFeeMsat)
 	if p.RoutingCap {
-		wantFee = min(feeMsat, min(maxFeeMsat, max((o.Sat-cover)*1000, p.RoutingFloorSat*1000)))
+		wantFee = min(feeMsat, min(maxFeeMsat, max((o.Sat-sat-claimCost)*1000, p.RoutingFloorSat*1000)))
 	}
 	if wantParts == 0 || wantParts > MaxPayParts {
 		wantParts = MaxPayParts // lnd's default (16) when 0

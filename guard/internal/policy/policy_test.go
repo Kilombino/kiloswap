@@ -1002,7 +1002,7 @@ func TestSubmarineMinimumsAndMargins(t *testing.T) {
 	// the lockup must cover routing and our claim at the highest fee rate
 	inv, _, _ = e.submarine(71, 100_000, 100_000+121+100, 71)
 	_, err = e.call(payURI, payReq(inv))
-	mustRefuse(t, err, "routing and claim costs")
+	mustRefuse(t, err, "plus our claim cost")
 	// cltv_limit must leave ClaimMarginBlocks before the timeout
 	inv, _, _ = e.submarine(72, 100_000, 200_000, 72)
 	r := payReq(inv)
