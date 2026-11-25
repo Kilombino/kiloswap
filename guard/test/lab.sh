@@ -518,6 +518,13 @@ fi
 hwm=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -u lab:lab -H 'content-type: application/json' -d '{"id":1,"method":"getzmqnotifications","params":[]}' http://shim:8332/ | jq -c '[.result[].hwm]' || true)
 [ "$hwm" = "[20,20]" ] && ok "knots queues at most 20 ZMQ messages per socket ($hwm)" || bad "zmq hwm: $hwm"
 
+log "the ninth review: getrawmempool alone, AddInvoice without AMP or private channels"
+[ "$(shimcode / '[{"id":1,"method":"getrawmempool","params":[]}]')" = 400 ] && ok "the shim refuses getrawmempool inside a batch" || bad "getrawmempool batched"
+[ "$(shimcode / '{"id":1,"method":"getrawmempool","params":[]}')" = 200 ] && ok "the shim answers getrawmempool on its own" || bad "getrawmempool refused"
+refused "an AMP invoice" KS addinvoice --amt 1000 --amp
+refused "a private invoice (advertising private channels)" KS addinvoice --amt 1000 --private
+allowed "a plain invoice" KS addinvoice --amt 1000
+
 log "option A: the routing fee paid from the lockup's surplus (10 sat floor), rewritten by the guard"
 # an attacker's invoice: the payment must go through their node (a route
 # hint through lnd-user, a 60 sat fee) to a key of theirs
