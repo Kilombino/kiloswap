@@ -100,6 +100,23 @@ func Serve(ctx context.Context, conn grpc.ClientConnInterface, p *policy.Policy,
 		}
 		if _, ok := req.InterceptType.(*lnrpc.RPCMiddlewareRequest_RegComplete); ok {
 			logger.Printf("registered with lnd for the %q caveat", policy.CaveatName)
+			// a new registration (lnd restarted?): ids of earlier calls mean
+			// nothing any more
+			p.ResetPending()
+			continue
+		}
+		if _, ok := req.InterceptType.(*lnrpc.RPCMiddlewareRequest_Response); ok {
+			// answers are never refused for being busy: an allowed call's
+			// answer must reach the ledger (a lockup sent, a payment done)
+			go func(req *lnrpc.RPCMiddlewareRequest) {
+				if err := reply(req.MsgId, judge(ctx, p, req, logger)); err != nil {
+					select {
+					case errs <- err:
+					default:
+					}
+					cancel()
+				}
+			}(req)
 			continue
 		}
 		select {

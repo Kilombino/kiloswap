@@ -77,7 +77,12 @@ const (
 	LockSettled   = "settled"   // our hold invoice settled
 	LockRefunding = "refunding" // our refund broadcast
 	LockRefunded  = "refunded"  // our refund confirmed
+	LockExpired   = "expired"   // allowed, never seen on chain: given up
 )
+
+// HoldCanceling is a hold invoice whose cancel the guard allowed and lnd has
+// not answered: no lockup may be allowed for it.
+const HoldCanceling = "canceling"
 
 // Payment is a submarine swap's invoice the guard allowed to be paid, with
 // the lockup output it checked: what it claims on its own once paid.

@@ -609,8 +609,11 @@ func (p *Policy) checkReverse(ctx context.Context, s ReverseSwap, want []byte, h
 	hold, own := p.Ledger.Holds[hh]
 	_, locked := p.Ledger.Lockups[hh]
 	p.Ledger.Unlock()
-	if !own || hold.State != "open" {
+	if !own {
 		return nil, refuse("the hold invoice was not created through the guard")
+	}
+	if hold.State != "open" {
+		return nil, refuse("the hold invoice is no longer open (%s)", hold.State)
 	}
 	if locked {
 		return nil, refuse("that hold invoice already has a lockup")
@@ -651,6 +654,9 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 	defer p.Ledger.Unlock()
 	if _, locked := p.Ledger.Lockups[l.Hash]; locked {
 		return refuse("that hold invoice already has a lockup")
+	}
+	if h := p.Ledger.Holds[l.Hash]; h == nil || h.State != "open" {
+		return refuse("the hold invoice is no longer open (being cancelled?)")
 	}
 	now := p.now()
 	if used := p.Ledger.since(now.Add(-24 * time.Hour)); used+l.Sat > p.DailySat {
@@ -908,13 +914,21 @@ func (p *Policy) cancel(requestID uint64, hash []byte) error {
 		return refuse("a 32-byte payment hash is required")
 	}
 	h := hex.EncodeToString(hash)
+	// the same lock as allowSend: a cancel and a lockup of one invoice can
+	// never both be allowed (lnd would drop the HTLCs and the coins would go)
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.Ledger.Lock()
 	defer p.Ledger.Unlock()
-	if _, ok := p.Ledger.Holds[h]; !ok {
+	hold, ok := p.Ledger.Holds[h]
+	if !ok {
 		return refuse("not a Kiloswap hold invoice")
 	}
-	if l, ok := p.Ledger.Lockups[h]; ok && l.State != LockRefunded {
+	if l, ok := p.Ledger.Lockups[h]; ok && l.State != LockRefunded && l.State != LockExpired {
 		return refuse("its lockup is %s: the invoice stays until the lockup is refunded", l.State)
+	}
+	if hold.State == "open" {
+		hold.State = HoldCanceling // no lockup from now on; back to open if lnd refuses
 	}
 	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/CancelInvoice", hash: h})
 	return nil
@@ -976,6 +990,9 @@ func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
 	if !ok {
 		return
 	}
+	if u := m.GetMethodFullUri(); u != "" && u != r.method {
+		return // another call with a reused id (lnd restarted): not this one
+	}
 	isErr := m.GetIsError()
 	switch r.method {
 	case "/lnrpc.Lightning/AddInvoice":
@@ -999,6 +1016,14 @@ func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
 	case "/invoicesrpc.Invoices/CancelInvoice", "/invoicesrpc.Invoices/SettleInvoice":
 		p.done(requestID)
 		if isErr {
+			if r.method == "/invoicesrpc.Invoices/CancelInvoice" {
+				p.Ledger.Lock()
+				if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCanceling {
+					h.State = "open" // lnd did not cancel it
+					_ = p.Ledger.save()
+				}
+				p.Ledger.Unlock()
+			}
 			return
 		}
 		p.Ledger.Lock()
@@ -1099,6 +1124,26 @@ func (p *Policy) failed(pay *Payment) {
 	p.notify("payment_failed", map[string]any{"swap": pay.SwapID, "sat": pay.Sat})
 }
 
+// ResetPending forgets every call waiting for lnd's answer: after lnd
+// restarts its request ids start again, and its old calls ended unanswered
+// (lockups among them are found on chain, payments asked about).
+func (p *Policy) ResetPending() {
+	p.pmu.Lock()
+	old := p.pending
+	p.pending = map[uint64]pendingReq{}
+	p.pmu.Unlock()
+	p.Ledger.Lock()
+	for _, r := range old {
+		if r.method == "/invoicesrpc.Invoices/CancelInvoice" {
+			if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCanceling {
+				h.State = "open" // closeHolds settles it from lnd's own record
+			}
+		}
+	}
+	_ = p.Ledger.save()
+	p.Ledger.Unlock()
+}
+
 // Stall reports a judgment that took too long or requests that came too
 // fast: the backend's database blocked or slowed down, or lnd flooded. The
 // request was refused; the operator should know.
@@ -1124,6 +1169,10 @@ func (p *Policy) Forget(requestID uint64) {
 		if l := p.Ledger.Lockups[r.hash]; l != nil && l.State == LockApproved {
 			delete(p.Ledger.Lockups, r.hash)
 			delete(p.Ledger.Entries, "send:"+r.hash)
+		}
+	case "/invoicesrpc.Invoices/CancelInvoice":
+		if h := p.Ledger.Holds[r.hash]; h != nil && h.State == HoldCanceling {
+			h.State = "open"
 		}
 	case "/routerrpc.Router/SendPaymentV2":
 		if x := p.Ledger.Payments[r.hash]; x != nil && x.Request == requestID && x.State == PayInflight {

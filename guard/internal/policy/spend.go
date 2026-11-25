@@ -718,7 +718,7 @@ func (p *Policy) closeHolds(ctx context.Context) {
 	p.Ledger.Lock()
 	var open []string
 	for h, x := range p.Ledger.Holds {
-		if x.State == "open" {
+		if x.State == "open" || x.State == HoldCanceling {
 			open = append(open, h)
 		}
 	}
@@ -737,13 +737,32 @@ func (p *Policy) closeHolds(ctx context.Context) {
 			state = "settled"
 		}
 		if state == "" {
+			// a cancel allowed whose answer never came: open again unless
+			// one is still waiting
+			p.Ledger.Lock()
+			if x := p.Ledger.Holds[h]; x != nil && x.State == HoldCanceling && !p.cancelPending(h) {
+				x.State = "open"
+				_ = p.Ledger.save()
+			}
+			p.Ledger.Unlock()
 			continue
 		}
 		p.Ledger.Lock()
-		if x := p.Ledger.Holds[h]; x != nil && x.State == "open" {
+		if x := p.Ledger.Holds[h]; x != nil && (x.State == "open" || x.State == HoldCanceling) {
 			x.State = state
 			_ = p.Ledger.save()
 		}
 		p.Ledger.Unlock()
 	}
+}
+
+func (p *Policy) cancelPending(hash string) bool {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	for _, r := range p.pending {
+		if r.method == "/invoicesrpc.Invoices/CancelInvoice" && r.hash == hash {
+			return true
+		}
+	}
+	return false
 }

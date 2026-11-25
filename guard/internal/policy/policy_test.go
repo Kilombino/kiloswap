@@ -1056,3 +1056,54 @@ func TestClaimVbytesBound(t *testing.T) {
 		t.Fatalf("claim is %d vB, over ClaimVbytes %d", v, ClaimVbytes)
 	}
 }
+
+// ---- the third review ----
+
+// A cancel allowed first closes the invoice to lockups at once (same lock),
+// and a cancel lnd refuses opens it again.
+func TestCancelThenLockupRace(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(100, 1_000_000, 100)
+	_, hash := preimage(100)
+	cid, err := e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustAllow(t, err)
+	_, err = e.call(sendURI, sendReq(r))
+	mustRefuse(t, err, "no longer open")
+	e.p.Answered(cid, &lnrpc.RPCMessage{MethodFullUri: cancelURI, IsError: true})
+	_, err = e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+}
+
+// An answer whose method is not the request's (an id reused after lnd
+// restarted) is not taken for it.
+func TestAnswerOfAnotherMethodIgnored(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(101, 1_000_000, 101)
+	id, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	b, _ := proto.Marshal(&lnrpc.SendCoinsResponse{Txid: strings.Repeat("aa", 32)})
+	e.p.Answered(id, &lnrpc.RPCMessage{MethodFullUri: "/lnrpc.Lightning/GetInfo", Serialized: b})
+	_, hash := preimage(101)
+	if l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]; l.State != LockApproved {
+		t.Fatalf("an answer of another method moved the lockup to %s", l.State)
+	}
+	e.p.ResetPending()
+	if _, ok := e.p.pendingFor(id); ok {
+		t.Fatal("pending kept after a new registration")
+	}
+}
+
+// The race itself: a lockup checked before a cancel is allowed, recorded
+// after it, is refused at the last step under the lock.
+func TestLockupCheckedBeforeCancelRefused(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(102, 1_000_000, 102)
+	want, _ := e.p.addrScript(r.LockupAddress)
+	l, err := e.p.checkReverse(context.Background(), r, want, 1000)
+	mustAllow(t, err)
+	_, hash := preimage(102)
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustAllow(t, err)
+	err = e.p.allowSend(context.Background(), 999, l, 1000)
+	mustRefuse(t, err, "no longer open")
+}
