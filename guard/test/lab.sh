@@ -137,7 +137,7 @@ start_guard() {
 		-e DATABASE_URL=postgres://kiloswap_guard:guardlab@postgres:5432/boltz \
 		-e LSP_STATE=/lsp/state.json -e LEDGER=/state/ledger.json -e NETWORK=regtest \
 		-e SWAP_MNEMONIC_FILE=/seed/swap-seed -e API_ADDR=:8091 -e API_TOKEN=labtoken \
-		-e CHAIN_RPC_URL=http://knots:18443/ -e CHAIN_RPC_USER=lab -e CHAIN_RPC_PASSWORD=lab "$@" \
+		-e CHAIN_RPC_URL=http://shim:8332/ -e CHAIN_RPC_USER=lab -e CHAIN_RPC_PASSWORD=lab "$@" \
 		alpine:3.22 /kiloswap-guard >/dev/null
 	for _ in $(seq 1 30); do docker logs $GUARD 2>&1 | grep -q registered && return 0; sleep 1; done
 	docker logs $GUARD >&2; return 1
@@ -171,7 +171,9 @@ docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/n
 for _ in $(seq 1 60); do r=$(curl -s http://127.0.0.1:29001/v2/swap/submarine || true); [ -n "$r" ] && [ "$r" != "{}" ] && break; sleep 3; done
 [ "$r" != "{}" ] || { docker compose logs --tail 30 boltz >&2; bad "backend not up on the guarded macaroon"; exit 1; }
 ok "backend up on kiloswap.macaroon"
-if docker compose logs boltz 2>&1 | grep -q "signing is the guard's"; then ok "backend: swap keys from the extended public key"; else bad "backend still signs"; fi
+signs=1
+for _ in $(seq 1 20); do docker compose logs boltz 2>&1 | grep -q "signing is the guard" && { signs=0; break; }; sleep 2; done
+[ $signs -eq 0 ] && ok "backend: swap keys from the extended public key" || bad "backend still signs"
 if (cd "$LAB/src/swap/e2e" && NO_COOP=1 API=http://127.0.0.1:29001 RETENTION_STATE="$work/retention.json" \
 	node run.mjs ${E2E:-} big-reverse big-submarine refund-server-down claim-server-down reverse-timeout-refund 2>&1 | tee "$work/e2e.log") &&
 	[ "$(grep -c '^PASS' "$work/e2e.log")" -ge 5 ]; then
