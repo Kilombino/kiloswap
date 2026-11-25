@@ -1,458 +1,680 @@
 package policy
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
+	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"google.golang.org/protobuf/encoding/protowire"
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/btcutil/hdkeychain"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
+	"github.com/btcsuite/btcd/wire"
+	"github.com/tyler-smith/go-bip39"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/Kilombino/kiloswap/guard/internal/keys"
 	"github.com/Kilombino/kiloswap/guard/internal/lnrpc"
+	"github.com/Kilombino/kiloswap/guard/internal/swapscript"
 )
 
-type fakeSwaps struct {
-	reverse    []ReverseSwap
-	swaps      []Swap
-	pendingN   int
-	pendingSat int64
-	err        error
+// ---- fakes ----
+
+type fakeLN struct {
+	mu       sync.Mutex
+	invoices map[string]*InvoiceInfo
+	payreqs  map[string]*PayReq
+	tracks   map[string][2]string // hash -> status, preimage
+	settled  [][]byte
+	balance  Balance
+	addr     string
 }
 
-func (f *fakeSwaps) ReverseByLockup(_ context.Context, a string) ([]ReverseSwap, error) {
+func (f *fakeLN) LookupInvoice(_ context.Context, h []byte) (*InvoiceInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.invoices[hex.EncodeToString(h)], nil
+}
+func (f *fakeLN) DecodePayReq(_ context.Context, pr string) (*PayReq, error) {
+	if x, ok := f.payreqs[pr]; ok {
+		return x, nil
+	}
+	return nil, fmt.Errorf("invalid invoice")
+}
+func (f *fakeLN) Balance(context.Context) (Balance, error) { return f.balance, nil }
+func (f *fakeLN) SettleInvoice(_ context.Context, pre []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settled = append(f.settled, pre)
+	h := sha256.Sum256(pre)
+	if inv := f.invoices[hex.EncodeToString(h[:])]; inv != nil {
+		inv.State = InvoiceSettled
+	}
+	return nil
+}
+func (f *fakeLN) TrackPayment(_ context.Context, h []byte) (int32, string, error) {
+	t, ok := f.tracks[hex.EncodeToString(h)]
+	if !ok {
+		return 0, "", nil
+	}
+	var s int32
+	fmt.Sscan(t[0], &s)
+	return s, t[1], nil
+}
+func (f *fakeLN) CancelInvoice(_ context.Context, h []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if inv := f.invoices[hex.EncodeToString(h)]; inv != nil {
+		inv.State = InvoiceCanceled
+	}
+	return nil
+}
+func (f *fakeLN) NewAddress(context.Context) (string, error) { return f.addr, nil }
+
+type fakeChain struct {
+	mu        sync.Mutex
+	txs       map[string][]Output
+	spent     map[string]bool
+	spenders  map[string]*Spend
+	height    int64
+	broadcast []*wire.MsgTx
+	confs     map[string]int64
+}
+
+func (c *fakeChain) Outputs(_ context.Context, txid string) ([]Output, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	o, ok := c.txs[txid]
+	if !ok {
+		return nil, fmt.Errorf("no transaction")
+	}
+	return o, nil
+}
+func (c *fakeChain) Output(ctx context.Context, txid string, vout uint32) (*Output, error) {
+	o, err := c.Outputs(ctx, txid)
+	if err != nil || int(vout) >= len(o) {
+		return nil, fmt.Errorf("no output")
+	}
+	return &o[vout], nil
+}
+func (c *fakeChain) Unspent(_ context.Context, txid string, vout uint32) (bool, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return !c.spent[fmt.Sprintf("%s:%d", txid, vout)], nil
+}
+func (c *fakeChain) Height(context.Context) (int64, error) { return c.height, nil }
+func (c *fakeChain) Spender(_ context.Context, txid string, vout uint32, _ int64) (*Spend, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.spenders[fmt.Sprintf("%s:%d", txid, vout)], nil
+}
+func (c *fakeChain) FeeRate(context.Context) (float64, error) { return 2, nil }
+func (c *fakeChain) Broadcast(_ context.Context, raw string) (string, error) {
+	b, _ := hex.DecodeString(raw)
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(b)); err != nil {
+		return "", err
+	}
+	c.mu.Lock()
+	c.broadcast = append(c.broadcast, &tx)
+	c.mu.Unlock()
+	return tx.TxHash().String(), nil
+}
+func (c *fakeChain) Confirmations(_ context.Context, txid string) (int64, error) {
+	return c.confs[txid], nil
+}
+
+type fakeSwaps struct {
+	reverse []ReverseSwap
+	swaps   map[string]*Swap
+}
+
+func (s *fakeSwaps) ReverseByLockup(_ context.Context, a string) ([]ReverseSwap, error) {
 	var out []ReverseSwap
-	for _, r := range f.reverse {
+	for _, r := range s.reverse {
 		if r.LockupAddress == a {
 			out = append(out, r)
 		}
 	}
-	return out, f.err
+	return out, nil
 }
-func (f *fakeSwaps) ReverseByHash(_ context.Context, h string) (bool, error) {
-	for _, r := range f.reverse {
-		if r.PreimageHash == h {
-			return true, f.err
-		}
-	}
-	return false, f.err
-}
-func (f *fakeSwaps) PendingReverse(context.Context) (int, int64, error) {
-	return f.pendingN, f.pendingSat, f.err
-}
-func (f *fakeSwaps) SwapByInvoice(_ context.Context, inv string) (*Swap, error) {
-	for _, s := range f.swaps {
-		if strings.EqualFold(s.Invoice, inv) {
-			s := s
-			return &s, f.err
-		}
-	}
-	return nil, f.err
+func (s *fakeSwaps) SwapByInvoice(_ context.Context, inv string) (*Swap, error) {
+	return s.swaps[inv], nil
 }
 
-type fakeWallet struct {
-	b   Balance
-	err error
+type fakeLSP struct{ n int64 }
+
+func (f fakeLSP) Reserved() (int64, error) { return f.n, nil }
+
+// ---- setup ----
+
+type env struct {
+	t     *testing.T
+	p     *Policy
+	ln    *fakeLN
+	chain *fakeChain
+	swaps *fakeSwaps
+	keys  *keys.Keys
+	next  uint64
+	notes []string
 }
 
-func (w *fakeWallet) Balance(context.Context) (Balance, error) { return w.b, w.err }
-
-type fakeInvoices struct {
-	inv map[string][2]int64 // hash -> state, paid msat
-	err error
-}
-
-func (f *fakeInvoices) Invoice(_ context.Context, h []byte) (int32, int64, error) {
-	v, ok := f.inv[hex.EncodeToString(h)]
-	if !ok {
-		return 0, 0, f.errOr(errors.New("unable to locate invoice"))
-	}
-	return int32(v[0]), v[1], f.err
-}
-func (f *fakeInvoices) errOr(e error) error {
-	if f.err != nil {
-		return f.err
-	}
-	return e
-}
-
-type fakeChain struct {
-	pays map[string][2]int64 // txid|address -> sat, confirmations
-	err  error
-}
-
-func (f *fakeChain) PaidTo(_ context.Context, txid, addr string) (int64, int64, error) {
-	v := f.pays[txid+"|"+addr]
-	return v[0], v[1], f.err
-}
-
-type fakeLSP struct {
-	sat int64
-	err error
-}
-
-func (l *fakeLSP) Reserved() (int64, error) { return l.sat, l.err }
-
-const btc = int64(100_000_000)
-
-type rig struct {
-	p      *Policy
-	swaps  *fakeSwaps
-	inv    *fakeInvoices
-	chain  *fakeChain
-	wallet *fakeWallet
-	lsp    *fakeLSP
-	now    time.Time
-	alerts []string
-	id     uint64
-}
-
-func newRig(t *testing.T) *rig {
+func newEnv(t *testing.T) *env {
 	t.Helper()
-	r := &rig{
-		swaps:  &fakeSwaps{},
-		inv:    &fakeInvoices{inv: map[string][2]int64{}},
-		chain:  &fakeChain{pays: map[string][2]int64{}},
-		wallet: &fakeWallet{b: Balance{Confirmed: 5 * btc}},
-		lsp:    &fakeLSP{},
-		now:    time.Date(2026, 11, 25, 12, 0, 0, 0, time.UTC),
-	}
-	clock := func() time.Time { return r.now }
-	led, err := OpenLedger(filepath.Join(t.TempDir(), "ledger.json"), clock)
+	ent, _ := bip39.NewEntropy(128)
+	words, _ := bip39.NewMnemonic(ent)
+	f := filepath.Join(t.TempDir(), "seed")
+	os.WriteFile(f, []byte(words), 0o600)
+	k, err := keys.FromMnemonicFile(f, "m/0/0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.p = &Policy{
-		MaxPerOpSat: btc, DailySat: 2 * btc, ReserveSat: 50_000_000,
-		MaxPendingReverse: 5, FeeRatio: 0.0001, MinFeeSat: 121, MaxFeeRate: 25,
-		RequiredConfs: 3, Swaps: r.swaps, Invoices: r.inv, Chain: r.chain, Wallet: r.wallet, LSP: r.lsp, Ledger: led, Now: clock,
-		Alert: func(m, why string) { r.alerts = append(r.alerts, m+": "+why) },
+	led, _ := OpenLedger("", nil)
+	ourAddrKey, _ := btcec.NewPrivateKey()
+	a, _ := btcutil.NewAddressTaproot(ourAddrKey.PubKey().SerializeCompressed()[1:], &chaincfg.RegressionNetParams)
+	e := &env{t: t, keys: k,
+		ln:    &fakeLN{invoices: map[string]*InvoiceInfo{}, payreqs: map[string]*PayReq{}, tracks: map[string][2]string{}, balance: Balance{Confirmed: 300_000_000}, addr: a.EncodeAddress()},
+		chain: &fakeChain{txs: map[string][]Output{}, spent: map[string]bool{}, spenders: map[string]*Spend{}, height: 1000, confs: map[string]int64{}},
+		swaps: &fakeSwaps{swaps: map[string]*Swap{}},
 	}
-	return r
-}
-
-func (r *rig) call(uri string, m proto.Message) error {
-	b, err := proto.Marshal(m)
-	if err != nil {
-		panic(err)
+	e.p = &Policy{
+		MaxPerOpSat: 100_000_000, DailySat: 200_000_000, ReserveSat: 50_000_000, MaxPendingReverse: 5,
+		FeeRatio: 0.0001, MinFeeSat: 121, MaxFeeRate: 25, RequiredConfs: 3,
+		MinLockBlocks: 12, MaxLockBlocks: 4320, HoldExpiryDelta: 18, SafetyBlocks: 6, ClaimMarginSat: 100,
+		Net: &chaincfg.RegressionNetParams, Swaps: e.swaps, LN: e.ln, Chain: e.chain, Keys: k,
+		LSP: fakeLSP{}, Ledger: led,
 	}
-	return r.raw(uri, b)
+	e.p.Notify = func(ev string, _ map[string]any) { e.notes = append(e.notes, ev) }
+	return e
 }
 
-func (r *rig) raw(uri string, b []byte) error {
-	r.id++
-	return r.p.Intercept(context.Background(), CaveatCondition, r.id,
-		&lnrpc.RPCMessage{MethodFullUri: uri, Serialized: b})
+func (e *env) msg(uri string, m proto.Message) *lnrpc.RPCMessage {
+	b, _ := proto.Marshal(m)
+	return &lnrpc.RPCMessage{MethodFullUri: uri, Serialized: b}
 }
 
-func (r *rig) answer(isErr bool) {
-	r.p.Answered(r.id, &lnrpc.RPCMessage{IsError: isErr})
+func (e *env) call(uri string, m proto.Message) (uint64, error) {
+	e.next++
+	return e.next, e.p.Intercept(context.Background(), CaveatCondition, e.next, e.msg(uri, m))
+}
+
+func (e *env) answer(id uint64, m proto.Message, isErr bool) {
+	var b []byte
+	if m != nil {
+		b, _ = proto.Marshal(m)
+	}
+	e.p.Answered(id, &lnrpc.RPCMessage{Serialized: b, IsError: isErr, StreamRpc: true})
 }
 
 func mustRefuse(t *testing.T, err error, want string) {
 	t.Helper()
 	if err == nil || !Refused(err) {
-		t.Fatalf("want a refusal containing %q, got %v", want, err)
+		t.Fatalf("want a refusal (%s), got %v", want, err)
 	}
-	if !strings.Contains(err.Error(), want) {
-		t.Fatalf("want %q in %q", want, err.Error())
+	if want != "" && !strings.Contains(err.Error(), want) {
+		t.Fatalf("refusal %q does not say %q", err, want)
 	}
 }
 
-func mustPass(t *testing.T, err error) {
+func mustAllow(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
-		t.Fatalf("want pass, got %v", err)
+		t.Fatalf("refused: %v", err)
 	}
 }
 
-const (
-	sendCoins = "/lnrpc.Lightning/SendCoins"
-	sendPay   = "/routerrpc.Router/SendPaymentV2"
-	addHold   = "/invoicesrpc.Invoices/AddHoldInvoice"
-	cancelInv = "/invoicesrpc.Invoices/CancelInvoice"
-	settleInv = "/invoicesrpc.Invoices/SettleInvoice"
-)
+func randKey() *btcec.PrivateKey { k, _ := btcec.NewPrivateKey(); return k }
 
-// rev adds a reverse swap whose hold invoice lnd holds as paid.
-func (r *rig) rev(addr string, sat int64, status string) {
-	h := sha256.Sum256([]byte(addr))
-	hh := hex.EncodeToString(h[:])
-	r.swaps.reverse = append(r.swaps.reverse, ReverseSwap{LockupAddress: addr, OnchainAmount: sat, Status: status, PreimageHash: hh})
-	r.inv.inv[hh] = [2]int64{InvoiceAccepted, (sat + 300) * 1000}
+func preimage(b byte) ([]byte, []byte) {
+	p := bytes.Repeat([]byte{b}, 32)
+	h := sha256.Sum256(p)
+	return p, h[:]
 }
 
-func lockupRig(t *testing.T, sat int64) *rig {
-	r := newRig(t)
-	r.rev("bcrt1qlockup", sat, "swap.created")
-	return r
-}
-
-// sub adds a submarine swap whose lockup the node shows confirmed.
-func (r *rig) sub(invoice string, sat int64, status string) {
-	r.swaps.swaps = append(r.swaps.swaps, Swap{Invoice: invoice, InvoiceAmount: sat, Status: status,
-		LockupAddress: "bcrt1plock-" + invoice, LockupTxID: "tx-" + invoice})
-	r.chain.pays["tx-"+invoice+"|bcrt1plock-"+invoice] = [2]int64{sat + 200, 3}
-}
-
-func TestCaveatAndMethods(t *testing.T) {
-	r := newRig(t)
-	r.id++
-	err := r.p.Intercept(context.Background(), "v0", r.id, &lnrpc.RPCMessage{MethodFullUri: "/lnrpc.Lightning/GetInfo"})
-	mustRefuse(t, err, "caveat condition")
-	for _, uri := range []string{
-		"/lnrpc.Lightning/OpenChannelSync", "/lnrpc.Lightning/OpenChannel",
-		"/lnrpc.Lightning/CloseChannel", "/lnrpc.Lightning/SendMany",
-		"/walletrpc.WalletKit/FundPsbt", "/walletrpc.WalletKit/SignPsbt",
-		"/lnrpc.Lightning/BakeMacaroon", "/lnrpc.Lightning/SendPaymentSync",
-		"/routerrpc.Router/SendToRouteV2", "/lnrpc.Lightning/UpdateChannelPolicy",
-		"/walletrpc.WalletKit/SendOutputs", "/lnrpc.Lightning/StopDaemon",
-	} {
-		mustRefuse(t, r.call(uri, &lnrpc.CancelInvoiceMsg{}), "not allowed")
-		mustRefuse(t, r.p.Stream(uri), "not allowed")
+func addrOf(t *testing.T, pk []byte) string {
+	_, addrs, _, err := txscript.ExtractPkScriptAddrs(pk, &chaincfg.RegressionNetParams)
+	if err != nil || len(addrs) != 1 {
+		t.Fatal(err)
 	}
-	mustPass(t, r.call("/lnrpc.Lightning/GetInfo", &lnrpc.CancelInvoiceMsg{}))
-	mustPass(t, r.p.Stream(sendPay))
-	if len(r.alerts) == 0 {
-		t.Fatal("refusals should alert")
-	}
+	return addrs[0].EncodeAddress()
 }
 
-func TestSendCoinsOnlyToLockup(t *testing.T) {
-	r := lockupRig(t, 1_000_000)
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qattacker", Amount: 1_000_000}), "no reverse swap")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_001}), "no reverse swap")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", SendAll: true}), "send_all")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000, SpendUnconfirmed: true}), "confirmed")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000, Outpoints: [][]byte{{1}}}), "chosen")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000, SatPerVbyte: 500}), "fee rate")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000, SatPerByte: 500}), "fee rate")
-	r.swaps.reverse[0].Status = "transaction.mempool"
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "no reverse swap")
-	r.swaps.reverse[0].Status = "swap.created"
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000, SatPerByte: 2, Label: "Lockup"}))
-	r.answer(false)
-	// a lockup is sent once
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "already sent")
+// submarine sets up a submarine swap whose lockup pays lockSat, and its
+// invoice for invSat; returns the invoice string.
+func (e *env) submarine(idx uint32, invSat, lockSat int64, b byte) (string, *Swap, []byte) {
+	pre, hash := preimage(b)
+	user := randKey()
+	server, _ := e.keys.Public(idx)
+	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Submarine, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
+	txid := strings.Repeat(fmt.Sprintf("%02x", b), 32)
+	e.chain.txs[txid] = []Output{{PkScript: out.PkScript, Sat: lockSat, Confirmations: 3}}
+	inv := fmt.Sprintf("lnbcrt%dinv%d", invSat, b)
+	e.ln.payreqs[inv] = &PayReq{Hash: hash, AmountMsat: invSat * 1000}
+	s := &Swap{ID: fmt.Sprintf("sub%d", b), PreimageHash: hex.EncodeToString(hash), RefundKey: hex.EncodeToString(user.PubKey().SerializeCompressed()),
+		KeyIndex: int64(idx), Timeout: 1100, LockupTxID: txid, LockupVout: 0, Version: 1}
+	e.swaps.swaps[inv] = s
+	return inv, s, pre
 }
 
-func TestSendCoinsRefusedByLndMayRetry(t *testing.T) {
-	r := lockupRig(t, 1_000_000)
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}))
-	r.answer(true) // lnd failed it: nothing sent
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}))
+func payReq(inv string) *lnrpc.SendPaymentRequest {
+	return &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121, CltvLimit: 50, TimeoutSeconds: 60}
 }
 
-func TestPerOperationAndDailyLimits(t *testing.T) {
-	r := newRig(t)
-	r.wallet.b.Confirmed = 10 * btc
-	r.rev("a1", btc+1, "invoice.pending")
-	r.rev("a2", btc, "invoice.pending")
-	r.rev("a3", btc, "invoice.pending")
-	r.rev("a4", btc, "invoice.pending")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a1", Amount: btc + 1}), "limit per operation")
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a2", Amount: btc}))
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a3", Amount: btc}))
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a4", Amount: btc}), "daily limit")
-	r.now = r.now.Add(24*time.Hour + time.Second)
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a4", Amount: btc}))
+const payURI = "/routerrpc.Router/SendPaymentV2"
+
+// ---- payments (review issues 1 and 2) ----
+
+func TestPaymentAmountFromTheInvoiceNotTheDatabase(t *testing.T) {
+	e := newEnv(t)
+	// the attacker's 5 BTC invoice; the database can say anything
+	inv, _, _ := e.submarine(1, 500_000_000, 1000, 1)
+	_, err := e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "limit per operation")
+	// 0.5 BTC invoice against a 1000 sat lockup
+	inv, _, _ = e.submarine(2, 50_000_000, 1000, 2)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "less than")
 }
 
-func TestDailyLimitSurvivesRestart(t *testing.T) {
-	r := newRig(t)
-	r.wallet.b.Confirmed = 10 * btc
-	r.rev("a2", btc, "invoice.pending")
-	r.rev("a3", btc, "invoice.pending")
-	r.rev("a4", 1, "invoice.pending")
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a2", Amount: btc}))
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a3", Amount: btc}))
-	led, err := OpenLedger(r.p.Ledger.path, func() time.Time { return r.now })
+func TestPaymentLockupMustBeTheRebuiltOutput(t *testing.T) {
+	e := newEnv(t)
+	inv, s, _ := e.submarine(3, 100_000, 200_000, 3)
+	// the lockup pays an address the attacker controls instead
+	e.chain.txs[s.LockupTxID][0].PkScript, _ = txscript.PayToTaprootScript(randKey().PubKey())
+	_, err := e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "rebuilds")
+	// hash of the swap row differs from the invoice's
+	inv, s, _ = e.submarine(4, 100_000, 200_000, 4)
+	s.PreimageHash = strings.Repeat("00", 32)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "hash")
+}
+
+func TestPaymentChecks(t *testing.T) {
+	e := newEnv(t)
+	inv, s, _ := e.submarine(5, 100_000, 200_000, 5)
+	r := payReq(inv)
+	r.CltvLimit = 0
+	_, err := e.call(payURI, r)
+	mustRefuse(t, err, "cltv_limit")
+	r = payReq(inv)
+	r.CltvLimit = 95 // timeout 1100, height 1000, safety 6
+	_, err = e.call(payURI, r)
+	mustRefuse(t, err, "no time to claim")
+	r = payReq(inv)
+	r.OutgoingChanIds = []uint64{1}
+	_, err = e.call(payURI, r)
+	mustRefuse(t, err, "outgoing")
+	r = payReq(inv)
+	r.FeeLimitSat = 5000
+	_, err = e.call(payURI, r)
+	mustRefuse(t, err, "fee limit")
+	e.chain.txs[s.LockupTxID][0].Confirmations = 2
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "confirmations")
+	e.chain.txs[s.LockupTxID][0].Confirmations = 3
+	e.chain.spent[s.LockupTxID+":0"] = true
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "spent")
+	e.chain.spent[s.LockupTxID+":0"] = false
+	_, err = e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+}
+
+func TestLockupBacksOnePayment(t *testing.T) {
+	e := newEnv(t)
+	inv, s, _ := e.submarine(6, 100_000, 200_000, 6)
+	_, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	// another swap row pointing at the same lockup
+	inv2, s2, _ := e.submarine(7, 100_000, 200_000, 7)
+	s2.LockupTxID = s.LockupTxID
+	e.chain.txs[s.LockupTxID] = append(e.chain.txs[s.LockupTxID][:1], e.chain.txs[s2.LockupTxID]...)
+	_ = inv2
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "already")
+}
+
+func TestCapNotGivenBackOnStreamErrors(t *testing.T) {
+	e := newEnv(t)
+	e.p.DailySat = 150_000
+	inv, _, _ := e.submarine(8, 100_000, 200_000, 8)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	// the backend cancels the stream / lnd answers AlreadyExists
+	e.answer(id, nil, true)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "already")
+	// another payment would pass the daily limit: the first still counts
+	inv2, _, _ := e.submarine(9, 100_000, 200_000, 9)
+	_, err = e.call(payURI, payReq(inv2))
+	mustRefuse(t, err, "daily limit")
+	// a FAILED on some other request id changes nothing
+	e.answer(9999, &lnrpc.Payment{Status: paymentFailed}, false)
+	_, err = e.call(payURI, payReq(inv2))
+	mustRefuse(t, err, "daily limit")
+	// lnd itself says the first one failed: given back
+	_, hash := preimage(8)
+	e.ln.tracks[hex.EncodeToString(hash)] = [2]string{"3", ""}
+	e.p.reconcilePayments(context.Background())
+	_, err = e.call(payURI, payReq(inv2))
+	mustAllow(t, err)
+}
+
+func TestFailedOnOwnStreamReleases(t *testing.T) {
+	e := newEnv(t)
+	e.p.DailySat = 150_000
+	inv, _, _ := e.submarine(10, 100_000, 200_000, 10)
+	id, _ := e.call(payURI, payReq(inv))
+	e.answer(id, &lnrpc.Payment{Status: paymentInFlight}, false)
+	e.answer(id, &lnrpc.Payment{Status: paymentFailed}, false)
+	// retry allowed (same lockup, the payment never went through)
+	_, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+}
+
+// ---- claims ----
+
+func verify(t *testing.T, tx *wire.MsgTx, prevPk []byte, prevSat int64) {
+	t.Helper()
+	fetch := txscript.NewCannedPrevOutputFetcher(prevPk, prevSat)
+	vm, err := txscript.NewEngine(prevPk, tx, 0, txscript.StandardVerifyFlags, nil, txscript.NewTxSigHashes(tx, fetch), prevSat, fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.p.Ledger = led
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a4", Amount: 1}), "daily limit")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a2", Amount: btc}), "already sent")
-}
-
-func TestLSPReserve(t *testing.T) {
-	r := lockupRig(t, 30_000_000)
-	r.wallet.b = Balance{Confirmed: 100_000_000, Locked: 5_000_000, AnchorReserve: 10_000}
-	r.lsp.sat = 20_000_000
-	// 100M - 5M - 10k - 50M - 20M = 24.99M < 30M
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 30_000_000}), "LSP reserve")
-	r.lsp.sat = 0
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 30_000_000}))
-}
-
-func TestFailClosedOnUnknownState(t *testing.T) {
-	r := lockupRig(t, 1_000_000)
-	r.lsp.err = errors.New("no state file")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "LSP requests unknown")
-	r.lsp.err = nil
-	r.wallet.err = errors.New("lnd down")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "wallet balance unknown")
-	r.wallet.err = nil
-	r.swaps.err = errors.New("db down")
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "swap database")
-	mustRefuse(t, r.call(cancelInv, &lnrpc.CancelInvoiceMsg{PaymentHash: make([]byte, 32)}), "swap database")
-}
-
-func TestUnknownFieldsRefused(t *testing.T) {
-	r := lockupRig(t, 1_000_000)
-	b, _ := proto.Marshal(&lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000})
-	b = protowire.AppendTag(b, 99, protowire.VarintType)
-	b = protowire.AppendVarint(b, 1)
-	mustRefuse(t, r.raw(sendCoins, b), "does not know")
-	mustRefuse(t, r.raw(sendCoins, []byte{0xff, 0xff}), "unreadable")
-}
-
-const inv = "lnbcrt1000u1pexample"
-
-func payRig(t *testing.T, sat int64, status string) *rig {
-	r := newRig(t)
-	r.sub(inv, sat, status)
-	return r
-}
-
-func TestPaymentOnlySwapInvoices(t *testing.T) {
-	r := payRig(t, 1_000_000, "transaction.confirmed")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "lnbcrt1attacker", FeeLimitSat: 100}), "not the invoice")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{Dest: []byte{2}, Amt: 1000, PaymentHash: make([]byte, 32)}), "only invoices")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, Amt: 5_000_000}), "own amount")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, Amp: true}), "AMP")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, DestCustomRecords: map[uint64][]byte{65536: {1}}}), "custom records")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, LastHopPubkey: []byte{2}}), "steered")
-	// fee cap: max(1M * 0.0001, 121) = 121 sat... 1M sat * 1e-4 = 100 sat, floor 121
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 1000}), "routing fee")
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121, MaxParts: 5, TimeoutSeconds: 60}))
-	// the same payment again (a retry) passes and counts once
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: strings.ToUpper(inv), FeeLimitSat: 121}))
-	if got := r.p.Ledger.Since(r.now.Add(-time.Hour)); got != 1_000_000 {
-		t.Fatalf("counted %d", got)
+	if err := vm.Execute(); err != nil {
+		t.Fatalf("the guard's transaction does not verify: %v", err)
 	}
 }
 
-func TestPaymentFeeScalesWithAmount(t *testing.T) {
-	r := payRig(t, btc, "invoice.pending")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 10_001}), "routing fee")
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 10_000}))
-}
-
-func TestPaymentNotBeforeLockupConfirmed(t *testing.T) {
-	for _, st := range []string{"swap.created", "invoice.set", "transaction.mempool", "invoice.failedToPay", "transaction.refunded"} {
-		r := payRig(t, 1_000_000, st)
-		mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121}), "not ready")
+func TestPaidThenClaimed(t *testing.T) {
+	e := newEnv(t)
+	inv, s, pre := e.submarine(11, 100_000, 200_000, 11)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: hex.EncodeToString(pre)}, false)
+	txid, fee, err := e.p.Claim(context.Background(), s.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(e.chain.broadcast) != 1 || txid == "" || fee <= 0 {
+		t.Fatal("no claim broadcast")
+	}
+	tx := e.chain.broadcast[0]
+	o := e.chain.txs[s.LockupTxID][0]
+	verify(t, tx, o.PkScript, o.Sat)
+	if tx.TxOut[0].Value != o.Sat-fee || addrOf(t, tx.TxOut[0].PkScript) != e.ln.addr {
+		t.Fatal("the claim does not go to lnd's address")
+	}
+	// asking again returns the same claim
+	txid2, _, _ := e.p.Claim(context.Background(), s.ID)
+	if txid2 != txid || len(e.chain.broadcast) != 1 {
+		t.Fatal("claimed twice")
 	}
 }
 
-func TestPaymentLimits(t *testing.T) {
-	r := payRig(t, btc+1, "transaction.confirmed")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 20_000}), "limit per operation")
-	r = newRig(t)
-	r.sub("i1", btc, "transaction.confirmed")
-	r.sub("i2", btc, "transaction.confirmed")
-	r.sub("i3", 10_000, "transaction.confirmed")
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i1", FeeLimitSat: 10_000}))
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i2", FeeLimitSat: 10_000}))
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i3", FeeLimitSat: 121}), "daily limit")
-}
-
-func TestDailyLimitIsShared(t *testing.T) {
-	r := newRig(t)
-	r.wallet.b.Confirmed = 10 * btc
-	r.sub("i1", btc, "transaction.confirmed")
-	r.rev("a1", btc, "invoice.pending")
-	r.rev("a2", 1, "invoice.pending")
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i1", FeeLimitSat: 10_000}))
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a1", Amount: btc}))
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "a2", Amount: 1}), "daily limit")
-}
-
-func TestHoldInvoices(t *testing.T) {
-	r := newRig(t)
-	h := sha256.Sum256([]byte("preimage-of-a-kiloswap-swap-0001"))
-	mustRefuse(t, r.call(addHold, &lnrpc.AddHoldInvoiceRequest{Hash: []byte{1}, Value: 1000}), "32-byte")
-	mustRefuse(t, r.call(addHold, &lnrpc.AddHoldInvoiceRequest{Hash: h[:], Value: btc + 1}), "not within")
-	mustRefuse(t, r.call(addHold, &lnrpc.AddHoldInvoiceRequest{Hash: h[:], Value: 1, ValueMsat: 1000}), "one amount")
-	r.swaps.pendingN = 5
-	mustRefuse(t, r.call(addHold, &lnrpc.AddHoldInvoiceRequest{Hash: h[:], Value: 100_000}), "reverse swaps pending")
-	r.swaps.pendingN = 4
-	r.wallet.b.Confirmed = 2 * btc // 2 BTC - 0.5 reserve = 1.5 available
-	r.swaps.pendingSat = btc
-	mustRefuse(t, r.call(addHold, &lnrpc.AddHoldInvoiceRequest{Hash: h[:], Value: 60_000_000}), "not fit")
-	mustPass(t, r.call(addHold, &lnrpc.AddHoldInvoiceRequest{Hash: h[:], ValueMsat: 40_000_000_000, Memo: "Send to BTC address"}))
-	// its own invoice may be settled and cancelled
-	pre := []byte("preimage-of-a-kiloswap-swap-0001")
-	mustPass(t, r.call(settleInv, &lnrpc.SettleInvoiceMsg{Preimage: pre}))
-	mustPass(t, r.call(cancelInv, &lnrpc.CancelInvoiceMsg{PaymentHash: h[:]}))
-}
-
-func TestOthersInvoicesUntouchable(t *testing.T) {
-	r := newRig(t)
-	bridge := sha256.Sum256([]byte("a hold invoice of the bridge...."))
-	mustRefuse(t, r.call(cancelInv, &lnrpc.CancelInvoiceMsg{PaymentHash: bridge[:]}), "not a Kiloswap")
-	mustRefuse(t, r.call(settleInv, &lnrpc.SettleInvoiceMsg{Preimage: []byte("a hold invoice of the bridge....")}), "not a Kiloswap")
-	mustRefuse(t, r.call(settleInv, &lnrpc.SettleInvoiceMsg{Preimage: []byte("short")}), "32-byte")
-	// one in the swap database (created before the guard kept a record) is its own
-	r.swaps.reverse = []ReverseSwap{{PreimageHash: hex.EncodeToString(bridge[:])}}
-	mustPass(t, r.call(cancelInv, &lnrpc.CancelInvoiceMsg{PaymentHash: bridge[:]}))
-}
-
-// The backend's database is its own word: a row it wrote is not enough.
-func TestLockupNeedsLndToHoldThePayment(t *testing.T) {
-	r := lockupRig(t, 1_000_000)
-	h := r.swaps.reverse[0].PreimageHash
-	for _, st := range []int64{0, 1, 2} { // OPEN, SETTLED, CANCELED
-		r.inv.inv[h] = [2]int64{st, 2_000_000_000}
-		mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "not paid and held")
+func TestWrongPreimageIsNotTaken(t *testing.T) {
+	e := newEnv(t)
+	inv, s, _ := e.submarine(12, 100_000, 200_000, 12)
+	id, _ := e.call(payURI, payReq(inv))
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: strings.Repeat("ab", 32)}, false)
+	if _, _, err := e.p.Claim(context.Background(), s.ID); err == nil {
+		t.Fatal("claimed with a preimage that does not match")
 	}
-	r.inv.inv[h] = [2]int64{InvoiceAccepted, 999_999_999} // less than the lockup
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "less than")
-	delete(r.inv.inv, h) // a row with no invoice in lnd at all
-	mustRefuse(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}), "lnd invoice")
-	r.inv.inv[h] = [2]int64{InvoiceAccepted, 1_000_000_000}
-	mustPass(t, r.call(sendCoins, &lnrpc.SendCoinsRequest{Addr: "bcrt1qlockup", Amount: 1_000_000}))
 }
 
-func TestPaymentNeedsTheLockupOnChain(t *testing.T) {
-	r := payRig(t, 1_000_000, "transaction.confirmed")
-	key := "tx-" + inv + "|bcrt1plock-" + inv
-	r.chain.pays[key] = [2]int64{1_000_200, 2}
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121}), "confirmations")
-	r.chain.pays[key] = [2]int64{999_999, 6}
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121}), "less than")
-	r.chain.pays[key] = [2]int64{0, 0} // a transaction the node does not know, or paying elsewhere
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121}), "confirmations")
-	r.chain.err = errors.New("rpc down")
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121}), "node")
-	r.chain.err = nil
-	r.swaps.swaps[0].LockupTxID = ""
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: inv, FeeLimitSat: 121}), "no lockup")
+// ---- reverse swaps (review issues 3, 4, 6) ----
+
+const (
+	holdURI   = "/invoicesrpc.Invoices/AddHoldInvoice"
+	sendURI   = "/lnrpc.Lightning/SendCoins"
+	cancelURI = "/invoicesrpc.Invoices/CancelInvoice"
+	lookupURI = "/lnrpc.Lightning/LookupInvoice"
+)
+
+// reverse creates a hold invoice through the guard, paid and held by lnd,
+// and the backend's row for its lockup.
+func (e *env) reverse(idx uint32, sat int64, b byte) (ReverseSwap, []byte, *btcec.PrivateKey) {
+	pre, hash := preimage(b)
+	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: sat + 1000})
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	e.answer(id, &lnrpc.AddHoldInvoiceResp{PaymentRequest: "lnbcrt"}, false)
+	e.ln.invoices[hex.EncodeToString(hash)] = &InvoiceInfo{State: InvoiceAccepted, PaidMsat: (sat + 1000) * 1000, HTLCExpiries: []int32{1200}}
+	user := randKey()
+	server, _ := e.keys.Public(idx)
+	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
+	r := ReverseSwap{ID: fmt.Sprintf("rev%d", b), LockupAddress: addrOf(e.t, out.PkScript), OnchainAmount: sat,
+		PreimageHash: hex.EncodeToString(hash), ClaimKey: hex.EncodeToString(user.PubKey().SerializeCompressed()),
+		KeyIndex: int64(idx), Timeout: 1100, Version: 1}
+	e.swaps.reverse = append(e.swaps.reverse, r)
+	return r, pre, user
 }
 
-func TestFailedPaymentFreesTheDailyLimit(t *testing.T) {
-	r := newRig(t)
-	r.sub("i1", btc, "invoice.pending")
-	r.sub("i2", btc, "invoice.pending")
-	r.sub("i3", btc, "invoice.pending")
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i1", FeeLimitSat: 10_000}))
-	upd := func(status int32) {
-		b, _ := proto.Marshal(&lnrpc.Payment{Status: status})
-		r.p.Answered(r.id, &lnrpc.RPCMessage{StreamRpc: true, Serialized: b})
+func sendReq(r ReverseSwap) *lnrpc.SendCoinsRequest {
+	return &lnrpc.SendCoinsRequest{Addr: r.LockupAddress, Amount: r.OnchainAmount, SatPerByte: 2}
+}
+
+func TestLockupNeedsAGuardHoldInvoice(t *testing.T) {
+	e := newEnv(t)
+	// a hold invoice created elsewhere (the bridge's, the LSP's): paid, held
+	pre, hash := preimage(20)
+	_ = pre
+	e.ln.invoices[hex.EncodeToString(hash)] = &InvoiceInfo{State: InvoiceAccepted, PaidMsat: 10_000_000_000, HTLCExpiries: []int32{1200}}
+	user := randKey()
+	server, _ := e.keys.Public(20)
+	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
+	r := ReverseSwap{ID: "x", LockupAddress: addrOf(t, out.PkScript), OnchainAmount: 1_000_000, PreimageHash: hex.EncodeToString(hash),
+		ClaimKey: hex.EncodeToString(user.PubKey().SerializeCompressed()), KeyIndex: 20, Timeout: 1100, Version: 1}
+	e.swaps.reverse = append(e.swaps.reverse, r)
+	_, err := e.call(sendURI, sendReq(r))
+	mustRefuse(t, err, "not created through the guard")
+}
+
+func TestLockupChecks(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(21, 1_000_000, 21)
+	// send_all, unconfirmed, target_conf
+	_, err := e.call(sendURI, &lnrpc.SendCoinsRequest{Addr: r.LockupAddress, SendAll: true, SatPerByte: 2})
+	mustRefuse(t, err, "send_all")
+	_, err = e.call(sendURI, &lnrpc.SendCoinsRequest{Addr: r.LockupAddress, Amount: r.OnchainAmount, TargetConf: 2})
+	mustRefuse(t, err, "fee rate")
+	// a row pointing to an address that is not the rebuilt output
+	bad := r
+	pk, _ := txscript.PayToTaprootScript(randKey().PubKey())
+	bad.LockupAddress = addrOf(t, pk)
+	e.swaps.reverse = append(e.swaps.reverse, bad)
+	_, err = e.call(sendURI, sendReq(bad))
+	mustRefuse(t, err, "rebuilds")
+	// timeout too far
+	r2, _, _ := e.reverse(22, 1_000_000, 22)
+	e.swaps.reverse[len(e.swaps.reverse)-1].Timeout = 9000
+	_, err = e.call(sendURI, sendReq(r2))
+	mustRefuse(t, err, "")
+	// HTLC expiring too close to the timeout
+	r3, _, _ := e.reverse(23, 1_000_000, 23)
+	_, h3 := preimage(23)
+	e.ln.invoices[hex.EncodeToString(h3)].HTLCExpiries = []int32{1110}
+	_, err = e.call(sendURI, sendReq(r3))
+	mustRefuse(t, err, "too close")
+	// the good one
+	_, err = e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	// the same hash twice
+	_, err = e.call(sendURI, sendReq(r))
+	mustRefuse(t, err, "already has a lockup")
+}
+
+func TestConcurrentSendsKeepTheReserve(t *testing.T) {
+	e := newEnv(t)
+	e.ln.balance = Balance{Confirmed: 52_900_000}
+	r1, _, _ := e.reverse(24, 1_500_000, 24)
+	_, err := e.call(sendURI, sendReq(r1))
+	mustAllow(t, err)
+	// lnd has not answered the send yet, so its coins are still in the
+	// balance: they must not be promised again
+	_, hash := preimage(25)
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 1_501_000})
+	mustRefuse(t, err, "would not fit")
+}
+
+func TestCancelOnlyOwnAndNotWhileLockedUp(t *testing.T) {
+	e := newEnv(t)
+	_, other := preimage(30)
+	_, err := e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: other})
+	mustRefuse(t, err, "not a Kiloswap")
+	r, _, _ := e.reverse(31, 1_000_000, 31)
+	_, hash := preimage(31)
+	id, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.SendCoinsResponse{Txid: strings.Repeat("31", 32)}, false)
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustRefuse(t, err, "stays until")
+	// a hold invoice the backend tried to add with an existing hash is never its own
+	e.ln.invoices[hex.EncodeToString(other)] = &InvoiceInfo{State: InvoiceAccepted}
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: other, Value: 1000})
+	mustRefuse(t, err, "already exists")
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: other})
+	mustRefuse(t, err, "not a Kiloswap")
+}
+
+func TestHoldRecordedOnlyWhenLndCreatedIt(t *testing.T) {
+	e := newEnv(t)
+	_, hash := preimage(40)
+	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 1000})
+	mustAllow(t, err)
+	e.answer(id, nil, true) // lnd refused it
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustRefuse(t, err, "not a Kiloswap")
+	_, err = e.call(lookupURI, &lnrpc.PaymentHash{RHash: hash})
+	mustRefuse(t, err, "not an invoice")
+}
+
+func TestPendingCountIsTheGuards(t *testing.T) {
+	e := newEnv(t)
+	e.p.MaxPendingReverse = 2
+	e.reverse(41, 100_000, 41)
+	e.reverse(42, 100_000, 42)
+	_, hash := preimage(43)
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 1000})
+	mustRefuse(t, err, "pending")
+}
+
+// ---- review issue 5 ----
+
+func TestLookupsOnlyOwnInvoices(t *testing.T) {
+	e := newEnv(t)
+	_, other := preimage(50)
+	_, err := e.call(lookupURI, &lnrpc.PaymentHash{RHash: other})
+	mustRefuse(t, err, "not an invoice")
+	_, err = e.call("/invoicesrpc.Invoices/SubscribeSingleInvoice", &lnrpc.SubscribeSingleInvoiceRequest{RHash: other})
+	mustRefuse(t, err, "not an invoice")
+	// an invoice the backend added through AddInvoice is its own
+	id, err := e.call("/lnrpc.Lightning/AddInvoice", &lnrpc.Invoice{Value: 1})
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.AddInvoiceResponse{RHash: other}, false)
+	_, err = e.call(lookupURI, &lnrpc.PaymentHash{RHash: other})
+	mustAllow(t, err)
+	_, err = e.call("/routerrpc.Router/ResetMissionControl", &lnrpc.WalletBalanceRequest{})
+	mustRefuse(t, err, "not allowed")
+}
+
+// ---- the guard's own work on reverse lockups ----
+
+func (e *env) sent(r ReverseSwap, b byte) (string, []byte) {
+	id, err := e.call(sendURI, sendReq(r))
+	mustAllow(e.t, err)
+	txid := strings.Repeat(fmt.Sprintf("%02x", b), 32)
+	e.answer(id, &lnrpc.SendCoinsResponse{Txid: txid}, false)
+	pk, _ := e.p.addrScript(r.LockupAddress)
+	e.chain.txs[txid] = []Output{{PkScript: []byte{0x51}, Sat: 1}, {PkScript: pk, Sat: r.OnchainAmount, Confirmations: 1}}
+	return txid, pk
+}
+
+func TestUserClaimSettles(t *testing.T) {
+	e := newEnv(t)
+	r, pre, user := e.reverse(60, 1_000_000, 60)
+	txid, _ := e.sent(r, 60)
+	_ = user
+	e.p.Tick(context.Background())
+	_, hash := preimage(60)
+	server, _ := e.keys.Public(60)
+	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
+	cb, _ := out.ControlBlock(out.ClaimLeaf)
+	e.chain.spent[txid+":1"] = true
+	e.chain.spenders[txid+":1"] = &Spend{TxID: "claim", Witness: [][]byte{make([]byte, 64), pre, out.ClaimLeaf.Script, cb}}
+	e.p.Tick(context.Background())
+	if len(e.ln.settled) != 1 || !bytes.Equal(e.ln.settled[0], pre) {
+		t.Fatal("the hold invoice was not settled with the claim's preimage")
 	}
-	upd(1) // in flight: still counted
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i2", FeeLimitSat: 10_000}))
-	upd(3) // i2 failed: it no longer counts
-	mustPass(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i3", FeeLimitSat: 10_000}))
-	upd(2) // i3 succeeded: counted
-	if got := r.p.Ledger.Since(r.now.Add(-time.Hour)); got != 2*btc {
-		t.Fatalf("counted %d, want i1 and i3", got)
+	if e.p.Ledger.Lockups[hex.EncodeToString(hash)].State != LockSettled {
+		t.Fatal("lockup not settled")
 	}
-	// i2 again now passes only if the limit allows: it does not
-	mustRefuse(t, r.call(sendPay, &lnrpc.SendPaymentRequest{PaymentRequest: "i2", FeeLimitSat: 10_000}), "daily limit")
+}
+
+func TestRefundAfterTimeout(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(61, 1_000_000, 61)
+	txid, pk := e.sent(r, 61)
+	if _, _, err := e.p.Refund(context.Background(), r.ID); err == nil {
+		t.Fatal("refunded before the timeout")
+	}
+	e.chain.height = 1100
+	e.p.Tick(context.Background())
+	if len(e.chain.broadcast) != 1 {
+		t.Fatal("no refund")
+	}
+	tx := e.chain.broadcast[0]
+	if tx.LockTime != 1100 {
+		t.Fatal("refund without the lock time")
+	}
+	verify(t, tx, pk, r.OnchainAmount)
+	_, hash := preimage(61)
+	_, err := e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustRefuse(t, err, "stays until")
+	e.chain.spent[txid+":1"] = true
+	e.chain.spenders[txid+":1"] = &Spend{TxID: tx.TxHash().String(), Witness: tx.TxIn[0].Witness, Confirmations: 1}
+	e.p.Tick(context.Background())
+	if e.ln.invoices[hex.EncodeToString(hash)].State != InvoiceCanceled {
+		t.Fatal("the guard did not cancel the hold invoice after its refund confirmed")
+	}
+	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
+	mustAllow(t, err)
+}
+
+func TestKeysNeverLeaveTheGuard(t *testing.T) {
+	e := newEnv(t)
+	x, err := e.keys.AccountXpub()
+	if err != nil || !strings.HasPrefix(x, "xpub") {
+		t.Fatalf("xpub: %v %s", err, x)
+	}
+	// the backend derives our public keys from it, the same ones
+	ek, _ := btcutilHD(x)
+	pub, _ := e.keys.Public(5)
+	if !bytes.Equal(ek(5), pub.SerializeCompressed()) {
+		t.Fatal("the xpub does not give our keys")
+	}
+	_ = time.Now
+}
+
+func btcutilHD(xpub string) (func(uint32) []byte, error) {
+	k, err := hdkeychain.NewKeyFromString(xpub)
+	if err != nil {
+		return nil, err
+	}
+	return func(i uint32) []byte {
+		c, _ := k.Derive(i)
+		p, _ := c.ECPubKey()
+		return p.SerializeCompressed()
+	}, nil
 }

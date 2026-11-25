@@ -8,7 +8,10 @@
 #                            each one to the guard and refuses them all while
 #                            the guard is not registered
 #   kiloswap-guard.macaroon  the guard: register as middleware, read the
-#                            wallet balance and look up invoices
+#                            wallet balance, look up and decode invoices,
+#                            settle and cancel Kiloswap's hold invoices,
+#                            follow its payments, new addresses for its
+#                            claims and refunds
 set -euo pipefail
 cd "$(dirname "$0")"
 set -a; . ./.env; set +a
@@ -24,14 +27,16 @@ backend=(
 	uri:/lnrpc.Lightning/SubscribePeerEvents uri:/lnrpc.Lightning/SubscribeChannelEvents
 	uri:/lnrpc.Lightning/ExportAllChannelBackups uri:/lnrpc.Lightning/SubscribeChannelBackups
 	uri:/routerrpc.Router/SendPaymentV2 uri:/routerrpc.Router/TrackPaymentV2
-	uri:/routerrpc.Router/ResetMissionControl uri:/invoicesrpc.Invoices/AddHoldInvoice
+	uri:/invoicesrpc.Invoices/AddHoldInvoice
 	uri:/invoicesrpc.Invoices/CancelInvoice uri:/invoicesrpc.Invoices/SettleInvoice
 	uri:/invoicesrpc.Invoices/SubscribeSingleInvoice
 	uri:/lnrpc.Lightning/NewAddress uri:/lnrpc.Lightning/SendCoins uri:/lnrpc.Lightning/GetTransactions
 )
 guard=(
 	uri:/lnrpc.Lightning/RegisterRPCMiddleware uri:/lnrpc.Lightning/WalletBalance
-	uri:/lnrpc.Lightning/LookupInvoice
+	uri:/lnrpc.Lightning/LookupInvoice uri:/lnrpc.Lightning/DecodePayReq
+	uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice
+	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress
 )
 bake() { # NAME ROOT_KEY_ID OWNER ARGS...
 	local name=$1 key=$2 owner=$3; shift 3

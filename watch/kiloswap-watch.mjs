@@ -188,6 +188,20 @@ if (ALERT_PORT) {
     req.on('end', async () => {
       res.end('ok');
       let j = {}; try { j = JSON.parse(body); } catch { return; }
+      // Movements the guard allowed or made itself: these do not come from
+      // the backend's database, so a backend taken over cannot hide them
+      const sat = (n) => Number(n || 0).toLocaleString('es-ES');
+      const moves = {
+        lockup_sent: () => `⛓️ Kiloswap: depósito enviado ${sat(j.sat)} sats (swap ${j.swap})`,
+        payment_succeeded: () => `⚡ Kiloswap: pago hecho ${sat(j.sat)} sats (swap ${j.swap})`,
+        payment_failed: () => `⚠️ Kiloswap: pago fallido ${sat(j.sat)} sats (swap ${j.swap})`,
+        claimed: () => `✅ Kiloswap: el guardián ha cobrado ${sat(j.sat)} sats (comisión de red ${sat(j.fee)}) — ${String(j.txid).slice(0, 16)}…`,
+        refunded: () => `↩️ Kiloswap: el guardián ha reembolsado ${sat(j.sat)} sats (swap ${j.swap})`,
+        settled: () => `💰 Kiloswap: factura liquidada ${sat(j.sat)} sats (swap ${j.swap})`,
+        guard_claim_failed: () => `🚨 Kiloswap: el guardián no ha podido cobrar (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
+        guard_lockup_error: () => `🚨 Kiloswap: depósito con problemas (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
+      };
+      if (moves[j.event]) { try { await send(moves[j.event]()); } catch { /* next one */ } return; }
       if (j.event !== 'guard_refusal') return;
       const now = Date.now(); burst = now - last < 60_000 ? burst + 1 : 0; last = now;
       if (burst > 5) return; // at most a few a minute; the guard's log has them all

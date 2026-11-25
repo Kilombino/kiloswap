@@ -5,6 +5,13 @@
 #     network lnd-net); the backend talks to it only with a macaroon that
 #     carries the "kiloswap" caveat, so lnd hands every call to the guard
 #     and refuses them all while the guard is down;
+#   - the swaps' server key lives only in the guard (secrets/swap_seed): the
+#     backend gets the extended public key and asks the guard for claims and
+#     refunds; its own seed.dat is a fresh, unrelated one;
+#   - the backend sits on an internal network: postgres, the shim (node RPC
+#     and ZMQ), the guard's API and lnd's gRPC port through lnd-proxy, which
+#     answers to lnd's name so its certificate still matches. No route to
+#     lnd-net (tor-lnd), the host's LAN or the internet;
 #   - nothing is published but the web front on 127.0.0.1 (a tunnel and an
 #     onion service in front of it).
 #
@@ -20,6 +27,10 @@ networks:
   default:
     ipam:
       config: [{subnet: "${KILOSWAP_SUBNET:-172.30.91.0/24}"}]
+  internal:
+    internal: true
+    ipam:
+      config: [{subnet: "${KILOSWAP_INTERNAL_SUBNET:-172.30.92.0/24}"}]
   lnd:
     name: ${LND_NETWORK:-lnd-net}
     external: true
@@ -37,6 +48,7 @@ services:
       POSTGRES_USER: boltz
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
     command: ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=40"]
+    networks: [internal]
     volumes:
       - ${KILOSWAP_ROOT:?}/postgres:/var/lib/postgresql
       - ${KILOSWAP_ROOT:?}/secrets/postgres_password:/run/secrets/postgres_password:ro
@@ -56,6 +68,7 @@ services:
       SHIM_DB: /data/txindex.db
       SHIM_WINDOW: "8640"
       SHIM_FORWARD: 28332=${NODE_HOST}:28332,28333=${NODE_HOST}:28333
+    networks: [default, internal]
     volumes:
       - ${KILOSWAP_ROOT:?}/shim:/data
     logging: *logging
@@ -68,15 +81,22 @@ services:
     read_only: true
     restart: unless-stopped
     depends_on: [postgres]
-    networks: [default, lnd]
+    # internal: postgres and the backend's calls to its API; lnd: register
+    # as middleware; default: the node's RPC on the host (its own user)
+    networks: [internal, lnd, default]
     environment:
       LND_GRPC: ${LND_HOST:-lnd-blake2b}:10009
       LND_TLSCERT: /lnd/tls.cert
       LND_MACAROON: /lnd/kiloswap-guard.macaroon
       DATABASE_URL_FILE: /run/secrets/guard_db_url
       CHAIN_RPC_URL: http://${NODE_HOST}:${NODE_RPC_PORT:-8332}/
-      CHAIN_RPC_USER: kiloswap
-      CHAIN_RPC_PASSWORD_FILE: /run/secrets/node_rpc_password
+      CHAIN_RPC_USER: kiloswap-guard
+      CHAIN_RPC_PASSWORD_FILE: /run/secrets/guard_rpc_password
+      NETWORK: mainnet
+      SWAP_MNEMONIC_FILE: /run/secrets/swap_seed
+      SWAP_KEY_PATH: m/0/0
+      API_ADDR: ":8091"
+      API_TOKEN_FILE: /run/secrets/guard_api_token
       LSP_STATE: /lsp/state.json
       LEDGER: /state/ledger.json
       ALERT_URL: ${ALERT_URL:-}
@@ -86,30 +106,53 @@ services:
       MAX_PENDING_REVERSE: ${MAX_PENDING_REVERSE:-5}
       FEE_RATIO: ${FEE_RATIO:-0.0001}
       REQUIRED_CONFS: ${REQUIRED_CONFS:-3}
+      HOLD_EXPIRY_DELTA: "18"
     volumes:
       - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
       - ${KILOSWAP_ROOT:?}/macaroons/kiloswap-guard.macaroon:/lnd/kiloswap-guard.macaroon:ro
       - ${LSP_STATE:?}:/lsp/state.json:ro
       - ${KILOSWAP_ROOT:?}/guard:/state
       - ${KILOSWAP_ROOT:?}/secrets/guard_db_url:/run/secrets/guard_db_url:ro
-      - ${KILOSWAP_ROOT:?}/secrets/node_rpc_password:/run/secrets/node_rpc_password:ro
+      - ${KILOSWAP_ROOT:?}/secrets/guard_rpc_password:/run/secrets/guard_rpc_password:ro
+      - ${KILOSWAP_ROOT:?}/secrets/swap_seed:/run/secrets/swap_seed:ro
+      - ${KILOSWAP_ROOT:?}/secrets/guard_api_token:/run/secrets/guard_api_token:ro
     logging: *logging
     mem_limit: 64m
+
+  # lnd's gRPC port, and nothing else of lnd-net, for the backend; it takes
+  # lnd's name on the internal network so lnd's certificate matches
+  lnd-proxy:
+    image: alpine/socat:1.8.0.3
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    restart: unless-stopped
+    command: ["-d", "TCP-LISTEN:10009,fork,reuseaddr", "TCP:${LND_HOST:-lnd-blake2b}:10009"]
+    networks:
+      lnd: {}
+      internal:
+        aliases: ["${LND_HOST:-lnd-blake2b}"]
+    logging: *logging
+    mem_limit: 32m
 
   boltz:
     image: kiloswap/backend:${BACKEND_TAG:-dev}
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
     stop_grace_period: 1m
-    depends_on: [postgres, shim, guard]
-    networks: [default, lnd]
+    depends_on: [postgres, shim, guard, lnd-proxy]
+    networks: [internal]
     environment:
       NODE_OPTIONS: --max-old-space-size=384
+      KILOSWAP_SWAP_XPUB_FILE: /run/secrets/swap_xpub
+      KILOSWAP_GUARD_URL: http://guard:8091
+      KILOSWAP_GUARD_TOKEN_FILE: /run/secrets/guard_api_token
     command: ["--configpath", "/boltz/boltz.conf", "--datadir", "/boltz"]
     volumes:
       - ${KILOSWAP_ROOT:?}/boltz:/boltz
       - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
       - ${KILOSWAP_ROOT:?}/macaroons/kiloswap.macaroon:/lnd/kiloswap.macaroon:ro
+      - ${KILOSWAP_ROOT:?}/secrets/swap_xpub:/run/secrets/swap_xpub:ro
+      - ${KILOSWAP_ROOT:?}/secrets/guard_api_token_backend:/run/secrets/guard_api_token:ro
     logging: *logging
     mem_limit: 1024m
 
@@ -118,7 +161,7 @@ services:
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
     depends_on: [boltz]
-    networks: [default, explorer]
+    networks: [default, internal, explorer]
     ports:
       - "127.0.0.1:${WEB_PORT:-3260}:8080"   # Cloudflare tunnel
       - "127.0.0.1:${ONION_PORT:-3261}:8081" # onion service

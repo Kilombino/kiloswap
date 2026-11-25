@@ -5,25 +5,40 @@
 // caveat is registered, so a stopped guard stops the backend, never the
 // other way round.
 //
-// What a backend taken over could do, and what stops it:
-//   - send on-chain coins anywhere: SendCoins only to the lockup address of
-//     a reverse swap whose hold invoice lnd itself holds as paid (ACCEPTED,
-//     at least the lockup's amount), for its exact amount, once, never
-//     send_all, never unconfirmed coins, fee rate capped. The backend's
-//     database is the backend's own word; lnd's invoice is not;
-//   - pay any invoice: SendPaymentV2 only the invoice of a submarine swap
-//     whose lockup transaction the node shows confirmed (RequiredConfs),
-//     paying at least the invoice's amount to the swap's lockup address;
-//     routing fee capped;
-//   - drain by many small moves: at most MaxPerOpSat each and DailySat in
-//     any 24 hours, on-chain sends and payments together;
-//   - starve the LSP: on-chain sends and new hold invoices must leave
-//     ReserveSat plus the LSP's open requests untouched;
-//   - tie up coins with unpaid reverse swaps: at most MaxPendingReverse at
-//     once;
-//   - touch other services' invoices: Cancel/SettleInvoice only for hold
-//     invoices it created (the bridge's are never its own);
+// The threat is the backend (and its database) taken over. Nothing it
+// writes is trusted on its own: amounts and hashes come from lnd (the
+// decoded invoice, lnd's own invoice record) and from the chain; swap
+// outputs are rebuilt by the guard from the server key it alone holds (the
+// backend only has the extended public key, so it can neither sign a swap
+// spend nor take a lockup through the key path).
+//
+//   - send on-chain coins: SendCoins only to the lockup address of a reverse
+//     swap whose output the guard rebuilt (our refund key, the user's claim
+//     key, the hold invoice's hash, a sane timeout), whose hold invoice the
+//     backend created through the guard and lnd holds as paid with every
+//     HTLC expiring well after the timeout; once per hash, exact amount,
+//     confirmed coins only, an explicit fee rate under the cap;
+//   - pay an invoice: SendPaymentV2 only an invoice whose amount and hash lnd
+//     decodes, for a submarine swap whose lockup output (rebuilt: our claim
+//     key, that hash, the user's refund key, the timeout) the node shows
+//     unspent with RequiredConfs confirmations, paying at least the invoice
+//     plus a claim margin; each lockup pays once; cltv_limit leaves time to
+//     claim before the timeout; routing fee capped; no steering;
+//   - drain by many moves: at most MaxPerOpSat each and DailySat in any 24
+//     hours, sends and payments together. An amount is given back only when
+//     lnd itself reports the send refused or the payment FAILED;
+//   - starve the LSP: sends and new hold invoices must leave ReserveSat, the
+//     LSP's open requests and every send not yet answered untouched;
+//   - tie up coins: at most MaxPendingReverse hold invoices open at once, by
+//     the guard's own count;
+//   - touch other invoices: lookups, cancels and settles only for invoices
+//     the backend created through the guard; a hold invoice whose lockup is
+//     still out cannot be cancelled;
 //   - anything else: only the methods in Allowed pass.
+//
+// Server-side spends (claiming submarine lockups, refunding reverse
+// lockups) and settling hold invoices when the user claims are done by the
+// guard itself (spend.go), with the key the backend does not have.
 package policy
 
 import (
@@ -37,10 +52,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/btcsuite/btcd/btcutil"
+	"github.com/btcsuite/btcd/chaincfg"
+	"github.com/btcsuite/btcd/txscript"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
 	"github.com/Kilombino/kiloswap/guard/internal/lnrpc"
+	"github.com/Kilombino/kiloswap/guard/internal/swapscript"
 )
 
 const (
@@ -51,28 +71,28 @@ const (
 )
 
 // Methods the backend may call. true: judged below; false: a read or a
-// call that cannot move funds, passed as it is. Anything else is refused.
+// call that cannot move funds nor leak another service's secrets, passed
+// as it is. Anything else is refused.
 var Allowed = map[string]bool{
 	"/lnrpc.Lightning/GetInfo":                     false,
-	"/lnrpc.Lightning/AddInvoice":                  false, // receives, never pays
-	"/lnrpc.Lightning/LookupInvoice":               false,
+	"/lnrpc.Lightning/AddInvoice":                  false, // receives; its hash is recorded
 	"/lnrpc.Lightning/DecodePayReq":                false,
 	"/lnrpc.Lightning/GetNodeInfo":                 false,
 	"/lnrpc.Lightning/GetChanInfo":                 false,
 	"/lnrpc.Lightning/DescribeGraph":               false,
 	"/lnrpc.Lightning/QueryRoutes":                 false,
-	"/lnrpc.Lightning/ListChannels":                false,
-	"/lnrpc.Lightning/ListPeers":                   false,
+	"/lnrpc.Lightning/ListChannels":                false, // privacy: see README
+	"/lnrpc.Lightning/ListPeers":                   false, // privacy: see README
 	"/lnrpc.Lightning/WalletBalance":               false,
 	"/lnrpc.Lightning/SubscribePeerEvents":         false,
 	"/lnrpc.Lightning/SubscribeChannelEvents":      false,
 	"/lnrpc.Lightning/ExportAllChannelBackups":     false,
 	"/lnrpc.Lightning/SubscribeChannelBackups":     false,
 	"/lnrpc.Lightning/NewAddress":                  false,
-	"/lnrpc.Lightning/GetTransactions":             false,
+	"/lnrpc.Lightning/GetTransactions":             false, // the lnd wallet provider; privacy: see README
 	"/routerrpc.Router/TrackPaymentV2":             false,
-	"/routerrpc.Router/ResetMissionControl":        false,
-	"/invoicesrpc.Invoices/SubscribeSingleInvoice": false,
+	"/lnrpc.Lightning/LookupInvoice":               true,
+	"/invoicesrpc.Invoices/SubscribeSingleInvoice": true,
 	"/lnrpc.Lightning/SendCoins":                   true,
 	"/routerrpc.Router/SendPaymentV2":              true,
 	"/invoicesrpc.Invoices/AddHoldInvoice":         true,
@@ -80,46 +100,98 @@ var Allowed = map[string]bool{
 	"/invoicesrpc.Invoices/SettleInvoice":          true,
 }
 
-// ReverseSwap is what the guard reads of a reverse swap (LN to on-chain).
+// ReverseSwap is what the backend's database says of a reverse swap (LN to
+// on-chain): a claim to check, never a fact.
 type ReverseSwap struct {
+	ID            string
 	LockupAddress string
 	OnchainAmount int64 // sat
 	PreimageHash  string
-	Status        string
+	ClaimKey      string // the user's, hex
+	KeyIndex      int64
+	Timeout       int64
+	Version       int
 }
 
-// Swap is what the guard reads of a submarine swap (on-chain to LN).
+// Swap is what the backend's database says of a submarine swap.
 type Swap struct {
-	Invoice       string
-	InvoiceAmount int64 // sat
-	Status        string
-	LockupAddress string
-	LockupTxID    string
+	ID           string
+	PreimageHash string
+	RefundKey    string // the user's, hex
+	KeyIndex     int64
+	Timeout      int64
+	LockupTxID   string
+	LockupVout   int64
+	Version      int
 }
 
-// Invoices reads lnd's own record of an invoice (the guard's macaroon).
-type Invoices interface {
-	// Invoice returns its state (OPEN 0, SETTLED 1, CANCELED 2, ACCEPTED 3)
-	// and what was paid to it, in msat.
-	Invoice(ctx context.Context, hash []byte) (state int32, paidMsat int64, err error)
+// InvoiceInfo is lnd's own record of an invoice.
+type InvoiceInfo struct {
+	State    int32
+	PaidMsat int64
+	// Expiry heights of the HTLCs held (accepted, not cancelled)
+	HTLCExpiries []int32
 }
 
-// Chain reads the node: what a transaction pays to an address, and how
-// deep it is.
+// PayReq is lnd's decoding of an invoice.
+type PayReq struct {
+	Hash       []byte
+	AmountMsat int64
+}
+
+// Lightning is lnd through the guard's own macaroon.
+type Lightning interface {
+	// LookupInvoice returns nil, nil if lnd has no such invoice.
+	LookupInvoice(ctx context.Context, hash []byte) (*InvoiceInfo, error)
+	DecodePayReq(ctx context.Context, payReq string) (*PayReq, error)
+	Balance(ctx context.Context) (Balance, error)
+	SettleInvoice(ctx context.Context, preimage []byte) error
+	CancelInvoice(ctx context.Context, hash []byte) error
+	// TrackPayment returns the payment's status (1 in flight, 2 succeeded,
+	// 3 failed) and its preimage once succeeded; 0 if lnd has no payment.
+	TrackPayment(ctx context.Context, hash []byte) (int32, string, error)
+	NewAddress(ctx context.Context) (string, error)
+}
+
+// Output is one transaction output as the node sees it.
+type Output struct {
+	PkScript      []byte
+	Sat           int64
+	Confirmations int64
+}
+
+// Spend is the transaction spending an outpoint, as the node sees it.
+type Spend struct {
+	TxID          string
+	Witness       [][]byte // of the input spending the outpoint
+	Confirmations int64
+}
+
+// Chain is the node through the guard's own RPC user.
 type Chain interface {
-	PaidTo(ctx context.Context, txid, address string) (sat int64, confirmations int64, err error)
+	Output(ctx context.Context, txid string, vout uint32) (*Output, error)
+	// Outputs lists a transaction's outputs and its confirmations.
+	Outputs(ctx context.Context, txid string) ([]Output, error)
+	Unspent(ctx context.Context, txid string, vout uint32) (bool, error)
+	Height(ctx context.Context) (int64, error)
+	// Spender finds the transaction spending txid:vout in the mempool or
+	// in the blocks from fromHeight on; nil if none.
+	Spender(ctx context.Context, txid string, vout uint32, fromHeight int64) (*Spend, error)
+	FeeRate(ctx context.Context) (float64, error) // sat/vB
+	Broadcast(ctx context.Context, rawHex string) (string, error)
+	Confirmations(ctx context.Context, txid string) (int64, error)
 }
 
-// InvoiceAccepted is lnd's state for a hold invoice paid and held.
-const InvoiceAccepted = 3
+// Keys are the swaps' server keys, held by the guard alone.
+type Keys interface {
+	Public(index uint32) (*btcec.PublicKey, error)
+	Private(index uint32) (*btcec.PrivateKey, error)
+}
 
-// Swaps reads the swap backend's database (a read-only role).
+// Swaps reads the swap backend's database (a read-only role): what the
+// backend claims, to be checked against lnd, the chain and our keys.
 type Swaps interface {
 	ReverseByLockup(ctx context.Context, address string) ([]ReverseSwap, error)
-	ReverseByHash(ctx context.Context, hash string) (bool, error)
-	// Reverse swaps that may still lock coins: count, and the on-chain
-	// amount of those not locked yet.
-	PendingReverse(ctx context.Context) (count int, unlockedSat int64, err error)
 	SwapByInvoice(ctx context.Context, invoice string) (*Swap, error)
 }
 
@@ -128,25 +200,19 @@ type Balance struct {
 	Confirmed, Locked, AnchorReserve int64
 }
 
-// Wallet reads lnd's on-chain balance (a macaroon of the guard's own).
-type Wallet interface {
-	Balance(ctx context.Context) (Balance, error)
-}
-
 // LSP reports the sats the LSP has promised to open channels with and not
 // spent yet.
 type LSP interface {
 	Reserved() (int64, error)
 }
 
-// Statuses in which a reverse swap waits for our lockup.
-// The backend sends the lockup before it records the invoice as paid, so
-// swap.created counts too: what proves the payment is lnd's invoice.
-var lockupStatuses = map[string]bool{"swap.created": true, "invoice.pending": true, "minerfee.paid": true}
-
-// Statuses in which a submarine swap's invoice may be paid: its lockup
-// confirmed, the payment going.
-var payStatuses = map[string]bool{"transaction.confirmed": true, "invoice.pending": true}
+// InvoiceAccepted is lnd's state for a hold invoice paid and held.
+const (
+	InvoiceOpen     = 0
+	InvoiceSettled  = 1
+	InvoiceCanceled = 2
+	InvoiceAccepted = 3
+)
 
 // Policy holds the limits and what the guard knows.
 type Policy struct {
@@ -156,20 +222,36 @@ type Policy struct {
 	MaxPendingReverse int     // 5
 	FeeRatio          float64 // 0.0001, the most a payment may pay to route
 	MinFeeSat         int64   // 121, the backend's own floor
-	MaxFeeRate        int64   // sat/vB a lockup may pay
+	MaxFeeRate        int64   // sat/vB a lockup or a guard spend may pay
 	RequiredConfs     int64   // 3, a submarine lockup's depth before paying
+	MinLockBlocks     int64   // a reverse lockup's timeout at least this far
+	MaxLockBlocks     int64   // and at most this far
+	HoldExpiryDelta   int64   // lnd's invoices.holdexpirydelta (18)
+	SafetyBlocks      int64   // margin to settle or claim before a deadline
+	ClaimMarginSat    int64   // a submarine lockup over the invoice by this
+	Net               *chaincfg.Params
 	Swaps             Swaps
-	Invoices          Invoices
+	LN                Lightning
 	Chain             Chain
-	Wallet            Wallet
+	Keys              Keys
 	LSP               LSP
 	Ledger            *Ledger
 	Now               func() time.Time
-	// Alert, when set, hears every refusal (for the operator's bot).
-	Alert func(method, reason string)
+	// Notify, when set, hears every refusal and every movement allowed or
+	// made (for the operator's bot): event, then key/values.
+	Notify func(event string, kv map[string]any)
 
-	mu      sync.Mutex
-	pending map[uint64]string // lnd request id -> ledger key, until answered
+	mu      sync.Mutex // judgments that touch the ledger, one at a time
+	pmu     sync.Mutex
+	pending  map[uint64]pendingReq
+	claimErr map[string]string // last claim error per payment hash
+}
+
+type pendingReq struct {
+	method string
+	hash   string
+	sat    int64
+	at     time.Time
 }
 
 type refusal struct{ msg string }
@@ -188,6 +270,12 @@ func (p *Policy) now() time.Time {
 	return time.Now()
 }
 
+func (p *Policy) notify(event string, kv map[string]any) {
+	if p.Notify != nil {
+		p.Notify(event, kv)
+	}
+}
+
 // Stream says whether a streaming call may be opened at all.
 func (p *Policy) Stream(uri string) error {
 	if _, ok := Allowed[uri]; !ok {
@@ -200,8 +288,8 @@ func (p *Policy) Stream(uri string) error {
 // macaroon used; requestID ties the request to lnd's answer.
 func (p *Policy) Intercept(ctx context.Context, condition string, requestID uint64, m *lnrpc.RPCMessage) error {
 	err := p.intercept(ctx, condition, requestID, m)
-	if err != nil && p.Alert != nil {
-		p.Alert(m.GetMethodFullUri(), err.Error())
+	if err != nil {
+		p.notify("guard_refusal", map[string]any{"method": m.GetMethodFullUri(), "reason": err.Error()})
 	}
 	return err
 }
@@ -214,6 +302,10 @@ func (p *Policy) intercept(ctx context.Context, condition string, requestID uint
 	judged, ok := Allowed[uri]
 	if !ok {
 		return refuse("%s is not allowed", uri)
+	}
+	if uri == "/lnrpc.Lightning/AddInvoice" {
+		p.track(requestID, pendingReq{method: uri})
+		return nil
 	}
 	if !judged {
 		return nil
@@ -236,13 +328,13 @@ func (p *Policy) intercept(ctx context.Context, condition string, requestID uint
 		if err := decode(m, &r); err != nil {
 			return err
 		}
-		return p.addHold(ctx, &r)
+		return p.addHold(ctx, requestID, &r)
 	case "/invoicesrpc.Invoices/CancelInvoice":
 		var r lnrpc.CancelInvoiceMsg
 		if err := decode(m, &r); err != nil {
 			return err
 		}
-		return p.ownInvoice(ctx, r.PaymentHash)
+		return p.cancel(requestID, r.PaymentHash)
 	case "/invoicesrpc.Invoices/SettleInvoice":
 		var r lnrpc.SettleInvoiceMsg
 		if err := decode(m, &r); err != nil {
@@ -252,7 +344,29 @@ func (p *Policy) intercept(ctx context.Context, condition string, requestID uint
 			return refuse("settle needs a 32-byte preimage")
 		}
 		h := sha256.Sum256(r.Preimage)
-		return p.ownInvoice(ctx, h[:])
+		return p.settle(requestID, h[:])
+	case "/lnrpc.Lightning/LookupInvoice":
+		var r lnrpc.PaymentHash
+		if err := decode(m, &r); err != nil {
+			return err
+		}
+		hash := r.RHash
+		if r.RHashStr != "" {
+			if len(hash) > 0 {
+				return refuse("one hash only")
+			}
+			var err error
+			if hash, err = hex.DecodeString(r.RHashStr); err != nil {
+				return refuse("unreadable hash")
+			}
+		}
+		return p.ownLookup(hash)
+	case "/invoicesrpc.Invoices/SubscribeSingleInvoice":
+		var r lnrpc.SubscribeSingleInvoiceRequest
+		if err := decode(m, &r); err != nil {
+			return err
+		}
+		return p.ownLookup(r.RHash)
 	}
 	return refuse("%s has no check", uri)
 }
@@ -273,10 +387,12 @@ func hasUnknown(m protoreflect.Message) bool {
 	return len(m.GetUnknown()) > 0
 }
 
-// available is what on-chain sends may still use: confirmed coins minus
-// what lnd holds back, the LSP's reserve and its open requests.
+// available is what on-chain sends may still use (caller holds p.mu and
+// the ledger lock): confirmed coins minus what lnd holds back, the LSP's
+// reserve and open requests, the sends allowed and not answered yet, and
+// what open hold invoices without a lockup may still ask for.
 func (p *Policy) available(ctx context.Context) (int64, error) {
-	b, err := p.Wallet.Balance(ctx)
+	b, err := p.LN.Balance(ctx)
 	if err != nil {
 		return 0, refuse("wallet balance unknown: %v", err)
 	}
@@ -284,7 +400,56 @@ func (p *Policy) available(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, refuse("LSP requests unknown: %v", err)
 	}
-	return b.Confirmed - b.Locked - b.AnchorReserve - p.ReserveSat - lsp, nil
+	var inflight int64
+	for _, l := range p.Ledger.Lockups {
+		if l.State == LockApproved {
+			inflight += l.Sat
+		}
+	}
+	return b.Confirmed - b.Locked - b.AnchorReserve - p.ReserveSat - lsp - inflight, nil
+}
+
+// promised is what open hold invoices without a lockup may still lock.
+func (p *Policy) promised() int64 {
+	var s int64
+	for h, x := range p.Ledger.Holds {
+		if x.State != "open" {
+			continue
+		}
+		if _, locked := p.Ledger.Lockups[h]; !locked {
+			s += x.Sat
+		}
+	}
+	return s
+}
+
+func (p *Policy) openHolds() int {
+	n := 0
+	for _, x := range p.Ledger.Holds {
+		if x.State == "open" {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *Policy) userKey(s string) (*btcec.PublicKey, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	return btcec.ParsePubKey(b)
+}
+
+func (p *Policy) addrScript(address string) ([]byte, error) {
+	a, err := btcutil.DecodeAddress(address, p.Net)
+	if err != nil {
+		return nil, err
+	}
+	if !a.IsForNet(p.Net) {
+		return nil, errors.New("address of another network")
+	}
+	return txscript.PayToAddrScript(a)
 }
 
 func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendCoinsRequest) error {
@@ -299,53 +464,179 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 		return refuse("amount must be positive")
 	case r.Amount > p.MaxPerOpSat:
 		return refuse("%d sat is over the %d sat limit per operation", r.Amount, p.MaxPerOpSat)
-	case r.SatPerVbyte > uint64(p.MaxFeeRate) || r.SatPerByte > p.MaxFeeRate || r.SatPerByte < 0:
+	case r.TargetConf != 0:
+		return refuse("a fee rate is required, not a confirmation target")
+	case r.SatPerByte < 0 || (r.SatPerVbyte > 0) == (r.SatPerByte > 0):
+		return refuse("exactly one positive fee rate is required")
+	case r.SatPerVbyte > uint64(p.MaxFeeRate) || r.SatPerByte > p.MaxFeeRate:
 		return refuse("fee rate over %d sat/vB", p.MaxFeeRate)
 	}
-	swaps, err := p.Swaps.ReverseByLockup(ctx, r.Addr)
+	want, err := p.addrScript(r.Addr)
+	if err != nil {
+		return refuse("unreadable address: %v", err)
+	}
+	rows, err := p.Swaps.ReverseByLockup(ctx, r.Addr)
 	if err != nil {
 		return refuse("swap database: %v", err)
 	}
-	var match *ReverseSwap
-	for i, s := range swaps {
-		if s.OnchainAmount == r.Amount && lockupStatuses[s.Status] {
-			match = &swaps[i]
+	height, err := p.Chain.Height(ctx)
+	if err != nil {
+		return refuse("node height: %v", err)
+	}
+	var lastErr error = refuse("no reverse swap waits for %d sat at that address", r.Amount)
+	for _, s := range rows {
+		if s.OnchainAmount != r.Amount {
+			continue
+		}
+		l, err := p.checkReverse(ctx, s, want, height)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return p.allowSend(ctx, requestID, l, height)
+	}
+	return lastErr
+}
+
+// checkReverse checks a reverse swap row against our key, lnd and the chain.
+func (p *Policy) checkReverse(ctx context.Context, s ReverseSwap, want []byte, height int64) (*Lockup, error) {
+	if s.Version != 1 {
+		return nil, refuse("only taproot swaps")
+	}
+	hash, err := hex.DecodeString(s.PreimageHash)
+	if err != nil || len(hash) != 32 {
+		return nil, refuse("the swap has no usable payment hash")
+	}
+	hh := hex.EncodeToString(hash)
+	if s.KeyIndex < 0 || s.KeyIndex >= 1<<31 {
+		return nil, refuse("bad key index")
+	}
+	if s.Timeout-height < p.MinLockBlocks || s.Timeout-height > p.MaxLockBlocks {
+		return nil, refuse("timeout %d is %d blocks away, not within %d..%d", s.Timeout, s.Timeout-height, p.MinLockBlocks, p.MaxLockBlocks)
+	}
+	server, err := p.Keys.Public(uint32(s.KeyIndex))
+	if err != nil {
+		return nil, refuse("key: %v", err)
+	}
+	user, err := p.userKey(s.ClaimKey)
+	if err != nil {
+		return nil, refuse("the swap's claim key: %v", err)
+	}
+	out, err := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user, PaymentHash: hash, Timeout: uint32(s.Timeout)})
+	if err != nil {
+		return nil, refuse("swap output: %v", err)
+	}
+	if !out.Matches(want) {
+		return nil, refuse("the lockup address is not the swap output the guard rebuilds")
+	}
+	p.Ledger.Lock()
+	hold, own := p.Ledger.Holds[hh]
+	_, locked := p.Ledger.Lockups[hh]
+	p.Ledger.Unlock()
+	if !own || hold.State != "open" {
+		return nil, refuse("the hold invoice was not created through the guard")
+	}
+	if locked {
+		return nil, refuse("that hold invoice already has a lockup")
+	}
+	inv, err := p.LN.LookupInvoice(ctx, hash)
+	if err != nil {
+		return nil, refuse("lnd invoice: %v", err)
+	}
+	if inv == nil || inv.State != InvoiceAccepted {
+		return nil, refuse("the swap's hold invoice is not paid and held")
+	}
+	if inv.PaidMsat < s.OnchainAmount*1000 {
+		return nil, refuse("the hold invoice holds %d msat, less than the %d sat lockup", inv.PaidMsat, s.OnchainAmount)
+	}
+	if len(inv.HTLCExpiries) == 0 {
+		return nil, refuse("the hold invoice holds no HTLC")
+	}
+	for _, e := range inv.HTLCExpiries {
+		if int64(e)-p.HoldExpiryDelta-p.SafetyBlocks <= s.Timeout {
+			return nil, refuse("an HTLC expires at %d, too close to the timeout %d to settle after a claim", e, s.Timeout)
 		}
 	}
-	if match == nil {
-		return refuse("no reverse swap waits for %d sat at that address", r.Amount)
+	return &Lockup{
+		SwapID: s.ID, Hash: hh, Address: s.LockupAddress, Sat: s.OnchainAmount,
+		KeyIndex: uint32(s.KeyIndex), UserKey: strings.ToLower(s.ClaimKey), Timeout: uint32(s.Timeout),
+		Vout: -1, State: LockApproved,
+	}, nil
+}
+
+func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, height int64) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	if _, locked := p.Ledger.Lockups[l.Hash]; locked {
+		return refuse("that hold invoice already has a lockup")
 	}
-	hash, err := hex.DecodeString(match.PreimageHash)
-	if err != nil || len(hash) != 32 {
-		return refuse("the swap has no usable payment hash")
+	now := p.now()
+	if used := p.Ledger.since(now.Add(-24 * time.Hour)); used+l.Sat > p.DailySat {
+		return refuse("%d sat would pass the daily limit (%d of %d used)", l.Sat, used, p.DailySat)
 	}
-	state, paid, err := p.Invoices.Invoice(ctx, hash)
+	avail, err := p.available(ctx)
 	if err != nil {
-		return refuse("lnd invoice: %v", err)
+		return err
 	}
-	if state != InvoiceAccepted {
-		return refuse("the swap's hold invoice is not paid and held (state %d)", state)
+	// other open hold invoices keep what they may still ask for; this
+	// one's promise is this lockup
+	others := p.promised()
+	if h := p.Ledger.Holds[l.Hash]; h != nil {
+		others -= h.Sat
 	}
-	if paid < r.Amount*1000 {
-		return refuse("the hold invoice holds %d msat, less than the %d sat lockup", paid, r.Amount)
+	avail -= others
+	if l.Sat > avail {
+		return refuse("%d sat would cut into the LSP reserve (%d available)", l.Sat, avail)
 	}
-	key := "lockup:" + r.Addr
-	return p.spend(ctx, requestID, key, r.Amount, true)
+	l.At, l.SentAt = now, height
+	p.Ledger.Lockups[l.Hash] = l
+	p.Ledger.Entries["send:"+l.Hash] = Entry{Key: "send:" + l.Hash, Sat: l.Sat, At: now, Done: true}
+	if err := p.Ledger.save(); err != nil {
+		delete(p.Ledger.Lockups, l.Hash)
+		delete(p.Ledger.Entries, "send:"+l.Hash)
+		return refuse("ledger: %v", err)
+	}
+	p.track(requestID, pendingReq{method: "/lnrpc.Lightning/SendCoins", hash: l.Hash, sat: l.Sat})
+	p.notify("lockup_allowed", map[string]any{"swap": l.SwapID, "sat": l.Sat, "timeout": l.Timeout})
+	return nil
 }
 
 func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.SendPaymentRequest) error {
 	switch {
 	case r.PaymentRequest == "":
 		return refuse("only invoices may be paid")
-	case len(r.Dest) > 0 || len(r.PaymentHash) > 0 || r.Amt != 0 || r.AmtMsat != 0:
-		return refuse("only an invoice's own amount and destination")
+	case len(r.Dest) > 0 || len(r.PaymentHash) > 0 || r.Amt != 0 || r.AmtMsat != 0 || r.FinalCltvDelta != 0:
+		return refuse("only an invoice's own amount, hash and destination")
 	case r.Amp || r.AllowSelfPayment || len(r.DestCustomRecords) > 0 || len(r.FirstHopCustomRecords) > 0:
 		return refuse("AMP, self-payments and custom records are not allowed")
 	case len(r.RouteHints) > 0 || len(r.LastHopPubkey) > 0 || len(r.DestFeatures) > 0 || len(r.PaymentAddr) > 0:
 		return refuse("the route may not be steered")
+	case len(r.OutgoingChanIds) > 0:
+		return refuse("outgoing channels may not be chosen")
+	case r.MaxParts > 16:
+		return refuse("at most 16 parts")
 	case r.FeeLimitSat < 0 || r.FeeLimitMsat < 0:
 		return refuse("a fee limit is required")
+	case r.CltvLimit <= 0:
+		return refuse("a cltv_limit is required")
 	}
+	pr, err := p.LN.DecodePayReq(ctx, r.PaymentRequest)
+	if err != nil {
+		return refuse("lnd cannot decode the invoice: %v", err)
+	}
+	if pr.AmountMsat <= 0 {
+		return refuse("only invoices with an amount")
+	}
+	if len(pr.Hash) != 32 {
+		return refuse("the invoice has no usable hash")
+	}
+	sat := (pr.AmountMsat + 999) / 1000
+	if sat > p.MaxPerOpSat {
+		return refuse("%d sat is over the %d sat limit per operation", sat, p.MaxPerOpSat)
+	}
+	hh := hex.EncodeToString(pr.Hash)
 	s, err := p.Swaps.SwapByInvoice(ctx, r.PaymentRequest)
 	if err != nil {
 		return refuse("swap database: %v", err)
@@ -353,26 +644,59 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if s == nil {
 		return refuse("not the invoice of a Kiloswap swap")
 	}
-	if !payStatuses[s.Status] {
-		return refuse("the swap is %s, not ready to pay", s.Status)
+	if s.Version != 1 {
+		return refuse("only taproot swaps")
 	}
-	if s.InvoiceAmount <= 0 || s.InvoiceAmount > p.MaxPerOpSat {
-		return refuse("%d sat is over the %d sat limit per operation", s.InvoiceAmount, p.MaxPerOpSat)
+	if !strings.EqualFold(s.PreimageHash, hh) {
+		return refuse("the invoice's hash is not the swap's")
 	}
-	if s.LockupTxID == "" || s.LockupAddress == "" {
+	if s.KeyIndex < 0 || s.KeyIndex >= 1<<31 || s.LockupVout < 0 || s.LockupVout > math.MaxUint32 {
+		return refuse("bad key index or vout")
+	}
+	if s.LockupTxID == "" {
 		return refuse("the swap has no lockup transaction")
 	}
-	got, confs, err := p.Chain.PaidTo(ctx, s.LockupTxID, s.LockupAddress)
+	server, err := p.Keys.Public(uint32(s.KeyIndex))
+	if err != nil {
+		return refuse("key: %v", err)
+	}
+	user, err := p.userKey(s.RefundKey)
+	if err != nil {
+		return refuse("the swap's refund key: %v", err)
+	}
+	out, err := swapscript.Build(swapscript.Params{Kind: swapscript.Submarine, Server: server, User: user, PaymentHash: pr.Hash, Timeout: uint32(s.Timeout)})
+	if err != nil {
+		return refuse("swap output: %v", err)
+	}
+	vout := uint32(s.LockupVout)
+	o, err := p.Chain.Output(ctx, s.LockupTxID, vout)
 	if err != nil {
 		return refuse("node: %v", err)
 	}
-	if confs < p.RequiredConfs {
-		return refuse("the lockup has %d confirmations, %d needed", confs, p.RequiredConfs)
+	if !out.Matches(o.PkScript) {
+		return refuse("the lockup output is not the swap output the guard rebuilds")
 	}
-	if got < s.InvoiceAmount {
-		return refuse("the lockup pays %d sat, less than the %d sat invoice", got, s.InvoiceAmount)
+	if o.Confirmations < p.RequiredConfs {
+		return refuse("the lockup has %d confirmations, %d needed", o.Confirmations, p.RequiredConfs)
 	}
-	maxFeeMsat := int64(math.Ceil(math.Max(float64(s.InvoiceAmount)*1000*p.FeeRatio, float64(p.MinFeeSat*1000))))
+	if o.Sat < sat+p.ClaimMarginSat {
+		return refuse("the lockup pays %d sat, less than the %d sat invoice plus %d to claim", o.Sat, sat, p.ClaimMarginSat)
+	}
+	unspent, err := p.Chain.Unspent(ctx, s.LockupTxID, vout)
+	if err != nil {
+		return refuse("node: %v", err)
+	}
+	if !unspent {
+		return refuse("the lockup is already spent")
+	}
+	height, err := p.Chain.Height(ctx)
+	if err != nil {
+		return refuse("node height: %v", err)
+	}
+	if left := s.Timeout - height - p.SafetyBlocks; int64(r.CltvLimit) > left || left <= 0 {
+		return refuse("cltv_limit %d leaves no time to claim before the timeout (%d blocks left)", r.CltvLimit, s.Timeout-height)
+	}
+	maxFeeMsat := int64(math.Ceil(math.Max(float64(pr.AmountMsat)*p.FeeRatio, float64(p.MinFeeSat*1000))))
 	feeMsat := r.FeeLimitMsat
 	if r.FeeLimitSat != 0 {
 		if r.FeeLimitMsat != 0 {
@@ -383,91 +707,45 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if feeMsat > maxFeeMsat+999 { // the backend rounds up to whole sat
 		return refuse("routing fee limit %d msat over %d msat", feeMsat, maxFeeMsat)
 	}
-	key := "pay:" + strings.ToLower(r.PaymentRequest)
-	return p.spend(ctx, requestID, key, s.InvoiceAmount, false)
+	return p.allowPay(requestID, &Payment{
+		SwapID: s.ID, Hash: hh, Sat: sat, Request: requestID, State: PayInflight,
+		KeyIndex: uint32(s.KeyIndex), UserKey: strings.ToLower(s.RefundKey), Timeout: uint32(s.Timeout),
+		LockupTx: strings.ToLower(s.LockupTxID), Vout: vout, LockupSat: o.Sat,
+	})
 }
 
-// spend checks the daily limit (and, on-chain, the coins left), then holds
-// the amount in the ledger. A key spends once: a lockup sent again would
-// pay twice; a payment retried is the same payment.
-func (p *Policy) spend(ctx context.Context, requestID uint64, key string, sat int64, onchain bool) error {
+func (p *Policy) allowPay(requestID uint64, pay *Payment) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	op := fmt.Sprintf("%s:%d", pay.LockupTx, pay.Vout)
+	if h, used := p.Ledger.Outpoints[op]; used {
+		return refuse("that lockup already backs a payment (%s)", h)
+	}
+	if old, ok := p.Ledger.Payments[pay.Hash]; ok && old.State != PayFailed {
+		return refuse("that invoice is already %s", old.State)
+	}
 	now := p.now()
-	if e, ok := p.Ledger.Get(key); ok {
-		if onchain && e.Done {
-			return refuse("that lockup was already sent")
-		}
-		if !onchain {
-			p.track(requestID, key)
-			return nil // the same payment again: counted once
-		}
+	if used := p.Ledger.since(now.Add(-24 * time.Hour)); used+pay.Sat > p.DailySat {
+		return refuse("%d sat would pass the daily limit (%d of %d used)", pay.Sat, used, p.DailySat)
 	}
-	if used := p.Ledger.Since(now.Add(-24 * time.Hour)); used+sat > p.DailySat {
-		return refuse("%d sat would pass the daily limit (%d of %d used)", sat, used, p.DailySat)
-	}
-	if onchain {
-		avail, err := p.available(ctx)
-		if err != nil {
-			return err
-		}
-		if sat > avail {
-			return refuse("%d sat would cut into the LSP reserve (%d available)", sat, avail)
-		}
-	}
-	if err := p.Ledger.Put(Entry{Key: key, Sat: sat, At: now, Done: onchain}); err != nil {
+	pay.At = now
+	p.Ledger.Payments[pay.Hash] = pay
+	p.Ledger.Outpoints[op] = pay.Hash
+	p.Ledger.Entries["pay:"+pay.Hash] = Entry{Key: "pay:" + pay.Hash, Sat: pay.Sat, At: now}
+	if err := p.Ledger.save(); err != nil {
+		delete(p.Ledger.Payments, pay.Hash)
+		delete(p.Ledger.Outpoints, op)
+		delete(p.Ledger.Entries, "pay:"+pay.Hash)
 		return refuse("ledger: %v", err)
 	}
-	p.track(requestID, key)
+	p.track(requestID, pendingReq{method: "/routerrpc.Router/SendPaymentV2", hash: pay.Hash, sat: pay.Sat})
+	p.notify("payment_allowed", map[string]any{"swap": pay.SwapID, "sat": pay.Sat})
 	return nil
 }
 
-func (p *Policy) track(requestID uint64, key string) {
-	if p.pending == nil {
-		p.pending = map[uint64]string{}
-	}
-	p.pending[requestID] = key
-}
-
-// Payment states of a SendPaymentV2 update.
-const (
-	paymentSucceeded = 2
-	paymentFailed    = 3
-)
-
-// Answered hears lnd's answer to a request: an on-chain send lnd refused,
-// or a payment that failed, did not move anything, so it no longer counts
-// against the daily limit (a lockup may be sent again, a payment retried).
-func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	key, ok := p.pending[requestID]
-	if !ok {
-		return
-	}
-	failed := m.GetIsError()
-	done := failed || !m.GetStreamRpc()
-	if strings.HasPrefix(key, "pay:") && !failed {
-		var u lnrpc.Payment
-		if proto.Unmarshal(m.GetSerialized(), &u) == nil {
-			switch u.Status {
-			case paymentFailed:
-				failed, done = true, true
-			case paymentSucceeded:
-				done = true
-			}
-		}
-	}
-	if !done {
-		return // payment updates in flight: wait for the last one
-	}
-	delete(p.pending, requestID)
-	if failed {
-		_ = p.Ledger.Delete(key)
-	}
-}
-
-func (p *Policy) addHold(ctx context.Context, r *lnrpc.AddHoldInvoiceRequest) error {
+func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHoldInvoiceRequest) error {
 	if len(r.Hash) != 32 {
 		return refuse("a hold invoice needs a 32-byte hash")
 	}
@@ -481,40 +759,241 @@ func (p *Policy) addHold(ctx context.Context, r *lnrpc.AddHoldInvoiceRequest) er
 	if sat <= 0 || sat > p.MaxPerOpSat {
 		return refuse("%d sat is not within 1..%d", sat, p.MaxPerOpSat)
 	}
-	count, unlocked, err := p.Swaps.PendingReverse(ctx)
-	if err != nil {
-		return refuse("swap database: %v", err)
+	if inv, err := p.LN.LookupInvoice(ctx, r.Hash); err != nil {
+		return refuse("lnd invoice: %v", err)
+	} else if inv != nil {
+		return refuse("an invoice with that hash already exists")
 	}
-	if count >= p.MaxPendingReverse {
-		return refuse("%d reverse swaps pending, the limit is %d", count, p.MaxPendingReverse)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	hh := hex.EncodeToString(r.Hash)
+	if _, ok := p.Ledger.Holds[hh]; ok {
+		return refuse("that hash was used before")
+	}
+	if n := p.openHolds(); n >= p.MaxPendingReverse {
+		return refuse("%d reverse swaps pending, the limit is %d", n, p.MaxPendingReverse)
 	}
 	avail, err := p.available(ctx)
 	if err != nil {
 		return err
 	}
-	if unlocked+sat > avail {
-		return refuse("%d sat more would not fit the coins left (%d promised, %d available)", sat, unlocked, avail)
+	if promised := p.promised(); promised+sat > avail {
+		return refuse("%d sat more would not fit the coins left (%d promised, %d available)", sat, promised, avail)
 	}
-	if err := p.Ledger.AddHold(hex.EncodeToString(r.Hash)); err != nil {
-		return refuse("ledger: %v", err)
-	}
+	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/AddHoldInvoice", hash: hh, sat: sat})
 	return nil
 }
 
-func (p *Policy) ownInvoice(ctx context.Context, hash []byte) error {
+func (p *Policy) ownLookup(hash []byte) error {
 	if len(hash) != 32 {
 		return refuse("a 32-byte payment hash is required")
 	}
 	h := hex.EncodeToString(hash)
-	if p.Ledger.HasHold(h) {
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	if _, ok := p.Ledger.Holds[h]; ok {
 		return nil
 	}
-	ok, err := p.Swaps.ReverseByHash(ctx, h)
-	if err != nil {
-		return refuse("swap database: %v", err)
+	if _, ok := p.Ledger.Invoices[h]; ok {
+		return nil
 	}
-	if !ok {
+	return refuse("not an invoice the backend created")
+}
+
+func (p *Policy) cancel(requestID uint64, hash []byte) error {
+	if len(hash) != 32 {
+		return refuse("a 32-byte payment hash is required")
+	}
+	h := hex.EncodeToString(hash)
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	if _, ok := p.Ledger.Holds[h]; !ok {
 		return refuse("not a Kiloswap hold invoice")
 	}
+	if l, ok := p.Ledger.Lockups[h]; ok && l.State != LockRefunded {
+		return refuse("its lockup is %s: the invoice stays until the lockup is refunded", l.State)
+	}
+	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/CancelInvoice", hash: h})
 	return nil
+}
+
+func (p *Policy) settle(requestID uint64, hash []byte) error {
+	h := hex.EncodeToString(hash)
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	if _, ok := p.Ledger.Holds[h]; !ok {
+		return refuse("not a Kiloswap hold invoice")
+	}
+	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/SettleInvoice", hash: h})
+	return nil
+}
+
+func (p *Policy) track(requestID uint64, r pendingReq) {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	if p.pending == nil {
+		p.pending = map[uint64]pendingReq{}
+	}
+	r.at = p.now()
+	p.pending[requestID] = r
+	// streams that never got a final answer are forgotten after a day
+	cut := r.at.Add(-24 * time.Hour)
+	for id, x := range p.pending {
+		if x.at.Before(cut) {
+			delete(p.pending, id)
+		}
+	}
+}
+
+func (p *Policy) pendingFor(requestID uint64) (pendingReq, bool) {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	r, ok := p.pending[requestID]
+	return r, ok
+}
+
+func (p *Policy) done(requestID uint64) {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	delete(p.pending, requestID)
+}
+
+// Payment states of a SendPaymentV2 update.
+const (
+	paymentInFlight  = 1
+	paymentSucceeded = 2
+	paymentFailed    = 3
+)
+
+// Answered hears lnd's answer to a request. Only lnd's own answers change
+// what the guard records: an amount comes back only when lnd refused the
+// send or reported the payment FAILED, on the stream that started it.
+func (p *Policy) Answered(requestID uint64, m *lnrpc.RPCMessage) {
+	r, ok := p.pendingFor(requestID)
+	if !ok {
+		return
+	}
+	isErr := m.GetIsError()
+	switch r.method {
+	case "/lnrpc.Lightning/AddInvoice":
+		p.done(requestID)
+		var resp lnrpc.AddInvoiceResponse
+		if !isErr && proto.Unmarshal(m.GetSerialized(), &resp) == nil && len(resp.RHash) == 32 {
+			p.Ledger.Lock()
+			p.Ledger.Invoices[hex.EncodeToString(resp.RHash)] = p.now()
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+		}
+	case "/invoicesrpc.Invoices/AddHoldInvoice":
+		p.done(requestID)
+		if isErr {
+			return
+		}
+		p.Ledger.Lock()
+		p.Ledger.Holds[r.hash] = &Hold{Sat: r.sat, At: p.now(), State: "open"}
+		_ = p.Ledger.save()
+		p.Ledger.Unlock()
+	case "/invoicesrpc.Invoices/CancelInvoice", "/invoicesrpc.Invoices/SettleInvoice":
+		p.done(requestID)
+		if isErr {
+			return
+		}
+		p.Ledger.Lock()
+		if h := p.Ledger.Holds[r.hash]; h != nil {
+			if r.method == "/invoicesrpc.Invoices/CancelInvoice" {
+				h.State = "canceled"
+			} else {
+				h.State = "settled"
+				if l := p.Ledger.Lockups[r.hash]; l != nil && l.State != LockRefunded {
+					l.State = LockSettled
+				}
+			}
+		}
+		_ = p.Ledger.save()
+		p.Ledger.Unlock()
+	case "/lnrpc.Lightning/SendCoins":
+		p.done(requestID)
+		var resp lnrpc.SendCoinsResponse
+		p.Ledger.Lock()
+		l := p.Ledger.Lockups[r.hash]
+		if l != nil && l.State == LockApproved {
+			if !isErr && proto.Unmarshal(m.GetSerialized(), &resp) == nil && resp.Txid != "" {
+				l.State, l.TxID = LockSent, resp.Txid
+				p.notify("lockup_sent", map[string]any{"swap": l.SwapID, "sat": l.Sat, "txid": l.TxID})
+			} else if isErr {
+				// lnd refused the send: nothing left the wallet
+				delete(p.Ledger.Lockups, r.hash)
+				delete(p.Ledger.Entries, "send:"+r.hash)
+			}
+		}
+		_ = p.Ledger.save()
+		p.Ledger.Unlock()
+	case "/routerrpc.Router/SendPaymentV2":
+		p.answeredPayment(requestID, r, m)
+	}
+}
+
+func (p *Policy) answeredPayment(requestID uint64, r pendingReq, m *lnrpc.RPCMessage) {
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	pay := p.Ledger.Payments[r.hash]
+	if pay == nil || pay.Request != requestID {
+		p.done(requestID)
+		return
+	}
+	if m.GetIsError() {
+		// the stream ended (refused, cancelled, already paid): lnd may still
+		// be paying. Nothing is given back until lnd reports the outcome.
+		p.done(requestID)
+		if pay.State == PayInflight {
+			pay.State = PayUnknown
+			_ = p.Ledger.save()
+		}
+		return
+	}
+	var u lnrpc.Payment
+	if proto.Unmarshal(m.GetSerialized(), &u) != nil {
+		return
+	}
+	if !strings.EqualFold(u.PaymentHash, pay.Hash) && u.PaymentHash != "" {
+		return
+	}
+	switch u.Status {
+	case paymentSucceeded:
+		p.done(requestID)
+		p.paid(pay, u.PaymentPreimage)
+	case paymentFailed:
+		p.done(requestID)
+		p.failed(pay)
+	}
+}
+
+// paid records a payment lnd reports as succeeded (caller holds the
+// ledger lock).
+func (p *Policy) paid(pay *Payment, preimage string) {
+	pre, err := hex.DecodeString(preimage)
+	h := sha256.Sum256(pre)
+	if err != nil || len(pre) != 32 || hex.EncodeToString(h[:]) != pay.Hash {
+		pay.State = PayUnknown // reconcile asks lnd again
+		_ = p.Ledger.save()
+		return
+	}
+	pay.State, pay.Preimage = PaySucceeded, hex.EncodeToString(pre)
+	if e, ok := p.Ledger.Entries["pay:"+pay.Hash]; ok {
+		e.Done = true
+		p.Ledger.Entries["pay:"+pay.Hash] = e
+	}
+	_ = p.Ledger.save()
+	p.notify("payment_succeeded", map[string]any{"swap": pay.SwapID, "sat": pay.Sat})
+}
+
+// failed gives back a payment lnd reports as failed (caller holds the lock).
+func (p *Policy) failed(pay *Payment) {
+	pay.State = PayFailed
+	delete(p.Ledger.Entries, "pay:"+pay.Hash)
+	delete(p.Ledger.Outpoints, fmt.Sprintf("%s:%d", pay.LockupTx, pay.Vout))
+	_ = p.Ledger.save()
+	p.notify("payment_failed", map[string]any{"swap": pay.SwapID, "sat": pay.Sat})
 }

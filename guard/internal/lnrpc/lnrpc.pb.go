@@ -890,7 +890,8 @@ type Invoice struct {
 	AmtPaidSat  int64                  `protobuf:"varint,19,opt,name=amt_paid_sat,json=amtPaidSat,proto3" json:"amt_paid_sat,omitempty"`
 	AmtPaidMsat int64                  `protobuf:"varint,20,opt,name=amt_paid_msat,json=amtPaidMsat,proto3" json:"amt_paid_msat,omitempty"`
 	// OPEN = 0, SETTLED = 1, CANCELED = 2, ACCEPTED = 3
-	State         int32 `protobuf:"varint,21,opt,name=state,proto3" json:"state,omitempty"`
+	State         int32          `protobuf:"varint,21,opt,name=state,proto3" json:"state,omitempty"`
+	Htlcs         []*InvoiceHTLC `protobuf:"bytes,22,rep,name=htlcs,proto3" json:"htlcs,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -967,18 +968,636 @@ func (x *Invoice) GetState() int32 {
 	return 0
 }
 
+func (x *Invoice) GetHtlcs() []*InvoiceHTLC {
+	if x != nil {
+		return x.Htlcs
+	}
+	return nil
+}
+
+type InvoiceHTLC struct {
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	ChanId       uint64                 `protobuf:"varint,1,opt,name=chan_id,json=chanId,proto3" json:"chan_id,omitempty"`
+	HtlcIndex    uint64                 `protobuf:"varint,2,opt,name=htlc_index,json=htlcIndex,proto3" json:"htlc_index,omitempty"`
+	AmtMsat      uint64                 `protobuf:"varint,3,opt,name=amt_msat,json=amtMsat,proto3" json:"amt_msat,omitempty"`
+	AcceptHeight int32                  `protobuf:"varint,4,opt,name=accept_height,json=acceptHeight,proto3" json:"accept_height,omitempty"`
+	AcceptTime   int64                  `protobuf:"varint,5,opt,name=accept_time,json=acceptTime,proto3" json:"accept_time,omitempty"`
+	ResolveTime  int64                  `protobuf:"varint,6,opt,name=resolve_time,json=resolveTime,proto3" json:"resolve_time,omitempty"`
+	ExpiryHeight int32                  `protobuf:"varint,7,opt,name=expiry_height,json=expiryHeight,proto3" json:"expiry_height,omitempty"`
+	// ACCEPTED = 0, SETTLED = 1, CANCELED = 2
+	State         int32 `protobuf:"varint,8,opt,name=state,proto3" json:"state,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *InvoiceHTLC) Reset() {
+	*x = InvoiceHTLC{}
+	mi := &file_lnrpc_proto_msgTypes[12]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *InvoiceHTLC) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*InvoiceHTLC) ProtoMessage() {}
+
+func (x *InvoiceHTLC) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[12]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use InvoiceHTLC.ProtoReflect.Descriptor instead.
+func (*InvoiceHTLC) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{12}
+}
+
+func (x *InvoiceHTLC) GetChanId() uint64 {
+	if x != nil {
+		return x.ChanId
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetHtlcIndex() uint64 {
+	if x != nil {
+		return x.HtlcIndex
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetAmtMsat() uint64 {
+	if x != nil {
+		return x.AmtMsat
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetAcceptHeight() int32 {
+	if x != nil {
+		return x.AcceptHeight
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetAcceptTime() int64 {
+	if x != nil {
+		return x.AcceptTime
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetResolveTime() int64 {
+	if x != nil {
+		return x.ResolveTime
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetExpiryHeight() int32 {
+	if x != nil {
+		return x.ExpiryHeight
+	}
+	return 0
+}
+
+func (x *InvoiceHTLC) GetState() int32 {
+	if x != nil {
+		return x.State
+	}
+	return 0
+}
+
+type PayReqString struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PayReq        string                 `protobuf:"bytes,1,opt,name=pay_req,json=payReq,proto3" json:"pay_req,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PayReqString) Reset() {
+	*x = PayReqString{}
+	mi := &file_lnrpc_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PayReqString) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PayReqString) ProtoMessage() {}
+
+func (x *PayReqString) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PayReqString.ProtoReflect.Descriptor instead.
+func (*PayReqString) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *PayReqString) GetPayReq() string {
+	if x != nil {
+		return x.PayReq
+	}
+	return ""
+}
+
+type PayReq struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Destination   string                 `protobuf:"bytes,1,opt,name=destination,proto3" json:"destination,omitempty"`
+	PaymentHash   string                 `protobuf:"bytes,2,opt,name=payment_hash,json=paymentHash,proto3" json:"payment_hash,omitempty"`
+	NumSatoshis   int64                  `protobuf:"varint,3,opt,name=num_satoshis,json=numSatoshis,proto3" json:"num_satoshis,omitempty"`
+	Timestamp     int64                  `protobuf:"varint,4,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	Expiry        int64                  `protobuf:"varint,5,opt,name=expiry,proto3" json:"expiry,omitempty"`
+	CltvExpiry    int64                  `protobuf:"varint,9,opt,name=cltv_expiry,json=cltvExpiry,proto3" json:"cltv_expiry,omitempty"`
+	NumMsat       int64                  `protobuf:"varint,12,opt,name=num_msat,json=numMsat,proto3" json:"num_msat,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PayReq) Reset() {
+	*x = PayReq{}
+	mi := &file_lnrpc_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PayReq) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PayReq) ProtoMessage() {}
+
+func (x *PayReq) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PayReq.ProtoReflect.Descriptor instead.
+func (*PayReq) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *PayReq) GetDestination() string {
+	if x != nil {
+		return x.Destination
+	}
+	return ""
+}
+
+func (x *PayReq) GetPaymentHash() string {
+	if x != nil {
+		return x.PaymentHash
+	}
+	return ""
+}
+
+func (x *PayReq) GetNumSatoshis() int64 {
+	if x != nil {
+		return x.NumSatoshis
+	}
+	return 0
+}
+
+func (x *PayReq) GetTimestamp() int64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *PayReq) GetExpiry() int64 {
+	if x != nil {
+		return x.Expiry
+	}
+	return 0
+}
+
+func (x *PayReq) GetCltvExpiry() int64 {
+	if x != nil {
+		return x.CltvExpiry
+	}
+	return 0
+}
+
+func (x *PayReq) GetNumMsat() int64 {
+	if x != nil {
+		return x.NumMsat
+	}
+	return 0
+}
+
+type NewAddressRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// WITNESS_PUBKEY_HASH = 0, TAPROOT_PUBKEY = 4
+	Type          int32  `protobuf:"varint,1,opt,name=type,proto3" json:"type,omitempty"`
+	Account       string `protobuf:"bytes,2,opt,name=account,proto3" json:"account,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NewAddressRequest) Reset() {
+	*x = NewAddressRequest{}
+	mi := &file_lnrpc_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NewAddressRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NewAddressRequest) ProtoMessage() {}
+
+func (x *NewAddressRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NewAddressRequest.ProtoReflect.Descriptor instead.
+func (*NewAddressRequest) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *NewAddressRequest) GetType() int32 {
+	if x != nil {
+		return x.Type
+	}
+	return 0
+}
+
+func (x *NewAddressRequest) GetAccount() string {
+	if x != nil {
+		return x.Account
+	}
+	return ""
+}
+
+type NewAddressResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Address       string                 `protobuf:"bytes,1,opt,name=address,proto3" json:"address,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *NewAddressResponse) Reset() {
+	*x = NewAddressResponse{}
+	mi := &file_lnrpc_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *NewAddressResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*NewAddressResponse) ProtoMessage() {}
+
+func (x *NewAddressResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use NewAddressResponse.ProtoReflect.Descriptor instead.
+func (*NewAddressResponse) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *NewAddressResponse) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+type SendCoinsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Txid          string                 `protobuf:"bytes,1,opt,name=txid,proto3" json:"txid,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SendCoinsResponse) Reset() {
+	*x = SendCoinsResponse{}
+	mi := &file_lnrpc_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SendCoinsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SendCoinsResponse) ProtoMessage() {}
+
+func (x *SendCoinsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SendCoinsResponse.ProtoReflect.Descriptor instead.
+func (*SendCoinsResponse) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *SendCoinsResponse) GetTxid() string {
+	if x != nil {
+		return x.Txid
+	}
+	return ""
+}
+
+type AddInvoiceResponse struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	RHash          []byte                 `protobuf:"bytes,1,opt,name=r_hash,json=rHash,proto3" json:"r_hash,omitempty"`
+	PaymentRequest string                 `protobuf:"bytes,2,opt,name=payment_request,json=paymentRequest,proto3" json:"payment_request,omitempty"`
+	AddIndex       uint64                 `protobuf:"varint,16,opt,name=add_index,json=addIndex,proto3" json:"add_index,omitempty"`
+	PaymentAddr    []byte                 `protobuf:"bytes,17,opt,name=payment_addr,json=paymentAddr,proto3" json:"payment_addr,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *AddInvoiceResponse) Reset() {
+	*x = AddInvoiceResponse{}
+	mi := &file_lnrpc_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddInvoiceResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddInvoiceResponse) ProtoMessage() {}
+
+func (x *AddInvoiceResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddInvoiceResponse.ProtoReflect.Descriptor instead.
+func (*AddInvoiceResponse) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *AddInvoiceResponse) GetRHash() []byte {
+	if x != nil {
+		return x.RHash
+	}
+	return nil
+}
+
+func (x *AddInvoiceResponse) GetPaymentRequest() string {
+	if x != nil {
+		return x.PaymentRequest
+	}
+	return ""
+}
+
+func (x *AddInvoiceResponse) GetAddIndex() uint64 {
+	if x != nil {
+		return x.AddIndex
+	}
+	return 0
+}
+
+func (x *AddInvoiceResponse) GetPaymentAddr() []byte {
+	if x != nil {
+		return x.PaymentAddr
+	}
+	return nil
+}
+
+type AddHoldInvoiceResp struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	PaymentRequest string                 `protobuf:"bytes,1,opt,name=payment_request,json=paymentRequest,proto3" json:"payment_request,omitempty"`
+	AddIndex       uint64                 `protobuf:"varint,2,opt,name=add_index,json=addIndex,proto3" json:"add_index,omitempty"`
+	PaymentAddr    []byte                 `protobuf:"bytes,3,opt,name=payment_addr,json=paymentAddr,proto3" json:"payment_addr,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *AddHoldInvoiceResp) Reset() {
+	*x = AddHoldInvoiceResp{}
+	mi := &file_lnrpc_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *AddHoldInvoiceResp) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*AddHoldInvoiceResp) ProtoMessage() {}
+
+func (x *AddHoldInvoiceResp) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use AddHoldInvoiceResp.ProtoReflect.Descriptor instead.
+func (*AddHoldInvoiceResp) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *AddHoldInvoiceResp) GetPaymentRequest() string {
+	if x != nil {
+		return x.PaymentRequest
+	}
+	return ""
+}
+
+func (x *AddHoldInvoiceResp) GetAddIndex() uint64 {
+	if x != nil {
+		return x.AddIndex
+	}
+	return 0
+}
+
+func (x *AddHoldInvoiceResp) GetPaymentAddr() []byte {
+	if x != nil {
+		return x.PaymentAddr
+	}
+	return nil
+}
+
+type SubscribeSingleInvoiceRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RHash         []byte                 `protobuf:"bytes,2,opt,name=r_hash,json=rHash,proto3" json:"r_hash,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SubscribeSingleInvoiceRequest) Reset() {
+	*x = SubscribeSingleInvoiceRequest{}
+	mi := &file_lnrpc_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SubscribeSingleInvoiceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SubscribeSingleInvoiceRequest) ProtoMessage() {}
+
+func (x *SubscribeSingleInvoiceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SubscribeSingleInvoiceRequest.ProtoReflect.Descriptor instead.
+func (*SubscribeSingleInvoiceRequest) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *SubscribeSingleInvoiceRequest) GetRHash() []byte {
+	if x != nil {
+		return x.RHash
+	}
+	return nil
+}
+
+type TrackPaymentRequest struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	PaymentHash       []byte                 `protobuf:"bytes,1,opt,name=payment_hash,json=paymentHash,proto3" json:"payment_hash,omitempty"`
+	NoInflightUpdates bool                   `protobuf:"varint,2,opt,name=no_inflight_updates,json=noInflightUpdates,proto3" json:"no_inflight_updates,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *TrackPaymentRequest) Reset() {
+	*x = TrackPaymentRequest{}
+	mi := &file_lnrpc_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TrackPaymentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TrackPaymentRequest) ProtoMessage() {}
+
+func (x *TrackPaymentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TrackPaymentRequest.ProtoReflect.Descriptor instead.
+func (*TrackPaymentRequest) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *TrackPaymentRequest) GetPaymentHash() []byte {
+	if x != nil {
+		return x.PaymentHash
+	}
+	return nil
+}
+
+func (x *TrackPaymentRequest) GetNoInflightUpdates() bool {
+	if x != nil {
+		return x.NoInflightUpdates
+	}
+	return false
+}
+
 // A payment update of SendPaymentV2; only its status is read
 // (IN_FLIGHT 1, SUCCEEDED 2, FAILED 3, INITIATED 4).
 type Payment struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Status        int32                  `protobuf:"varint,10,opt,name=status,proto3" json:"status,omitempty"`
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	PaymentHash     string                 `protobuf:"bytes,1,opt,name=payment_hash,json=paymentHash,proto3" json:"payment_hash,omitempty"`
+	PaymentPreimage string                 `protobuf:"bytes,6,opt,name=payment_preimage,json=paymentPreimage,proto3" json:"payment_preimage,omitempty"`
+	ValueSat        int64                  `protobuf:"varint,7,opt,name=value_sat,json=valueSat,proto3" json:"value_sat,omitempty"`
+	ValueMsat       int64                  `protobuf:"varint,8,opt,name=value_msat,json=valueMsat,proto3" json:"value_msat,omitempty"`
+	PaymentRequest  string                 `protobuf:"bytes,9,opt,name=payment_request,json=paymentRequest,proto3" json:"payment_request,omitempty"`
+	// IN_FLIGHT = 1, SUCCEEDED = 2, FAILED = 3, INITIATED = 4
+	Status        int32 `protobuf:"varint,10,opt,name=status,proto3" json:"status,omitempty"`
+	FeeSat        int64 `protobuf:"varint,11,opt,name=fee_sat,json=feeSat,proto3" json:"fee_sat,omitempty"`
+	FeeMsat       int64 `protobuf:"varint,12,opt,name=fee_msat,json=feeMsat,proto3" json:"fee_msat,omitempty"`
+	FailureReason int32 `protobuf:"varint,16,opt,name=failure_reason,json=failureReason,proto3" json:"failure_reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Payment) Reset() {
 	*x = Payment{}
-	mi := &file_lnrpc_proto_msgTypes[12]
+	mi := &file_lnrpc_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -990,7 +1609,7 @@ func (x *Payment) String() string {
 func (*Payment) ProtoMessage() {}
 
 func (x *Payment) ProtoReflect() protoreflect.Message {
-	mi := &file_lnrpc_proto_msgTypes[12]
+	mi := &file_lnrpc_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1003,12 +1622,68 @@ func (x *Payment) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Payment.ProtoReflect.Descriptor instead.
 func (*Payment) Descriptor() ([]byte, []int) {
-	return file_lnrpc_proto_rawDescGZIP(), []int{12}
+	return file_lnrpc_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *Payment) GetPaymentHash() string {
+	if x != nil {
+		return x.PaymentHash
+	}
+	return ""
+}
+
+func (x *Payment) GetPaymentPreimage() string {
+	if x != nil {
+		return x.PaymentPreimage
+	}
+	return ""
+}
+
+func (x *Payment) GetValueSat() int64 {
+	if x != nil {
+		return x.ValueSat
+	}
+	return 0
+}
+
+func (x *Payment) GetValueMsat() int64 {
+	if x != nil {
+		return x.ValueMsat
+	}
+	return 0
+}
+
+func (x *Payment) GetPaymentRequest() string {
+	if x != nil {
+		return x.PaymentRequest
+	}
+	return ""
 }
 
 func (x *Payment) GetStatus() int32 {
 	if x != nil {
 		return x.Status
+	}
+	return 0
+}
+
+func (x *Payment) GetFeeSat() int64 {
+	if x != nil {
+		return x.FeeSat
+	}
+	return 0
+}
+
+func (x *Payment) GetFeeMsat() int64 {
+	if x != nil {
+		return x.FeeMsat
+	}
+	return 0
+}
+
+func (x *Payment) GetFailureReason() int32 {
+	if x != nil {
+		return x.FailureReason
 	}
 	return 0
 }
@@ -1032,7 +1707,7 @@ type AddHoldInvoiceRequest struct {
 
 func (x *AddHoldInvoiceRequest) Reset() {
 	*x = AddHoldInvoiceRequest{}
-	mi := &file_lnrpc_proto_msgTypes[13]
+	mi := &file_lnrpc_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1044,7 +1719,7 @@ func (x *AddHoldInvoiceRequest) String() string {
 func (*AddHoldInvoiceRequest) ProtoMessage() {}
 
 func (x *AddHoldInvoiceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_lnrpc_proto_msgTypes[13]
+	mi := &file_lnrpc_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1057,7 +1732,7 @@ func (x *AddHoldInvoiceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AddHoldInvoiceRequest.ProtoReflect.Descriptor instead.
 func (*AddHoldInvoiceRequest) Descriptor() ([]byte, []int) {
-	return file_lnrpc_proto_rawDescGZIP(), []int{13}
+	return file_lnrpc_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *AddHoldInvoiceRequest) GetMemo() string {
@@ -1139,7 +1814,7 @@ type CancelInvoiceMsg struct {
 
 func (x *CancelInvoiceMsg) Reset() {
 	*x = CancelInvoiceMsg{}
-	mi := &file_lnrpc_proto_msgTypes[14]
+	mi := &file_lnrpc_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1151,7 +1826,7 @@ func (x *CancelInvoiceMsg) String() string {
 func (*CancelInvoiceMsg) ProtoMessage() {}
 
 func (x *CancelInvoiceMsg) ProtoReflect() protoreflect.Message {
-	mi := &file_lnrpc_proto_msgTypes[14]
+	mi := &file_lnrpc_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1164,7 +1839,7 @@ func (x *CancelInvoiceMsg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CancelInvoiceMsg.ProtoReflect.Descriptor instead.
 func (*CancelInvoiceMsg) Descriptor() ([]byte, []int) {
-	return file_lnrpc_proto_rawDescGZIP(), []int{14}
+	return file_lnrpc_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *CancelInvoiceMsg) GetPaymentHash() []byte {
@@ -1183,7 +1858,7 @@ type SettleInvoiceMsg struct {
 
 func (x *SettleInvoiceMsg) Reset() {
 	*x = SettleInvoiceMsg{}
-	mi := &file_lnrpc_proto_msgTypes[15]
+	mi := &file_lnrpc_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1195,7 +1870,7 @@ func (x *SettleInvoiceMsg) String() string {
 func (*SettleInvoiceMsg) ProtoMessage() {}
 
 func (x *SettleInvoiceMsg) ProtoReflect() protoreflect.Message {
-	mi := &file_lnrpc_proto_msgTypes[15]
+	mi := &file_lnrpc_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1208,7 +1883,7 @@ func (x *SettleInvoiceMsg) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SettleInvoiceMsg.ProtoReflect.Descriptor instead.
 func (*SettleInvoiceMsg) Descriptor() ([]byte, []int) {
-	return file_lnrpc_proto_rawDescGZIP(), []int{15}
+	return file_lnrpc_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *SettleInvoiceMsg) GetPreimage() []byte {
@@ -1251,7 +1926,7 @@ type SendPaymentRequest struct {
 
 func (x *SendPaymentRequest) Reset() {
 	*x = SendPaymentRequest{}
-	mi := &file_lnrpc_proto_msgTypes[16]
+	mi := &file_lnrpc_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1263,7 +1938,7 @@ func (x *SendPaymentRequest) String() string {
 func (*SendPaymentRequest) ProtoMessage() {}
 
 func (x *SendPaymentRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_lnrpc_proto_msgTypes[16]
+	mi := &file_lnrpc_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1276,7 +1951,7 @@ func (x *SendPaymentRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SendPaymentRequest.ProtoReflect.Descriptor instead.
 func (*SendPaymentRequest) Descriptor() ([]byte, []int) {
-	return file_lnrpc_proto_rawDescGZIP(), []int{16}
+	return file_lnrpc_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *SendPaymentRequest) GetDest() []byte {
@@ -1526,7 +2201,7 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\vPaymentHash\x12\x1c\n" +
 	"\n" +
 	"r_hash_str\x18\x01 \x01(\tR\brHashStr\x12\x15\n" +
-	"\x06r_hash\x18\x02 \x01(\fR\x05rHash\"\xb1\x01\n" +
+	"\x06r_hash\x18\x02 \x01(\fR\x05rHash\"\xdb\x01\n" +
 	"\aInvoice\x12\x15\n" +
 	"\x06r_hash\x18\x04 \x01(\fR\x05rHash\x12\x14\n" +
 	"\x05value\x18\x05 \x01(\x03R\x05value\x12\x1d\n" +
@@ -1535,10 +2210,63 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\famt_paid_sat\x18\x13 \x01(\x03R\n" +
 	"amtPaidSat\x12\"\n" +
 	"\ramt_paid_msat\x18\x14 \x01(\x03R\vamtPaidMsat\x12\x14\n" +
-	"\x05state\x18\x15 \x01(\x05R\x05state\"!\n" +
-	"\aPayment\x12\x16\n" +
+	"\x05state\x18\x15 \x01(\x05R\x05state\x12(\n" +
+	"\x05htlcs\x18\x16 \x03(\v2\x12.lnrpc.InvoiceHTLCR\x05htlcs\"\x84\x02\n" +
+	"\vInvoiceHTLC\x12\x17\n" +
+	"\achan_id\x18\x01 \x01(\x04R\x06chanId\x12\x1d\n" +
+	"\n" +
+	"htlc_index\x18\x02 \x01(\x04R\thtlcIndex\x12\x19\n" +
+	"\bamt_msat\x18\x03 \x01(\x04R\aamtMsat\x12#\n" +
+	"\raccept_height\x18\x04 \x01(\x05R\facceptHeight\x12\x1f\n" +
+	"\vaccept_time\x18\x05 \x01(\x03R\n" +
+	"acceptTime\x12!\n" +
+	"\fresolve_time\x18\x06 \x01(\x03R\vresolveTime\x12#\n" +
+	"\rexpiry_height\x18\a \x01(\x05R\fexpiryHeight\x12\x14\n" +
+	"\x05state\x18\b \x01(\x05R\x05state\"'\n" +
+	"\fPayReqString\x12\x17\n" +
+	"\apay_req\x18\x01 \x01(\tR\x06payReq\"\xe2\x01\n" +
+	"\x06PayReq\x12 \n" +
+	"\vdestination\x18\x01 \x01(\tR\vdestination\x12!\n" +
+	"\fpayment_hash\x18\x02 \x01(\tR\vpaymentHash\x12!\n" +
+	"\fnum_satoshis\x18\x03 \x01(\x03R\vnumSatoshis\x12\x1c\n" +
+	"\ttimestamp\x18\x04 \x01(\x03R\ttimestamp\x12\x16\n" +
+	"\x06expiry\x18\x05 \x01(\x03R\x06expiry\x12\x1f\n" +
+	"\vcltv_expiry\x18\t \x01(\x03R\n" +
+	"cltvExpiry\x12\x19\n" +
+	"\bnum_msat\x18\f \x01(\x03R\anumMsat\"A\n" +
+	"\x11NewAddressRequest\x12\x12\n" +
+	"\x04type\x18\x01 \x01(\x05R\x04type\x12\x18\n" +
+	"\aaccount\x18\x02 \x01(\tR\aaccount\".\n" +
+	"\x12NewAddressResponse\x12\x18\n" +
+	"\aaddress\x18\x01 \x01(\tR\aaddress\"'\n" +
+	"\x11SendCoinsResponse\x12\x12\n" +
+	"\x04txid\x18\x01 \x01(\tR\x04txid\"\x94\x01\n" +
+	"\x12AddInvoiceResponse\x12\x15\n" +
+	"\x06r_hash\x18\x01 \x01(\fR\x05rHash\x12'\n" +
+	"\x0fpayment_request\x18\x02 \x01(\tR\x0epaymentRequest\x12\x1b\n" +
+	"\tadd_index\x18\x10 \x01(\x04R\baddIndex\x12!\n" +
+	"\fpayment_addr\x18\x11 \x01(\fR\vpaymentAddr\"}\n" +
+	"\x12AddHoldInvoiceResp\x12'\n" +
+	"\x0fpayment_request\x18\x01 \x01(\tR\x0epaymentRequest\x12\x1b\n" +
+	"\tadd_index\x18\x02 \x01(\x04R\baddIndex\x12!\n" +
+	"\fpayment_addr\x18\x03 \x01(\fR\vpaymentAddr\"<\n" +
+	"\x1dSubscribeSingleInvoiceRequest\x12\x15\n" +
+	"\x06r_hash\x18\x02 \x01(\fR\x05rHashJ\x04\b\x01\x10\x02\"h\n" +
+	"\x13TrackPaymentRequest\x12!\n" +
+	"\fpayment_hash\x18\x01 \x01(\fR\vpaymentHash\x12.\n" +
+	"\x13no_inflight_updates\x18\x02 \x01(\bR\x11noInflightUpdates\"\xaf\x02\n" +
+	"\aPayment\x12!\n" +
+	"\fpayment_hash\x18\x01 \x01(\tR\vpaymentHash\x12)\n" +
+	"\x10payment_preimage\x18\x06 \x01(\tR\x0fpaymentPreimage\x12\x1b\n" +
+	"\tvalue_sat\x18\a \x01(\x03R\bvalueSat\x12\x1d\n" +
+	"\n" +
+	"value_msat\x18\b \x01(\x03R\tvalueMsat\x12'\n" +
+	"\x0fpayment_request\x18\t \x01(\tR\x0epaymentRequest\x12\x16\n" +
 	"\x06status\x18\n" +
-	" \x01(\x05R\x06status\"\xb8\x02\n" +
+	" \x01(\x05R\x06status\x12\x17\n" +
+	"\afee_sat\x18\v \x01(\x03R\x06feeSat\x12\x19\n" +
+	"\bfee_msat\x18\f \x01(\x03R\afeeMsat\x12%\n" +
+	"\x0efailure_reason\x18\x10 \x01(\x05R\rfailureReason\"\xb8\x02\n" +
 	"\x15AddHoldInvoiceRequest\x12\x12\n" +
 	"\x04memo\x18\x01 \x01(\tR\x04memo\x12\x12\n" +
 	"\x04hash\x18\x02 \x01(\fR\x04hash\x12\x14\n" +
@@ -1593,11 +2321,14 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x01\x1aH\n" +
 	"\x1aFirstHopCustomRecordsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\x04R\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x012\xe4\x01\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value:\x028\x012\xdb\x02\n" +
 	"\tLightning\x12V\n" +
 	"\x15RegisterRPCMiddleware\x12\x1c.lnrpc.RPCMiddlewareResponse\x1a\x1b.lnrpc.RPCMiddlewareRequest(\x010\x01\x12J\n" +
 	"\rWalletBalance\x12\x1b.lnrpc.WalletBalanceRequest\x1a\x1c.lnrpc.WalletBalanceResponse\x123\n" +
-	"\rLookupInvoice\x12\x12.lnrpc.PaymentHash\x1a\x0e.lnrpc.InvoiceB4Z2github.com/Kilombino/kiloswap/guard/internal/lnrpcb\x06proto3"
+	"\rLookupInvoice\x12\x12.lnrpc.PaymentHash\x1a\x0e.lnrpc.Invoice\x122\n" +
+	"\fDecodePayReq\x12\x13.lnrpc.PayReqString\x1a\r.lnrpc.PayReq\x12A\n" +
+	"\n" +
+	"NewAddress\x12\x18.lnrpc.NewAddressRequest\x1a\x19.lnrpc.NewAddressResponseB4Z2github.com/Kilombino/kiloswap/guard/internal/lnrpcb\x06proto3"
 
 var (
 	file_lnrpc_proto_rawDescOnce sync.Once
@@ -1611,50 +2342,65 @@ func file_lnrpc_proto_rawDescGZIP() []byte {
 	return file_lnrpc_proto_rawDescData
 }
 
-var file_lnrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_lnrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 30)
 var file_lnrpc_proto_goTypes = []any{
-	(*RPCMiddlewareRequest)(nil),   // 0: lnrpc.RPCMiddlewareRequest
-	(*MetadataValues)(nil),         // 1: lnrpc.MetadataValues
-	(*StreamAuth)(nil),             // 2: lnrpc.StreamAuth
-	(*RPCMessage)(nil),             // 3: lnrpc.RPCMessage
-	(*RPCMiddlewareResponse)(nil),  // 4: lnrpc.RPCMiddlewareResponse
-	(*MiddlewareRegistration)(nil), // 5: lnrpc.MiddlewareRegistration
-	(*InterceptFeedback)(nil),      // 6: lnrpc.InterceptFeedback
-	(*SendCoinsRequest)(nil),       // 7: lnrpc.SendCoinsRequest
-	(*WalletBalanceRequest)(nil),   // 8: lnrpc.WalletBalanceRequest
-	(*WalletBalanceResponse)(nil),  // 9: lnrpc.WalletBalanceResponse
-	(*PaymentHash)(nil),            // 10: lnrpc.PaymentHash
-	(*Invoice)(nil),                // 11: lnrpc.Invoice
-	(*Payment)(nil),                // 12: lnrpc.Payment
-	(*AddHoldInvoiceRequest)(nil),  // 13: lnrpc.AddHoldInvoiceRequest
-	(*CancelInvoiceMsg)(nil),       // 14: lnrpc.CancelInvoiceMsg
-	(*SettleInvoiceMsg)(nil),       // 15: lnrpc.SettleInvoiceMsg
-	(*SendPaymentRequest)(nil),     // 16: lnrpc.SendPaymentRequest
-	nil,                            // 17: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
-	nil,                            // 18: lnrpc.SendPaymentRequest.DestCustomRecordsEntry
-	nil,                            // 19: lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
+	(*RPCMiddlewareRequest)(nil),          // 0: lnrpc.RPCMiddlewareRequest
+	(*MetadataValues)(nil),                // 1: lnrpc.MetadataValues
+	(*StreamAuth)(nil),                    // 2: lnrpc.StreamAuth
+	(*RPCMessage)(nil),                    // 3: lnrpc.RPCMessage
+	(*RPCMiddlewareResponse)(nil),         // 4: lnrpc.RPCMiddlewareResponse
+	(*MiddlewareRegistration)(nil),        // 5: lnrpc.MiddlewareRegistration
+	(*InterceptFeedback)(nil),             // 6: lnrpc.InterceptFeedback
+	(*SendCoinsRequest)(nil),              // 7: lnrpc.SendCoinsRequest
+	(*WalletBalanceRequest)(nil),          // 8: lnrpc.WalletBalanceRequest
+	(*WalletBalanceResponse)(nil),         // 9: lnrpc.WalletBalanceResponse
+	(*PaymentHash)(nil),                   // 10: lnrpc.PaymentHash
+	(*Invoice)(nil),                       // 11: lnrpc.Invoice
+	(*InvoiceHTLC)(nil),                   // 12: lnrpc.InvoiceHTLC
+	(*PayReqString)(nil),                  // 13: lnrpc.PayReqString
+	(*PayReq)(nil),                        // 14: lnrpc.PayReq
+	(*NewAddressRequest)(nil),             // 15: lnrpc.NewAddressRequest
+	(*NewAddressResponse)(nil),            // 16: lnrpc.NewAddressResponse
+	(*SendCoinsResponse)(nil),             // 17: lnrpc.SendCoinsResponse
+	(*AddInvoiceResponse)(nil),            // 18: lnrpc.AddInvoiceResponse
+	(*AddHoldInvoiceResp)(nil),            // 19: lnrpc.AddHoldInvoiceResp
+	(*SubscribeSingleInvoiceRequest)(nil), // 20: lnrpc.SubscribeSingleInvoiceRequest
+	(*TrackPaymentRequest)(nil),           // 21: lnrpc.TrackPaymentRequest
+	(*Payment)(nil),                       // 22: lnrpc.Payment
+	(*AddHoldInvoiceRequest)(nil),         // 23: lnrpc.AddHoldInvoiceRequest
+	(*CancelInvoiceMsg)(nil),              // 24: lnrpc.CancelInvoiceMsg
+	(*SettleInvoiceMsg)(nil),              // 25: lnrpc.SettleInvoiceMsg
+	(*SendPaymentRequest)(nil),            // 26: lnrpc.SendPaymentRequest
+	nil,                                   // 27: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
+	nil,                                   // 28: lnrpc.SendPaymentRequest.DestCustomRecordsEntry
+	nil,                                   // 29: lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
 }
 var file_lnrpc_proto_depIdxs = []int32{
 	2,  // 0: lnrpc.RPCMiddlewareRequest.stream_auth:type_name -> lnrpc.StreamAuth
 	3,  // 1: lnrpc.RPCMiddlewareRequest.request:type_name -> lnrpc.RPCMessage
 	3,  // 2: lnrpc.RPCMiddlewareRequest.response:type_name -> lnrpc.RPCMessage
-	17, // 3: lnrpc.RPCMiddlewareRequest.metadata_pairs:type_name -> lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
+	27, // 3: lnrpc.RPCMiddlewareRequest.metadata_pairs:type_name -> lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
 	5,  // 4: lnrpc.RPCMiddlewareResponse.register:type_name -> lnrpc.MiddlewareRegistration
 	6,  // 5: lnrpc.RPCMiddlewareResponse.feedback:type_name -> lnrpc.InterceptFeedback
-	18, // 6: lnrpc.SendPaymentRequest.dest_custom_records:type_name -> lnrpc.SendPaymentRequest.DestCustomRecordsEntry
-	19, // 7: lnrpc.SendPaymentRequest.first_hop_custom_records:type_name -> lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
-	1,  // 8: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry.value:type_name -> lnrpc.MetadataValues
-	4,  // 9: lnrpc.Lightning.RegisterRPCMiddleware:input_type -> lnrpc.RPCMiddlewareResponse
-	8,  // 10: lnrpc.Lightning.WalletBalance:input_type -> lnrpc.WalletBalanceRequest
-	10, // 11: lnrpc.Lightning.LookupInvoice:input_type -> lnrpc.PaymentHash
-	0,  // 12: lnrpc.Lightning.RegisterRPCMiddleware:output_type -> lnrpc.RPCMiddlewareRequest
-	9,  // 13: lnrpc.Lightning.WalletBalance:output_type -> lnrpc.WalletBalanceResponse
-	11, // 14: lnrpc.Lightning.LookupInvoice:output_type -> lnrpc.Invoice
-	12, // [12:15] is the sub-list for method output_type
-	9,  // [9:12] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	12, // 6: lnrpc.Invoice.htlcs:type_name -> lnrpc.InvoiceHTLC
+	28, // 7: lnrpc.SendPaymentRequest.dest_custom_records:type_name -> lnrpc.SendPaymentRequest.DestCustomRecordsEntry
+	29, // 8: lnrpc.SendPaymentRequest.first_hop_custom_records:type_name -> lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
+	1,  // 9: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry.value:type_name -> lnrpc.MetadataValues
+	4,  // 10: lnrpc.Lightning.RegisterRPCMiddleware:input_type -> lnrpc.RPCMiddlewareResponse
+	8,  // 11: lnrpc.Lightning.WalletBalance:input_type -> lnrpc.WalletBalanceRequest
+	10, // 12: lnrpc.Lightning.LookupInvoice:input_type -> lnrpc.PaymentHash
+	13, // 13: lnrpc.Lightning.DecodePayReq:input_type -> lnrpc.PayReqString
+	15, // 14: lnrpc.Lightning.NewAddress:input_type -> lnrpc.NewAddressRequest
+	0,  // 15: lnrpc.Lightning.RegisterRPCMiddleware:output_type -> lnrpc.RPCMiddlewareRequest
+	9,  // 16: lnrpc.Lightning.WalletBalance:output_type -> lnrpc.WalletBalanceResponse
+	11, // 17: lnrpc.Lightning.LookupInvoice:output_type -> lnrpc.Invoice
+	14, // 18: lnrpc.Lightning.DecodePayReq:output_type -> lnrpc.PayReq
+	16, // 19: lnrpc.Lightning.NewAddress:output_type -> lnrpc.NewAddressResponse
+	15, // [15:20] is the sub-list for method output_type
+	10, // [10:15] is the sub-list for method input_type
+	10, // [10:10] is the sub-list for extension type_name
+	10, // [10:10] is the sub-list for extension extendee
+	0,  // [0:10] is the sub-list for field type_name
 }
 
 func init() { file_lnrpc_proto_init() }
@@ -1678,7 +2424,7 @@ func file_lnrpc_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_lnrpc_proto_rawDesc), len(file_lnrpc_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   20,
+			NumMessages:   30,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

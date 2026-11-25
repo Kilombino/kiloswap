@@ -36,6 +36,9 @@ to Bitcoin BLAKE2b by paulscode in
 - Tested on regtest with the service stopped: refund by the timeout path and
   claim by the script path, broadcast by a node, with nothing but the user's
   keys.
+- The service signs nothing cooperatively. A submarine swap that fails is
+  refunded with your rescue key **after its timeout** (about 3 days), not
+  right away; a Lightning → on-chain swap is claimed by the script path.
 
 What the service does need: if the service is gone **and** your browser was
 wiped, finding your swaps again from the rescue key asks the service. That is
@@ -43,51 +46,82 @@ why its database is backed up, encrypted, off the host.
 
 ## The guard
 
-[`guard/`](guard/) is lnd RPC middleware. The backend's macaroon carries the
-custom caveat `kiloswap=v1`; lnd hands every call made with it to the guard
-before running it, and refuses all of them while the guard is not registered
-(fail closed). The guard allows:
+[`guard/`](guard/) is lnd RPC middleware and the only holder of the swaps'
+server key. The backend's macaroon carries the custom caveat `kiloswap=v1`;
+lnd hands every call made with it to the guard before running it, and
+refuses all of them while the guard is not registered (fail closed).
 
-- **on-chain sends** (`SendCoins`) only to the lockup address of a reverse
-  swap whose hold invoice lnd itself holds as paid (`ACCEPTED`, at least the
-  lockup's amount), exact amount, once, confirmed coins only, no `send_all`,
-  fee rate capped;
-- **payments** (`SendPaymentV2`) only of the invoice of a submarine swap whose
-  lockup the node shows confirmed (3 confirmations) paying at least the
-  invoice's amount; routing fee at most 0.01 % (121 sat floor); no AMP, keysend,
-  custom records or route steering;
-- at most **1 BTC per operation and 2 BTC per 24 hours**, sends and payments
-  together, remembered across restarts;
-- on-chain sends and new hold invoices must leave **50,000,000 sat** for the
-  operator's LSP plus the LSP's open channel requests;
-- at most **5 pending** Lightning → on-chain swaps;
-- cancel/settle only its own hold invoices (never those of the operator's
-  other services);
-- nothing else: no channels, no `SendMany`, no PSBTs, no macaroons.
+The threat it is built for is the backend and its database taken over.
 
-The backend's database is the backend's own word, so the money checks use
-sources the backend cannot write: lnd's invoice and the node's chain.
+- **The key.** The swaps' server key (the former `seed.dat`) is the guard's
+  alone. The backend has the extended public key: it puts our public keys in
+  new swaps and finds their outputs, but cannot sign a claim, a refund or a
+  key-path spend. Cooperative signing is off. The guard makes every
+  server-side spend itself, by the script path, to an address of lnd's
+  wallet: it claims submarine lockups once their payment succeeded, refunds
+  reverse lockups after their timeout, and settles a hold invoice as soon as
+  the user's claim shows the preimage on chain.
+- **Rebuilt outputs.** Before any money moves, the guard rebuilds the swap's
+  taproot output (MuSig2 of our key and the user's, claim and refund
+  leaves, the payment hash, the timeout) from our key and data it checks,
+  and compares it with the address or the on-chain output.
+- **On-chain sends** (`SendCoins`) only to such a reverse-swap output, whose
+  hold invoice the backend created through the guard and lnd holds as paid
+  with every HTLC expiring well after the timeout; once per invoice, exact
+  amount, confirmed coins, an explicit fee rate under the cap, no
+  `send_all`; timeout between 12 and 4,320 blocks away.
+- **Payments** (`SendPaymentV2`) only of an invoice lnd decodes (amount and
+  hash from the invoice, never from the database), for a submarine swap
+  whose rebuilt output the node shows unspent with 3 confirmations, paying
+  at least the invoice plus a claim margin; each lockup backs one payment;
+  `cltv_limit` leaves time to claim before the timeout; routing fee at most
+  0.01 % (121 sat floor); no AMP, keysend, custom records, route hints or
+  chosen channels.
+- At most **1 BTC per operation and 2 BTC per 24 hours**, sends and payments
+  together, remembered across restarts. An amount comes back only when lnd
+  itself reports the send refused or the payment FAILED (asked again if a
+  stream ends early); a cancelled stream or "already paid" gives nothing
+  back.
+- On-chain sends and new hold invoices must leave **50,000,000 sat** for the
+  operator's LSP, the LSP's open requests and every send not answered yet.
+- At most **5 open** Lightning → on-chain hold invoices, by the guard's own
+  count.
+- Lookups, cancels and settles only of invoices the backend created through
+  the guard (recorded when lnd answers, never from the database); a hold
+  invoice whose lockup is still out cannot be cancelled.
+- Nothing else: no channels, no `SendMany`, no PSBTs, no macaroons, no
+  mission control reset.
+- Every movement it allows or makes, and every refusal, is posted to the
+  operator's bot by the guard itself.
 
-Tests: `go test ./...` in `guard/` (every rule), and
-[`guard/test/lab.sh`](guard/test/lab.sh) on the regtest lab: the whole e2e
-suite (both directions, ~1 BTC swaps, refunds, rescues with the server down)
-through the guard, then a backend taken over calling lnd directly (sends to
-random addresses, sweeps, random invoices, other services' invoices, forged
-database rows, channels, too-wide macaroons) and the guard stopped. All
-refused.
+Deployment: the backend sits on an internal Docker network (postgres, the
+node through the shim, the guard's API, and lnd's gRPC port through a proxy);
+it has no route to `lnd-net`, the host's LAN or the internet. The guard has
+its own node RPC user (reads and the broadcast of its own spends).
+
+Tests: `go test ./...` in `guard/` (every rule, the claim and refund
+transactions run through the script engine, the rebuilt outputs checked
+against swaps the real backend made), and
+[`guard/test/lab.sh`](guard/test/lab.sh) on the regtest lab: the backend on
+the extended public key with an unrelated `seed.dat`, the e2e suite through
+the guard (both directions, ~1 BTC swaps, user refunds and claims with the
+server down, the guard's own timeout refund), then a backend taken over
+calling lnd directly (the independent review's scenarios among them) and the
+guard stopped.
 
 ## Known limits
 
-- A submarine swap is paid once its lockup pays the swap's lockup address on
-  chain. The guard checks the transaction and its depth, not that the
-  address is really the swap's contract with our claim key. A backend taken
-  over could write a swap pointing at an address of the attacker's, then
-  lock coins there itself and have its own invoice paid: it would get back
-  what it locked plus the payment. The daily limit (2 BTC) bounds it, every
-  payment reaches the operator's bot, and the next step is for the guard to
-  rebuild the contract's address from the swap's script and the service's
-  public key.
 - The guard trusts lnd and the node it asks. Both are the operator's own.
+- Privacy, not funds: the backend's macaroon still reads the node's
+  channels, peers and on-chain transactions (`ListChannels`, `ListPeers`,
+  `GetTransactions`, which the backend uses), and its node RPC user can read
+  any loaded wallet of the node (`listunspent`, `gettransaction`): the
+  node's RPC whitelist is per method, not per wallet.
+- No cooperative refunds: a failed submarine swap waits for its timeout.
+- The guard's refunds are not fee-bumped; it pays the node's estimate (the
+  chain's fees are low). A stuck refund would need a manual replacement.
+- The web app is set to `cooperativeDisabled` (branch `kiloswap`); that
+  build was not run through the UI tests yet.
 
 ## Layout
 

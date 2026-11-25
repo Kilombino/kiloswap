@@ -45,54 +45,61 @@ se copia, cifrada, fuera de la máquina.
 
 ## El guardián
 
-[`guard/`](guard/) es middleware RPC de LND. El macaroon del backend lleva
-la condición `kiloswap=v1`, así que LND le pasa al guardián cada llamada
-hecha con él antes de ejecutarla. Si el guardián no está, LND las rechaza
-todas: falla cerrado.
+[`guard/`](guard/) es un middleware RPC de LND y el único que tiene la clave
+de servidor de los swaps. El macaroon del backend lleva la condición
+`kiloswap=v1`: LND le pasa cada llamada al guardián antes de ejecutarla, y
+las rechaza todas mientras el guardián no esté registrado.
 
-El guardián deja pasar solo esto:
+Está pensado para el caso de que alguien tome el backend y su base de datos:
 
-- **Envíos on-chain**, solo a la dirección de depósito de un swap
-  Lightning → on-chain cuya factura retenida LND tiene como pagada
-  (`ACCEPTED`, por al menos el importe del depósito). Además:
-  - importe exacto y una sola vez;
-  - solo monedas confirmadas, nunca `send_all`;
-  - comisión de red con tope.
-- **Pagos**, solo de la factura de un swap on-chain → Lightning cuyo
-  depósito el nodo ve con 3 confirmaciones y por al menos el importe de la
-  factura. Además:
-  - comisión de ruta como mucho del 0,01 %;
-  - sin AMP, keysend ni rutas forzadas.
-- **Topes de importe:** como mucho **1 BTC por operación y 2 BTC cada 24
-  horas**, contando envíos y pagos juntos. Lo recuerda aunque se reinicie.
-- **Reserva para el LSP:** siempre quedan **50.000.000 sats** para el LSP
-  del operador, más sus peticiones de canal en curso.
-- **Swaps pendientes:** como mucho **5** swaps Lightning → on-chain a la
-  vez.
-- **Facturas:** cancela o cobra solo sus propias facturas retenidas, nunca
-  las de otros servicios.
-- **Nada más:** ni canales, ni `SendMany`, ni PSBT, ni macaroons.
+- **La clave.** La clave de servidor de los swaps (el antiguo `seed.dat`) es
+  solo del guardián. El backend tiene la clave pública extendida: pone
+  nuestras claves públicas en los swaps nuevos y encuentra sus salidas, pero
+  no puede firmar cobros, reembolsos ni gastos por la ruta de clave. No hay
+  firma cooperativa. El guardián hace él mismo todos los gastos del lado del
+  servidor, por la ruta de script y a direcciones de LND: cobra los depósitos
+  submarinos cuando su pago sale bien, reembolsa los inversos tras el plazo
+  y liquida la factura retenida en cuanto el cobro del usuario muestra el
+  preimage en la cadena.
+- **Salidas reconstruidas.** Antes de mover dinero, el guardián reconstruye
+  la salida taproot del swap (MuSig2 de nuestra clave y la del usuario,
+  hojas de cobro y de reembolso, hash, plazo) con nuestra clave y datos que
+  comprueba, y la compara con la dirección o la salida en la cadena.
+- **Envíos on-chain** solo a esa salida de un swap inverso cuya factura
+  retenida creó el backend a través del guardián y LND tiene pagada, con
+  todos los HTLC venciendo bastante después del plazo; una vez por factura,
+  importe exacto, monedas confirmadas y comisión explícita bajo el tope.
+- **Pagos** solo de facturas que LND descodifica (importe y hash de la
+  factura, nunca de la base de datos), de un swap submarino cuya salida
+  reconstruida el nodo ve sin gastar y con 3 confirmaciones, por al menos el
+  importe más un margen de cobro; cada depósito respalda un solo pago; el
+  `cltv_limit` deja tiempo para cobrar antes del plazo; comisión de ruta como
+  mucho 0,01 %; sin elegir canales ni rutas.
+- **1 BTC por operación y 2 BTC cada 24 h**, entre envíos y pagos. Un importe
+  solo se devuelve si LND dice que rechazó el envío o que el pago FALLÓ.
+- **Reserva de 50.000.000 sats** para el LSP, más sus peticiones abiertas y
+  los envíos aún sin respuesta.
+- **Como mucho 5** facturas retenidas abiertas, según la cuenta del propio
+  guardián.
+- Consultas, cancelaciones y liquidaciones solo de facturas que el backend
+  creó a través del guardián; una factura con su depósito fuera no se puede
+  cancelar.
+- Cada movimiento y cada rechazo los avisa el propio guardián al bot.
 
-La base de datos del backend es la palabra del propio backend. Por eso las
-comprobaciones de dinero usan fuentes que el backend no puede escribir: la
-factura de LND y la cadena del nodo.
+El backend está en una red interna de Docker sin salida: no llega a
+`lnd-net`, a la red local ni a internet.
 
 ## Límites conocidos
 
-- **Swaps on-chain → Lightning:** se pagan cuando su depósito paga, en la
-  cadena, la dirección de depósito del swap. El guardián comprueba la
-  transacción y sus confirmaciones, pero no que esa dirección sea de verdad
-  el contrato del swap con nuestra clave.
-  - Si alguien tomara el control del backend, podría apuntar un swap a una
-    dirección suya, depositar ahí sus propias monedas y cobrar su factura:
-    recuperaría lo depositado y se llevaría además el pago.
-  - Lo acotan el tope diario (2 BTC) y que cada pago llega al bot del
-    operador.
-  - El siguiente paso es que el guardián reconstruya la dirección del
-    contrato a partir del script del swap y de la clave pública del
-    servicio.
-- **LND y el nodo:** el guardián se fía de ellos. Los dos son del propio
-  operador.
+- El guardián confía en el LND y el nodo a los que pregunta (los del
+  operador).
+- Privacidad, no fondos: el macaroon del backend aún lee canales, pares y
+  transacciones on-chain del nodo, y su usuario RPC puede leer cualquier
+  cartera cargada (la lista blanca es por método, no por cartera).
+- Sin reembolsos cooperativos: un swap submarino fallido espera al plazo.
+- Los reembolsos del guardián no suben de comisión solos.
+- La web lleva `cooperativeDisabled`; esa compilación aún no ha pasado las
+  pruebas de interfaz.
 
 ## Licencia
 

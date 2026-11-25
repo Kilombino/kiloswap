@@ -5,14 +5,18 @@ package sources
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"google.golang.org/grpc"
@@ -34,7 +38,8 @@ func OpenDB(ctx context.Context, url string) (*DB, error) {
 
 func (d *DB) ReverseByLockup(ctx context.Context, address string) ([]policy.ReverseSwap, error) {
 	rows, err := d.Pool.Query(ctx,
-		`SELECT "lockupAddress", "onchainAmount", "preimageHash", status
+		`SELECT id, "lockupAddress", "onchainAmount", "preimageHash", coalesce("claimPublicKey",''),
+		        coalesce("keyIndex",-1), "timeoutBlockHeight", version
 		   FROM "reverseSwaps" WHERE "lockupAddress" = $1`, address)
 	if err != nil {
 		return nil, err
@@ -43,7 +48,8 @@ func (d *DB) ReverseByLockup(ctx context.Context, address string) ([]policy.Reve
 	var out []policy.ReverseSwap
 	for rows.Next() {
 		var r policy.ReverseSwap
-		if err := rows.Scan(&r.LockupAddress, &r.OnchainAmount, &r.PreimageHash, &r.Status); err != nil {
+		if err := rows.Scan(&r.ID, &r.LockupAddress, &r.OnchainAmount, &r.PreimageHash, &r.ClaimKey,
+			&r.KeyIndex, &r.Timeout, &r.Version); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -51,137 +57,344 @@ func (d *DB) ReverseByLockup(ctx context.Context, address string) ([]policy.Reve
 	return out, rows.Err()
 }
 
-func (d *DB) ReverseByHash(ctx context.Context, hash string) (bool, error) {
-	var n int
-	err := d.Pool.QueryRow(ctx,
-		`SELECT count(*) FROM "reverseSwaps" WHERE "preimageHash" = $1`, strings.ToLower(hash)).Scan(&n)
-	return n > 0, err
-}
-
-// Statuses in which a reverse swap may still lock coins, and those in which
-// it has not locked them yet.
-const pendingStatuses = `('swap.created','invoice.set','invoice.pending','minerfee.paid','transaction.mempool','transaction.confirmed')`
-const unlockedStatuses = `('swap.created','invoice.set','invoice.pending','minerfee.paid')`
-
-func (d *DB) PendingReverse(ctx context.Context) (int, int64, error) {
-	var n int
-	var sat int64
-	err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM "reverseSwaps" WHERE status IN `+pendingStatuses).Scan(&n)
-	if err != nil {
-		return 0, 0, err
-	}
-	err = d.Pool.QueryRow(ctx,
-		`SELECT coalesce(sum("onchainAmount"),0) FROM "reverseSwaps" WHERE status IN `+unlockedStatuses).Scan(&sat)
-	return n, sat, err
-}
-
 func (d *DB) SwapByInvoice(ctx context.Context, invoice string) (*policy.Swap, error) {
 	var s policy.Swap
-	var amt *int64
-	var txid *string
 	err := d.Pool.QueryRow(ctx,
-		`SELECT invoice, "invoiceAmount", status, "lockupAddress", "lockupTransactionId"
+		`SELECT id, "preimageHash", coalesce("refundPublicKey",''), coalesce("keyIndex",-1),
+		        "timeoutBlockHeight", coalesce("lockupTransactionId",''), coalesce("lockupTransactionVout",-1), version
 		   FROM swaps WHERE lower(invoice) = lower($1)`, invoice).
-		Scan(&s.Invoice, &amt, &s.Status, &s.LockupAddress, &txid)
+		Scan(&s.ID, &s.PreimageHash, &s.RefundKey, &s.KeyIndex, &s.Timeout, &s.LockupTxID, &s.LockupVout, &s.Version)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
 			return nil, nil
 		}
 		return nil, err
 	}
-	if amt != nil {
-		s.InvoiceAmount = *amt
-	}
-	if txid != nil {
-		s.LockupTxID = *txid
-	}
 	return &s, nil
 }
 
-// Wallet asks lnd for its on-chain balance with the guard's macaroon.
-type Wallet struct{ Conn grpc.ClientConnInterface }
+// LN is lnd through the guard's own macaroon.
+type LN struct{ Conn grpc.ClientConnInterface }
 
-func (w Wallet) Balance(ctx context.Context) (policy.Balance, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func call(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, 10*time.Second)
+}
+
+func (l LN) Balance(ctx context.Context) (policy.Balance, error) {
+	ctx, cancel := call(ctx)
 	defer cancel()
 	var r lnrpc.WalletBalanceResponse
-	if err := w.Conn.Invoke(ctx, "/lnrpc.Lightning/WalletBalance", &lnrpc.WalletBalanceRequest{}, &r); err != nil {
+	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/WalletBalance", &lnrpc.WalletBalanceRequest{}, &r); err != nil {
 		return policy.Balance{}, err
 	}
 	return policy.Balance{Confirmed: r.ConfirmedBalance, Locked: r.LockedBalance, AnchorReserve: r.ReservedBalanceAnchorChan}, nil
 }
 
-// Invoices asks lnd for its own record of an invoice.
-type Invoices struct{ Conn grpc.ClientConnInterface }
-
-func (i Invoices) Invoice(ctx context.Context, hash []byte) (int32, int64, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+func (l LN) LookupInvoice(ctx context.Context, hash []byte) (*policy.InvoiceInfo, error) {
+	ctx, cancel := call(ctx)
 	defer cancel()
 	var r lnrpc.Invoice
-	if err := i.Conn.Invoke(ctx, "/lnrpc.Lightning/LookupInvoice", &lnrpc.PaymentHash{RHash: hash}, &r); err != nil {
-		return 0, 0, err
+	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/LookupInvoice", &lnrpc.PaymentHash{RHash: hash}, &r); err != nil {
+		if status.Code(err) == codes.NotFound || strings.Contains(err.Error(), "unable to locate invoice") {
+			return nil, nil
+		}
+		return nil, err
 	}
-	return r.State, r.AmtPaidMsat, nil
+	info := &policy.InvoiceInfo{State: r.State, PaidMsat: r.AmtPaidMsat}
+	for _, h := range r.Htlcs {
+		if h.State == 0 || h.State == 1 { // accepted or settled
+			info.HTLCExpiries = append(info.HTLCExpiries, h.ExpiryHeight)
+		}
+	}
+	return info, nil
 }
 
-// Chain asks the node (Knots, JSON-RPC with a whitelisted user) what a
-// transaction pays to an address and how deep it is.
+func (l LN) DecodePayReq(ctx context.Context, payReq string) (*policy.PayReq, error) {
+	ctx, cancel := call(ctx)
+	defer cancel()
+	var r lnrpc.PayReq
+	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/DecodePayReq", &lnrpc.PayReqString{PayReq: payReq}, &r); err != nil {
+		return nil, err
+	}
+	h, err := hex.DecodeString(r.PaymentHash)
+	if err != nil {
+		return nil, err
+	}
+	return &policy.PayReq{Hash: h, AmountMsat: r.NumMsat}, nil
+}
+
+func (l LN) SettleInvoice(ctx context.Context, preimage []byte) error {
+	ctx, cancel := call(ctx)
+	defer cancel()
+	var r emptyMsg
+	return l.Conn.Invoke(ctx, "/invoicesrpc.Invoices/SettleInvoice", &lnrpc.SettleInvoiceMsg{Preimage: preimage}, &r)
+}
+
+func (l LN) CancelInvoice(ctx context.Context, hash []byte) error {
+	ctx, cancel := call(ctx)
+	defer cancel()
+	var r emptyMsg
+	return l.Conn.Invoke(ctx, "/invoicesrpc.Invoices/CancelInvoice", &lnrpc.CancelInvoiceMsg{PaymentHash: hash}, &r)
+}
+
+func (l LN) NewAddress(ctx context.Context) (string, error) {
+	ctx, cancel := call(ctx)
+	defer cancel()
+	var r lnrpc.NewAddressResponse
+	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/NewAddress", &lnrpc.NewAddressRequest{Type: 4}, &r); err != nil {
+		return "", err
+	}
+	return r.Address, nil
+}
+
+var trackDesc = &grpc.StreamDesc{StreamName: "TrackPaymentV2", ServerStreams: true}
+
+// TrackPayment reads lnd's first answer on the payment (its current state).
+func (l LN) TrackPayment(ctx context.Context, hash []byte) (int32, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	st, err := l.Conn.NewStream(ctx, trackDesc, "/routerrpc.Router/TrackPaymentV2")
+	if err != nil {
+		return 0, "", err
+	}
+	if err := st.SendMsg(&lnrpc.TrackPaymentRequest{PaymentHash: hash, NoInflightUpdates: true}); err != nil {
+		return 0, "", err
+	}
+	if err := st.CloseSend(); err != nil {
+		return 0, "", err
+	}
+	var p lnrpc.Payment
+	if err := st.RecvMsg(&p); err != nil {
+		if status.Code(err) == codes.NotFound || strings.Contains(err.Error(), "not found") {
+			return 0, "", nil
+		}
+		return 0, "", err
+	}
+	return p.Status, p.PaymentPreimage, nil
+}
+
+// emptyMsg reads an answer the guard does not need.
+type emptyMsg = lnrpc.WalletBalanceRequest
+
+// Chain asks the node (Knots, JSON-RPC with the guard's own whitelisted
+// user) about transactions, and broadcasts the guard's own spends.
 type Chain struct {
 	URL, User, Password string
 	Client              *http.Client
 }
 
-func (c Chain) PaidTo(ctx context.Context, txid, address string) (int64, int64, error) {
-	body, _ := json.Marshal(map[string]any{"jsonrpc": "1.0", "id": "guard", "method": "getrawtransaction", "params": []any{txid, true}})
+func (c Chain) rpc(ctx context.Context, method string, params []any, out any) error {
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "1.0", "id": "guard", "method": method, "params": params})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.URL, bytes.NewReader(body))
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 	req.SetBasicAuth(c.User, c.Password)
 	req.Header.Set("Content-Type", "application/json")
 	cl := c.Client
 	if cl == nil {
-		cl = &http.Client{Timeout: 10 * time.Second}
+		cl = &http.Client{Timeout: 20 * time.Second}
 	}
 	resp, err := cl.Do(req)
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 	defer resp.Body.Close()
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return 0, 0, err
+		return err
 	}
 	var r struct {
-		Result *struct {
-			Confirmations int64 `json:"confirmations"`
-			Vout          []struct {
-				Value        float64 `json:"value"`
-				ScriptPubKey struct {
-					Address string `json:"address"`
-				} `json:"scriptPubKey"`
-			} `json:"vout"`
-		} `json:"result"`
-		Error *struct {
+		Result json.RawMessage `json:"result"`
+		Error  *struct {
+			Code    int    `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(b, &r); err != nil {
-		return 0, 0, fmt.Errorf("node answer (%d): %w", resp.StatusCode, err)
+		return fmt.Errorf("node answer to %s (%d): %w", method, resp.StatusCode, err)
 	}
 	if r.Error != nil {
-		return 0, 0, fmt.Errorf("node: %s", r.Error.Message)
+		return fmt.Errorf("node %s: %s", method, r.Error.Message)
 	}
-	if r.Result == nil {
-		return 0, 0, fmt.Errorf("node: no transaction %s", txid)
+	if out == nil {
+		return nil
 	}
-	var sat int64
-	for _, o := range r.Result.Vout {
-		if o.ScriptPubKey.Address == address {
-			sat += int64(math.Round(o.Value * 1e8))
+	return json.Unmarshal(r.Result, out)
+}
+
+type rawTx struct {
+	Txid          string `json:"txid"`
+	Confirmations int64  `json:"confirmations"`
+	Vin           []struct {
+		Txid        string   `json:"txid"`
+		Vout        uint32   `json:"vout"`
+		Txinwitness []string `json:"txinwitness"`
+	} `json:"vin"`
+	Vout []struct {
+		Value        json.Number `json:"value"`
+		N            uint32      `json:"n"`
+		ScriptPubKey struct {
+			Hex string `json:"hex"`
+		} `json:"scriptPubKey"`
+	} `json:"vout"`
+}
+
+func sats(v json.Number) (int64, error) {
+	// exact: "1.23456789" BTC to sat without floating point
+	s := v.String()
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	whole, frac, _ := strings.Cut(s, ".")
+	if len(frac) > 8 {
+		return 0, fmt.Errorf("value %s has more than 8 decimals", v)
+	}
+	frac += strings.Repeat("0", 8-len(frac))
+	n, err := strconv.ParseInt(whole+frac, 10, 64)
+	if neg {
+		n = -n
+	}
+	return n, err
+}
+
+func (c Chain) Outputs(ctx context.Context, txid string) ([]policy.Output, error) {
+	var t rawTx
+	if err := c.rpc(ctx, "getrawtransaction", []any{txid, 1}, &t); err != nil {
+		return nil, err
+	}
+	out := make([]policy.Output, len(t.Vout))
+	for i, o := range t.Vout {
+		pk, err := hex.DecodeString(o.ScriptPubKey.Hex)
+		if err != nil {
+			return nil, err
+		}
+		s, err := sats(o.Value)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = policy.Output{PkScript: pk, Sat: s, Confirmations: t.Confirmations}
+	}
+	return out, nil
+}
+
+func (c Chain) Output(ctx context.Context, txid string, vout uint32) (*policy.Output, error) {
+	outs, err := c.Outputs(ctx, txid)
+	if err != nil {
+		return nil, err
+	}
+	if int(vout) >= len(outs) {
+		return nil, fmt.Errorf("transaction %s has no output %d", txid, vout)
+	}
+	return &outs[vout], nil
+}
+
+func (c Chain) Unspent(ctx context.Context, txid string, vout uint32) (bool, error) {
+	var r json.RawMessage
+	if err := c.rpc(ctx, "gettxout", []any{txid, vout, true}, &r); err != nil {
+		return false, err
+	}
+	return len(r) > 0 && string(r) != "null", nil
+}
+
+func (c Chain) Height(ctx context.Context) (int64, error) {
+	var h int64
+	err := c.rpc(ctx, "getblockcount", []any{}, &h)
+	return h, err
+}
+
+func (c Chain) Confirmations(ctx context.Context, txid string) (int64, error) {
+	var t rawTx
+	if err := c.rpc(ctx, "getrawtransaction", []any{txid, 1}, &t); err != nil {
+		return 0, err
+	}
+	return t.Confirmations, nil
+}
+
+func (c Chain) Broadcast(ctx context.Context, rawHex string) (string, error) {
+	var txid string
+	err := c.rpc(ctx, "sendrawtransaction", []any{rawHex}, &txid)
+	return txid, err
+}
+
+func (c Chain) FeeRate(ctx context.Context) (float64, error) {
+	var r struct {
+		Feerate float64 `json:"feerate"` // BTC/kvB
+	}
+	if err := c.rpc(ctx, "estimatesmartfee", []any{2}, &r); err != nil {
+		return 0, err
+	}
+	return r.Feerate * 1e8 / 1000, nil
+}
+
+func witness(hexes []string) ([][]byte, error) {
+	w := make([][]byte, len(hexes))
+	for i, h := range hexes {
+		b, err := hex.DecodeString(h)
+		if err != nil {
+			return nil, err
+		}
+		w[i] = b
+	}
+	return w, nil
+}
+
+// Spender looks in the mempool (gettxspendingprevout), then in the blocks
+// from fromHeight to the tip.
+func (c Chain) Spender(ctx context.Context, txid string, vout uint32, fromHeight int64) (*policy.Spend, error) {
+	find := func(t rawTx, confs int64) (*policy.Spend, error) {
+		for _, in := range t.Vin {
+			if strings.EqualFold(in.Txid, txid) && in.Vout == vout {
+				w, err := witness(in.Txinwitness)
+				if err != nil {
+					return nil, err
+				}
+				return &policy.Spend{TxID: t.Txid, Witness: w, Confirmations: confs}, nil
+			}
+		}
+		return nil, nil
+	}
+	var mp []struct {
+		Spendingtxid string `json:"spendingtxid"`
+	}
+	if err := c.rpc(ctx, "gettxspendingprevout", []any{[]map[string]any{{"txid": txid, "vout": vout}}}, &mp); err == nil {
+		for _, m := range mp {
+			if m.Spendingtxid == "" {
+				continue
+			}
+			var t rawTx
+			if err := c.rpc(ctx, "getrawtransaction", []any{m.Spendingtxid, 1}, &t); err != nil {
+				return nil, err
+			}
+			if s, err := find(t, 0); s != nil || err != nil {
+				return s, err
+			}
 		}
 	}
-	return sat, r.Result.Confirmations, nil
+	tip, err := c.Height(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if fromHeight < 1 || tip-fromHeight > 5000 {
+		fromHeight = tip - 5000
+	}
+	for h := tip; h >= fromHeight; h-- {
+		var hash string
+		if err := c.rpc(ctx, "getblockhash", []any{h}, &hash); err != nil {
+			return nil, err
+		}
+		var b struct {
+			Tx []rawTx `json:"tx"`
+		}
+		if err := c.rpc(ctx, "getblock", []any{hash, 2}, &b); err != nil {
+			return nil, err
+		}
+		for _, t := range b.Tx {
+			if s, err := find(t, tip-h+1); s != nil || err != nil {
+				return s, err
+			}
+		}
+	}
+	return nil, nil
 }
 
 // LSP reads the LSP's state file. Requests waiting for payment or paid

@@ -8,27 +8,97 @@ import (
 	"time"
 )
 
-// Entry is one amount the guard let through.
+// Entry is one amount the guard let through (the daily limit).
 type Entry struct {
 	Key  string    `json:"key"`
 	Sat  int64     `json:"sat"`
 	At   time.Time `json:"at"`
-	Done bool      `json:"done"` // an on-chain send: never again
+	Done bool      `json:"done"` // moved for good: never released
 }
 
-// Ledger is the guard's memory, kept on disk so a restart forgets nothing:
-// what it let through in the last days (the daily limit, lockups sent once)
-// and the hold invoices the backend created (the only ones it may cancel or
-// settle).
+// Hold is a hold invoice the backend created through the guard. It is
+// recorded only once lnd has answered that it exists.
+type Hold struct {
+	Sat   int64     `json:"sat"`
+	At    time.Time `json:"at"`
+	State string    `json:"state"` // open, settled, canceled
+}
+
+// Lockup is an on-chain send the guard allowed for a reverse swap, with the
+// output it rebuilt itself: what it will settle (the user's claim reveals
+// the preimage) or refund (after the timeout) on its own.
+type Lockup struct {
+	SwapID   string    `json:"swapId"`
+	Hash     string    `json:"hash"`
+	Address  string    `json:"address"`
+	Sat      int64     `json:"sat"`
+	KeyIndex uint32    `json:"keyIndex"`
+	UserKey  string    `json:"userKey"`
+	Timeout  uint32    `json:"timeout"`
+	TxID     string    `json:"txid,omitempty"`
+	Vout     int32     `json:"vout"` // -1 until found
+	State    string    `json:"state"`
+	At       time.Time `json:"at"`
+	SentAt   int64     `json:"sentHeight,omitempty"`
+	RefundTx string    `json:"refundTx,omitempty"`
+	Preimage string    `json:"preimage,omitempty"`
+	Note     string    `json:"note,omitempty"`
+}
+
+// Lockup states.
+const (
+	LockApproved  = "approved"  // allowed, lnd has not answered
+	LockSent      = "sent"      // on chain
+	LockClaimed   = "claimed"   // the user claimed: preimage known, settle pending
+	LockSettled   = "settled"   // our hold invoice settled
+	LockRefunding = "refunding" // our refund broadcast
+	LockRefunded  = "refunded"  // our refund confirmed
+)
+
+// Payment is a submarine swap's invoice the guard allowed to be paid, with
+// the lockup output it checked: what it claims on its own once paid.
+type Payment struct {
+	SwapID    string    `json:"swapId"`
+	Hash      string    `json:"hash"`
+	Sat       int64     `json:"sat"`
+	Request   uint64    `json:"request"`
+	State     string    `json:"state"`
+	Preimage  string    `json:"preimage,omitempty"`
+	KeyIndex  uint32    `json:"keyIndex"`
+	UserKey   string    `json:"userKey"`
+	Timeout   uint32    `json:"timeout"`
+	LockupTx  string    `json:"lockupTx"`
+	Vout      uint32    `json:"vout"`
+	LockupSat int64     `json:"lockupSat"`
+	ClaimTx   string    `json:"claimTx,omitempty"`
+	ClaimFee  int64     `json:"claimFee,omitempty"`
+	At        time.Time `json:"at"`
+}
+
+// Payment states.
+const (
+	PayInflight  = "inflight"
+	PayUnknown   = "unknown" // the stream ended without a final state
+	PaySucceeded = "succeeded"
+	PayFailed    = "failed"
+	PayClaimed   = "claimed"
+)
+
+// Ledger is the guard's memory, on disk so a restart forgets nothing. Only
+// the guard writes it; nothing in it comes from the backend's word alone.
 type Ledger struct {
-	mu      sync.Mutex
-	path    string
-	Entries map[string]Entry     `json:"entries"`
-	Holds   map[string]time.Time `json:"holds"`
-	now     func() time.Time
+	mu        sync.Mutex
+	path      string
+	Entries   map[string]Entry     `json:"entries"`
+	Holds     map[string]*Hold     `json:"holds"`
+	Lockups   map[string]*Lockup   `json:"lockups"`   // by payment hash
+	Payments  map[string]*Payment  `json:"payments"`  // by payment hash
+	Outpoints map[string]string    `json:"outpoints"` // txid:vout -> payment hash
+	Invoices  map[string]time.Time `json:"invoices"`  // AddInvoice hashes
+	now       func() time.Time
 }
 
-// keep is how long entries and holds are remembered.
+// keep is how long finished records are remembered.
 const keep = 30 * 24 * time.Hour
 
 // OpenLedger reads the ledger at path ("" keeps it in memory, for tests).
@@ -36,7 +106,8 @@ func OpenLedger(path string, now func() time.Time) (*Ledger, error) {
 	if now == nil {
 		now = time.Now
 	}
-	l := &Ledger{path: path, Entries: map[string]Entry{}, Holds: map[string]time.Time{}, now: now}
+	l := &Ledger{path: path, now: now}
+	l.init()
 	if path == "" {
 		return l, nil
 	}
@@ -50,14 +121,38 @@ func OpenLedger(path string, now func() time.Time) (*Ledger, error) {
 	if err := json.Unmarshal(b, l); err != nil {
 		return nil, err
 	}
+	l.init()
+	return l, nil
+}
+
+func (l *Ledger) init() {
 	if l.Entries == nil {
 		l.Entries = map[string]Entry{}
 	}
 	if l.Holds == nil {
-		l.Holds = map[string]time.Time{}
+		l.Holds = map[string]*Hold{}
 	}
-	return l, nil
+	if l.Lockups == nil {
+		l.Lockups = map[string]*Lockup{}
+	}
+	if l.Payments == nil {
+		l.Payments = map[string]*Payment{}
+	}
+	if l.Outpoints == nil {
+		l.Outpoints = map[string]string{}
+	}
+	if l.Invoices == nil {
+		l.Invoices = map[string]time.Time{}
+	}
 }
+
+// Lock and Unlock guard every read and write of the maps.
+func (l *Ledger) Lock()   { l.mu.Lock() }
+func (l *Ledger) Unlock() { l.mu.Unlock() }
+
+// Save writes the ledger (caller holds the lock): temporary file synced,
+// renamed, directory synced, so a power cut leaves the old or the new.
+func (l *Ledger) Save() error { return l.save() }
 
 func (l *Ledger) save() error {
 	if l.path == "" {
@@ -69,9 +164,24 @@ func (l *Ledger) save() error {
 			delete(l.Entries, k)
 		}
 	}
-	for h, at := range l.Holds {
-		if at.Before(cut) {
+	for h, x := range l.Holds {
+		if x.State != "open" && x.At.Before(cut) {
 			delete(l.Holds, h)
+		}
+	}
+	for h, x := range l.Lockups {
+		if (x.State == LockSettled || x.State == LockRefunded) && x.At.Before(cut) {
+			delete(l.Lockups, h)
+		}
+	}
+	for h, x := range l.Payments {
+		if (x.State == PayClaimed || x.State == PayFailed) && x.At.Before(cut) {
+			delete(l.Payments, h)
+		}
+	}
+	for h, at := range l.Invoices {
+		if at.Before(cut) {
+			delete(l.Invoices, h)
 		}
 	}
 	b, err := json.MarshalIndent(l, "", " ")
@@ -79,45 +189,33 @@ func (l *Ledger) save() error {
 		return err
 	}
 	tmp := l.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, l.path); err != nil {
 		return err
 	}
-	d, err := os.Open(filepath.Dir(l.path))
-	if err == nil {
+	if d, err := os.Open(filepath.Dir(l.path)); err == nil {
 		_ = d.Sync()
 		d.Close()
 	}
 	return nil
 }
 
-func (l *Ledger) Get(key string) (Entry, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	e, ok := l.Entries[key]
-	return e, ok
-}
-
-func (l *Ledger) Put(e Entry) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.Entries[e.Key] = e
-	return l.save()
-}
-
-func (l *Ledger) Delete(key string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	delete(l.Entries, key)
-	return l.save()
-}
-
-// Since sums what went through after t.
-func (l *Ledger) Since(t time.Time) int64 {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// since sums the entries after t (caller holds the lock).
+func (l *Ledger) since(t time.Time) int64 {
 	var s int64
 	for _, e := range l.Entries {
 		if e.At.After(t) {
@@ -125,18 +223,4 @@ func (l *Ledger) Since(t time.Time) int64 {
 		}
 	}
 	return s
-}
-
-func (l *Ledger) AddHold(hash string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.Holds[hash] = l.now()
-	return l.save()
-}
-
-func (l *Ledger) HasHold(hash string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	_, ok := l.Holds[hash]
-	return ok
 }

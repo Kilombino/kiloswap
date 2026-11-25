@@ -19,6 +19,8 @@ service Lightning {
         returns (stream RPCMiddlewareRequest);
     rpc WalletBalance (WalletBalanceRequest) returns (WalletBalanceResponse);
     rpc LookupInvoice (PaymentHash) returns (Invoice);
+    rpc DecodePayReq (PayReqString) returns (PayReq);
+    rpc NewAddress (NewAddressRequest) returns (NewAddressResponse);
 }
 
 message RPCMiddlewareRequest {
@@ -115,12 +117,75 @@ message Invoice {
     int64 amt_paid_msat = 20;
     // OPEN = 0, SETTLED = 1, CANCELED = 2, ACCEPTED = 3
     int32 state = 21;
+    repeated InvoiceHTLC htlcs = 22;
+}
+message InvoiceHTLC {
+    uint64 chan_id = 1;
+    uint64 htlc_index = 2;
+    uint64 amt_msat = 3;
+    int32 accept_height = 4;
+    int64 accept_time = 5;
+    int64 resolve_time = 6;
+    int32 expiry_height = 7;
+    // ACCEPTED = 0, SETTLED = 1, CANCELED = 2
+    int32 state = 8;
+}
+message PayReqString {
+    string pay_req = 1;
+}
+message PayReq {
+    string destination = 1;
+    string payment_hash = 2;
+    int64 num_satoshis = 3;
+    int64 timestamp = 4;
+    int64 expiry = 5;
+    int64 cltv_expiry = 9;
+    int64 num_msat = 12;
+}
+message NewAddressRequest {
+    // WITNESS_PUBKEY_HASH = 0, TAPROOT_PUBKEY = 4
+    int32 type = 1;
+    string account = 2;
+}
+message NewAddressResponse {
+    string address = 1;
+}
+message SendCoinsResponse {
+    string txid = 1;
+}
+message AddInvoiceResponse {
+    bytes r_hash = 1;
+    string payment_request = 2;
+    uint64 add_index = 16;
+    bytes payment_addr = 17;
+}
+message AddHoldInvoiceResp {
+    string payment_request = 1;
+    uint64 add_index = 2;
+    bytes payment_addr = 3;
+}
+message SubscribeSingleInvoiceRequest {
+    reserved 1;
+    bytes r_hash = 2;
+}
+message TrackPaymentRequest {
+    bytes payment_hash = 1;
+    bool no_inflight_updates = 2;
 }
 
 // A payment update of SendPaymentV2; only its status is read
 // (IN_FLIGHT 1, SUCCEEDED 2, FAILED 3, INITIATED 4).
 message Payment {
+    string payment_hash = 1;
+    string payment_preimage = 6;
+    int64 value_sat = 7;
+    int64 value_msat = 8;
+    string payment_request = 9;
+    // IN_FLIGHT = 1, SUCCEEDED = 2, FAILED = 3, INITIATED = 4
     int32 status = 10;
+    int64 fee_sat = 11;
+    int64 fee_msat = 12;
+    int32 failure_reason = 16;
 }
 
 // invoicesrpc

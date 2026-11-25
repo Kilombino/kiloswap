@@ -22,18 +22,29 @@ datos en `${KILOSWAP_ROOT}`.
    - Web: `Kilombino/kiloswap-webapp`, rama `kiloswap`, compilada con
      `bun run mainnet && bun run build:regular`. El resultado va a
      `${KILOSWAP_ROOT}/webapp`.
-2. **`deploy/.env`**: copiar `.env.example` y ajustarlo. Después,
-   `./setup.sh`. Imprime la línea `rpcauth=kiloswap:…` para el nodo.
-3. **Cartera vacía del backend en el nodo**, en caliente:
+2. **La clave de los swaps, solo en el guardián.** Instalación nueva:
+   `docker run --rm kiloswap/guard newseed > ${KILOSWAP_ROOT}/secrets/swap_seed`
+   (24 palabras; anotarlas en papel junto a las de LND). Si ya hubo un
+   backend con su `seed.dat`, ese archivo se **mueve** a
+   `secrets/swap_seed` y en `boltz/` se deja uno nuevo y sin relación
+   (`kiloswap/guard newseed`): el backend solo tendrá la xpub.
+3. **`deploy/.env`**: copiar `.env.example` y ajustarlo. Después,
+   `./setup.sh`. Escribe la xpub para el backend (`secrets/swap_xpub`), el
+   token del API del guardián y las dos líneas `rpcauth=` para el nodo
+   (`kiloswap` para el backend y el shim, `kiloswap-guard` para el
+   guardián).
+4. **Cartera vacía del backend en el nodo**, en caliente:
    `bitcoin-cli createwallet kiloswap-empty true true`
    (sin claves y en blanco, solo para los caminos raros del backend).
-4. **Macaroons**, en caliente: `./bake-macaroons.sh`.
+5. **Macaroons**, en caliente: `./bake-macaroons.sh`.
    - Las raíces 31 y 32 están libres hoy (`lncli listmacaroonids`).
    - El macaroon del backend lleva la condición `kiloswap=v1`. Mientras
      LND no tenga el middleware activado, la condición no se comprueba.
      Por eso **no se arranca el backend hasta después de la ventana**.
-5. **Red del stack**: `docker compose up --no-start`. Crea la red
-   `172.30.91.0/24` sin arrancar nada.
+6. **Redes del stack**: `docker compose up --no-start`. Crea
+   `172.30.91.0/24` (shim, guardián y web hacia fuera) y la interna
+   `172.30.92.0/24` (sin salida: backend, postgres, guardián, shim y
+   `lnd-proxy`) sin arrancar nada.
 
 ## Ventana (cuando no haya alquileres de MRR a punto de acabar)
 
@@ -49,7 +60,9 @@ en los 15 minutos siguientes.
    zmqpubrawtx=tcp://<IP-del-host>:28333
    rpcallowip=172.30.91.0/24
    rpcauth=kiloswap:<lo que imprime setup.sh>
-   rpcwhitelist=kiloswap:getblock,getblockhash,getblockheader,getblockchaininfo,getbestblockhash,getblockcount,getrawtransaction,gettxout,gettxspendingprevout,getrawmempool,getmempoolinfo,getmempoolentry,estimatesmartfee,getnetworkinfo,getdeploymentinfo,getzmqnotifications,uptime,sendrawtransaction,testmempoolaccept,getnewaddress,getbalances,listunspent,gettransaction,getwalletinfo,getpeerinfo,getnodeaddresses
+   rpcauth=kiloswap-guard:<lo que imprime setup.sh>
+   rpcwhitelist=kiloswap:getblock,getblockhash,getblockheader,getblockchaininfo,getbestblockhash,getblockcount,getrawtransaction,gettxout,gettxspendingprevout,getrawmempool,getmempoolinfo,getmempoolentry,estimatesmartfee,getnetworkinfo,getdeploymentinfo,getzmqnotifications,uptime,sendrawtransaction,testmempoolaccept,getnewaddress,listunspent,gettransaction
+   rpcwhitelist=kiloswap-guard:getrawtransaction,gettxout,getblockcount,getblockhash,getblock,gettxspendingprevout,estimatesmartfee,sendrawtransaction
    # IMPRESCINDIBLE: sin esto, la lista blanca de arriba deja SIN PERMISOS
    # a todos los demás usuarios (LND, mempool, DATUM, Kilobot…)
    rpcwhitelistdefault=0
@@ -57,11 +70,17 @@ en los 15 minutos siguientes.
    - **ZMQ** escucha en la IP de la red local. El cortafuegos ya deja pasar
      a `172.16.0.0/12` (los contenedores) y a la red local, y solo publica
      bloques y transacciones (nada privado).
-   - **Lista blanca**: son las llamadas que hacen el backend, el shim y el
-     guardián, sacadas del registro RPC del laboratorio. Se añaden unas
-     pocas de lectura de cartera (`getbalances`, `listunspent`,
-     `gettransaction`, `getwalletinfo`, `getmempoolentry`) que no salieron
-     en el registro, para los caminos raros con la cartera vacía.
+   - **Listas blancas**: el backend y el shim, las llamadas sacadas del
+     registro RPC del laboratorio más `listunspent`, `gettransaction` y
+     `getnewaddress` para los caminos raros con la cartera vacía (fuera
+     `getpeerinfo`, `getnodeaddresses`, `getbalances` y `getwalletinfo`, que
+     el backend de BTC no usa). El guardián tiene su propio usuario, solo
+     con lo que lee y la difusión de sus propios cobros y reembolsos.
+   - **Fuga de privacidad conocida:** la lista blanca es por método, no por
+     cartera. Con `/wallet/<nombre>`, el usuario `kiloswap` puede leer
+     `listunspent` y `gettransaction` de cualquier cartera cargada (p. ej.
+     otra, de solo vigilancia) y pedirle direcciones. No puede gastar
+     (no tiene `send*`, `sign*`, `walletprocesspsbt` ni `walletpassphrase`).
 3. **Añadir a `lnd.conf`**:
    ```
    [rpcmiddleware]
@@ -95,9 +114,13 @@ en él.
 
 ## Después (sin cortes)
 
-1. `docker compose up -d postgres shim guard`
+1. `docker compose up -d postgres shim lnd-proxy guard`
    - Los logs del guardián deben decir `registered with lnd for the
      "kiloswap" caveat`.
+   - El guardián hace él mismo los cobros de los swaps submarinos (tras el
+     pago, por la hoja de cobro) y los reembolsos de los inversos (tras el
+     plazo, por la hoja de reembolso), siempre a direcciones de LND, y
+     liquida la factura retenida cuando el usuario cobra on-chain.
 2. `docker compose up -d boltz`
    - Arranca el backend y crea sus tablas.
    - Después, `./db-roles.sh`. El guardián lee las dos tablas con su
@@ -105,6 +128,8 @@ en él.
 3. **Prueba de que el guardián manda.** Con el macaroon del backend:
    - `sendcoins` a una dirección cualquiera → rechazado por
      "kiloswap guard".
+   - En los logs del backend: `swap keys: extended public key at m/0/0
+     (signing is the guard's)`.
    - Con el guardián parado (`docker compose stop guard`) → LND rechaza
      incluso `getinfo`.
    - Volverlo a arrancar.
@@ -134,8 +159,10 @@ en él.
        abrir swap.kilombino.com directamente.
 6. **Avisos:** `watch/watch.env.example` →
    `~/.config/kiloswap-watch/watch.env` y el servicio de usuario
-   `kiloswap-watch`. El guardián le manda sus rechazos a
-   `172.30.91.1:9599`.
+   `kiloswap-watch`. El guardián le manda a `172.30.91.1:9599` cada
+   rechazo y cada movimiento que permite o hace él (depósito permitido y
+   enviado, pago permitido, pagado o fallido, cobro, reembolso,
+   liquidación): esos avisos no dependen de la base de datos del backend.
 7. **Copias:**
    - Contraseña en `/root/kiloswap-backup/passphrase` (600).
    - Timer `kiloswap-backup.timer` para la copia diaria completa.
@@ -152,3 +179,6 @@ en él.
   usuarios recuperan sus fondos con su clave de rescate cuando vence el
   plazo.
 - **Revocar el acceso del backend a LND:** `lncli deletemacaroonid 31`.
+- **Sin cooperativo:** el servidor no firma nada. Un usuario cuyo swap
+  submarino falla recupera sus fondos con su clave de rescate **cuando
+  vence el plazo** (unos 3 días), no al momento.
