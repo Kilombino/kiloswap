@@ -142,3 +142,10 @@ func (o *Output) PreimageFromClaim(witness [][]byte, paymentHash []byte) ([]byte
 }
 
 func sha256sum(b []byte) []byte { h := sha256.Sum256(b); return h[:] }
+
+// SpendsLeaf tells whether a script-path witness spends through leaf (its
+// next-to-last item is the leaf's script).
+func (o *Output) SpendsLeaf(witness [][]byte, leaf txscript.TapLeaf) bool {
+	n := len(witness)
+	return n >= 3 && bytes.Equal(witness[n-2], leaf.Script)
+}

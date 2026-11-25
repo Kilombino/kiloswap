@@ -152,13 +152,32 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 		return "", 0, errors.New("the lockup output changed")
 	}
 	height, _ := p.Chain.Height(ctx)
-	sp := &spendFee{urgent: p.urgent(x, height)}
+	// a claim broadcast before a crash, not recorded: only our key can spend
+	// the claim leaf, so a claim-leaf spend is ours
+	if unspent, err := p.Chain.Unspent(ctx, x.LockupTx, x.Vout); err == nil && !unspent {
+		if sp, err := p.Chain.Spender(ctx, x.LockupTx, x.Vout, height-maxScanBack); err == nil && sp != nil && out.SpendsLeaf(sp.Witness, out.ClaimLeaf) {
+			p.Ledger.Lock()
+			x.ClaimTx, x.State = sp.TxID, PayClaimed
+			x.Bump = Bump{TxIDs: []string{sp.TxID}, Dest: x.Bump.Dest, Height: height, Rate: 1}
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+			p.notify("claimed", map[string]any{"swap": x.SwapID, "txid": sp.TxID, "recovered": true})
+			return sp.TxID, 0, nil
+		}
+	}
+	// the same address on every attempt (a failed broadcast must not burn
+	// a new address of lnd's each round)
+	sp := &spendFee{urgent: p.urgent(x, height), dest: x.Bump.Dest}
 	tx, fee, err := p.spendLeafWith(ctx, out, out.ClaimLeaf, x.LockupTx, x.Vout, o, 0, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, preimage, leaf, cb}
 	}, server, sp)
 	if err != nil {
 		return "", 0, err
 	}
+	p.Ledger.Lock()
+	x.Bump.Dest = sp.dest
+	_ = p.Ledger.save()
+	p.Ledger.Unlock()
 	txid, err := p.broadcast(ctx, tx)
 	if err != nil {
 		return "", 0, err
@@ -412,6 +431,16 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 		if pre, ok := out.PreimageFromClaim(sp.Witness, hash); ok {
 			return p.settleClaimed(ctx, l, pre, sp.TxID)
 		}
+		if (l.State == LockSent || l.State == LockRefunding) && !l.Bump.Ours(sp.TxID) && !strings.EqualFold(sp.TxID, l.RefundTx) &&
+			out.SpendsLeaf(sp.Witness, out.RefundLeaf) {
+			// our refund, broadcast before a crash and not recorded: only our
+			// key can spend the refund leaf
+			p.Ledger.Lock()
+			l.State, l.RefundTx = LockRefunding, sp.TxID
+			l.Bump.TxIDs = append(l.Bump.TxIDs, sp.TxID)
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+		}
 		if l.State == LockRefunding && (strings.EqualFold(sp.TxID, l.RefundTx) || l.Bump.Ours(sp.TxID)) {
 			if sp.Confirmations < 1 {
 				return p.bumpRefund(ctx, l, out, o, vout, height, true)
@@ -495,6 +524,9 @@ func (p *Policy) Refund(ctx context.Context, swapID string) (string, int64, erro
 	}
 	if l.RefundTx != "" {
 		return l.RefundTx, 0, nil
+	}
+	if l.State != LockSent {
+		return "", 0, fmt.Errorf("%w: the lockup is %s", ErrNotYet, l.State)
 	}
 	height, err := p.Chain.Height(ctx)
 	if err != nil {
@@ -669,6 +701,13 @@ func (p *Policy) watchClaim(ctx context.Context, x *Payment, height int64) error
 		if err != nil || sp == nil {
 			return nil // not found yet
 		}
+		if !x.Bump.Ours(sp.TxID) && p.claimLeafSpend(x, sp) {
+			p.Ledger.Lock()
+			x.Bump.TxIDs = append(x.Bump.TxIDs, sp.TxID) // ours, from before a crash
+			x.ClaimTx = sp.TxID
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+		}
 		if !x.Bump.Ours(sp.TxID) {
 			p.Ledger.Lock()
 			x.Bump.Done = true
@@ -774,6 +813,16 @@ func (p *Policy) closeHolds(ctx context.Context) {
 			state = "canceled"
 		case inv.State == InvoiceSettled:
 			state = "settled"
+		case inv.State == InvoiceAccepted && p.MaxHoldParts > 0 && len(inv.HTLCExpiries) > p.MaxHoldParts:
+			// too many parts hold too many of the channels' HTLC slots (the
+			// bridge's and the LSP's too): cancel it, unless it has a lockup
+			p.Ledger.Lock()
+			_, locked := p.Ledger.Lockups[h]
+			p.Ledger.Unlock()
+			if !locked && p.LN.CancelInvoice(ctx, hash) == nil {
+				state = "canceled"
+				p.notify("guard_hold_canceled", map[string]any{"hash": h, "htlcs": len(inv.HTLCExpiries)})
+			}
 		}
 		if state == "" {
 			// a cancel allowed whose answer never came: open again unless
@@ -804,4 +853,23 @@ func (p *Policy) cancelPending(hash string) bool {
 		}
 	}
 	return false
+}
+
+// maxScanBack bounds how far back a recovery looks for a spend.
+const maxScanBack = 1500
+
+// claimLeafSpend tells whether sp spends x's lockup through the claim leaf
+// (which only our key can sign).
+func (p *Policy) claimLeafSpend(x *Payment, sp *Spend) bool {
+	hash, _ := hex.DecodeString(x.Hash)
+	server, err := p.Keys.Public(x.KeyIndex)
+	if err != nil {
+		return false
+	}
+	user, err := p.userKey(x.UserKey)
+	if err != nil {
+		return false
+	}
+	out, err := swapscript.Build(swapscript.Params{Kind: swapscript.Submarine, Server: server, User: user, PaymentHash: hash, Timeout: x.Timeout})
+	return err == nil && out.SpendsLeaf(sp.Witness, out.ClaimLeaf)
 }

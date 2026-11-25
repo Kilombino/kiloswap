@@ -1277,3 +1277,83 @@ func TestHeavyCallsRateLimited(t *testing.T) {
 	_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
 	mustRefuse(t, err, "a minute")
 }
+
+// A claim broadcast before a crash and never recorded is recognised (only
+// our key spends the claim leaf) instead of failing every round.
+func TestUnrecordedClaimRecovered(t *testing.T) {
+	e := newEnv(t)
+	inv, s, pre := e.submarine(117, 100_000, 200_000, 117)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: hex.EncodeToString(pre)}, false)
+	if _, _, err := e.p.Claim(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	tx := e.chain.broadcast[0]
+	// the crash: the ledger lost the claim
+	x := e.p.Ledger.Payments[s.PreimageHash]
+	x.State, x.ClaimTx, x.Bump = PaySucceeded, "", Bump{}
+	txid, _, err := e.p.Claim(context.Background(), s.ID)
+	if err != nil || txid != tx.TxHash().String() || len(e.chain.broadcast) != 1 {
+		t.Fatalf("not recovered: %v %s (%d broadcasts)", err, txid, len(e.chain.broadcast))
+	}
+}
+
+// Likewise an unrecorded refund of a reverse lockup.
+func TestUnrecordedRefundRecovered(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(118, 1_000_000, 118)
+	txid, _ := e.sent(r, 118)
+	e.chain.height = 1100
+	e.p.Tick(context.Background())
+	_, hash := preimage(118)
+	l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]
+	l.State, l.RefundTx, l.Bump = LockSent, "", Bump{}
+	n := len(e.chain.broadcast)
+	e.chain.spenders[txid+":1"].Confirmations = 3
+	e.p.Tick(context.Background())
+	if l.State != LockRefunded || len(e.chain.broadcast) != n {
+		t.Fatalf("not recovered: %s, %d broadcasts", l.State, len(e.chain.broadcast)-n)
+	}
+}
+
+// A hold invoice of ours holding too many HTLCs is cancelled.
+func TestHoldWithTooManyPartsCancelled(t *testing.T) {
+	e := newEnv(t)
+	e.reverse(119, 1_000_000, 119)
+	_, hash := preimage(119)
+	inv := e.ln.invoices[hex.EncodeToString(hash)]
+	inv.HTLCExpiries = make([]int32, 20)
+	e.p.Tick(context.Background())
+	if inv.State != InvoiceCanceled {
+		t.Fatal("a hold invoice with 20 HTLCs was kept")
+	}
+}
+
+// The API's refund only for a lockup on chain; slots expire for unpaid holds.
+func TestRefundStateAndSlots(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(120, 1_000_000, 120)
+	_, err := e.call(sendURI, sendReq(r))
+	mustAllow(t, err)
+	e.chain.height = 1200
+	if _, _, err := e.p.Refund(context.Background(), r.ID); err == nil || !strings.Contains(err.Error(), "approved") {
+		t.Fatalf("refunded a lockup not on chain: %v", err)
+	}
+	e2 := newEnv(t)
+	at := time.Unix(1_800_000_000, 0)
+	e2.p.Now = func() time.Time { return at }
+	e2.p.HoldSlotTime = 15 * time.Minute
+	for i := byte(0); i < 5; i++ {
+		_, hash := preimage(130 + i)
+		id, err := e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+		mustAllow(t, err)
+		e2.answer(id, &lnrpc.AddHoldInvoiceResp{PaymentRequest: "x"}, false)
+	}
+	_, hash := preimage(140)
+	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	mustRefuse(t, err, "pending")
+	at = at.Add(20 * time.Minute)
+	_, err = e2.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	mustAllow(t, err)
+}

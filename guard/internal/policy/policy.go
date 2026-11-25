@@ -260,6 +260,9 @@ type Policy struct {
 	ReverseMarginBlocks int64
 	// MaxHoldCltv is the most cltv_expiry a hold invoice may ask.
 	MaxHoldCltv uint64
+	// HoldSlotTime is how long an unpaid hold invoice counts against
+	// MaxPendingReverse.
+	HoldSlotTime time.Duration
 	// MaxSubTimeoutBlocks is the most a submarine swap's timeout may be
 	// ahead (a long one ties the payment's outcome up for days).
 	MaxSubTimeoutBlocks int64
@@ -519,13 +522,21 @@ func (p *Policy) available(ctx context.Context) (int64, error) {
 func (p *Policy) promised() int64 {
 	var s int64
 	for h, x := range p.Ledger.Holds {
-		if x.State != "open" {
+		if x.State != "open" && x.State != HoldCanceling {
 			continue
 		}
 		if _, locked := p.Ledger.Lockups[h]; !locked {
 			s += x.Sat
 		}
 	}
+	// and those allowed whose creation lnd has not confirmed yet
+	p.pmu.Lock()
+	for _, r := range p.pending {
+		if r.method == "/invoicesrpc.Invoices/AddHoldInvoice" {
+			s += r.sat
+		}
+	}
+	p.pmu.Unlock()
 	return s
 }
 
@@ -533,8 +544,14 @@ func (p *Policy) promised() int64 {
 // lnd has not confirmed yet (so two at once cannot both pass the limit).
 func (p *Policy) openHolds() int {
 	n := 0
-	for _, x := range p.Ledger.Holds {
-		if x.State == "open" {
+	for h, x := range p.Ledger.Holds {
+		if x.State != "open" {
+			continue
+		}
+		// an unpaid invoice holds a slot only for a while (its amount stays
+		// promised until it is closed): slots are not for squatting
+		_, locked := p.Ledger.Lockups[h]
+		if locked || p.HoldSlotTime <= 0 || p.now().Sub(x.At) < p.HoldSlotTime {
 			n++
 		}
 	}
@@ -722,8 +739,11 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 		others -= h.Sat
 	}
 	avail -= others
-	if l.Sat > avail {
-		return refuse("%d sat would cut into the LSP reserve (%d available)", l.Sat, avail)
+	// the lockup's own fee and a refund at the highest rate come out of the
+	// same coins
+	need := l.Sat + 2*ClaimVbytes*p.MaxFeeRate
+	if need > avail {
+		return refuse("%d sat (with the lockup's and a refund's fees) would cut into the LSP reserve (%d available)", need, avail)
 	}
 	l.At, l.SentAt = now, height
 	p.Ledger.Lockups[l.Hash] = l

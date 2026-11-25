@@ -187,6 +187,7 @@ func main() {
 		ApprovedExpireBlocks: num("APPROVED_EXPIRE_BLOCKS", 72),
 		MaxSubTimeoutBlocks:  num("MAX_SUB_TIMEOUT_BLOCKS", 1200),
 		MaxInflightPayments:  int(num("MAX_INFLIGHT_PAYMENTS", 10)),
+		HoldSlotTime:         time.Duration(num("HOLD_SLOT_MINUTES", 15)) * time.Minute,
 		Net:                  net,
 		Swaps:                db,
 		LN:                   sources.LN{Conn: conn},
