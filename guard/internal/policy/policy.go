@@ -232,14 +232,44 @@ type Policy struct {
 	HoldExpiryDelta   int64   // lnd's invoices.holdexpirydelta (18)
 	SafetyBlocks      int64   // margin to settle or claim before a deadline
 	ClaimMarginSat    int64   // a submarine lockup over the invoice by this
-	Net               *chaincfg.Params
-	Swaps             Swaps
-	LN                Lightning
-	Chain             Chain
-	Keys              Keys
-	LSP               LSP
-	Ledger            *Ledger
-	Now               func() time.Time
+	// MinInvoiceSat is the smallest submarine invoice paid (smaller ones
+	// cost more to claim than they bring).
+	MinInvoiceSat int64
+	// ClaimMarginBlocks is how many blocks before a submarine swap's
+	// timeout the payment must be final (cltv_limit) so that the guard's
+	// claim confirms even against a peer that holds the HTLC to its expiry.
+	ClaimMarginBlocks int64
+	// MinSubTimeoutBlocks is the least a submarine swap's timeout may be
+	// ahead when its invoice is paid.
+	MinSubTimeoutBlocks int64
+	// ConfTiers scale a submarine lockup's required depth with its amount
+	// (a reorg with ~50% of the hash rate is cheaper for small amounts):
+	// the first tier whose MaxSat covers the lockup applies.
+	ConfTiers []ConfTier
+	// UrgentBlocks: a claim this close to the timeout pays whatever it
+	// takes, up to UrgentFeeFraction of the lockup, past MaxFeeRate.
+	UrgentBlocks      int64
+	UrgentFeeFraction float64
+	// MaxHoldParts is the most HTLCs a hold invoice may hold when its
+	// lockup is sent (each one takes a slot the bridge and LSP share).
+	MaxHoldParts int
+	// ReverseMarginBlocks: every HTLC of a hold invoice must outlast the
+	// lockup's timeout by HoldExpiryDelta plus this, to settle after a
+	// claim that comes at the last moment.
+	ReverseMarginBlocks int64
+	// MaxHoldCltv is the most cltv_expiry a hold invoice may ask.
+	MaxHoldCltv uint64
+	// LockupFeeFactor caps a lockup's fee rate at this times the node's
+	// estimate (at least 2 sat/vB): no paying the miners to grief.
+	LockupFeeFactor float64
+	Net             *chaincfg.Params
+	Swaps           Swaps
+	LN              Lightning
+	Chain           Chain
+	Keys            Keys
+	LSP             LSP
+	Ledger          *Ledger
+	Now             func() time.Time
 	// Notify, when set, hears every refusal and every movement allowed or
 	// made (for the operator's bot): event, then key/values.
 	Notify func(event string, kv map[string]any)
@@ -249,6 +279,30 @@ type Policy struct {
 	pending  map[uint64]pendingReq
 	claimErr map[string]string // last claim error per payment hash
 }
+
+// ConfTier is one step of ConfTiers.
+type ConfTier struct {
+	MaxSat int64
+	Confs  int64
+}
+
+// confsFor is the depth a submarine lockup of sat needs.
+func (p *Policy) confsFor(sat int64) int64 {
+	c := p.RequiredConfs
+	for _, t := range p.ConfTiers {
+		if sat <= t.MaxSat {
+			return max(c, t.Confs)
+		}
+	}
+	if n := len(p.ConfTiers); n > 0 {
+		return max(c, p.ConfTiers[n-1].Confs)
+	}
+	return c
+}
+
+// ClaimVbytes is what the guard's claim of a submarine lockup weighs at
+// most (one taproot script-path input with preimage, one output).
+const ClaimVbytes = 160
 
 type pendingReq struct {
 	method string
@@ -426,6 +480,8 @@ func (p *Policy) promised() int64 {
 	return s
 }
 
+// openHolds counts the open hold invoices and those allowed whose creation
+// lnd has not confirmed yet (so two at once cannot both pass the limit).
 func (p *Policy) openHolds() int {
 	n := 0
 	for _, x := range p.Ledger.Holds {
@@ -433,6 +489,13 @@ func (p *Policy) openHolds() int {
 			n++
 		}
 	}
+	p.pmu.Lock()
+	for _, r := range p.pending {
+		if r.method == "/invoicesrpc.Invoices/AddHoldInvoice" {
+			n++
+		}
+	}
+	p.pmu.Unlock()
 	return n
 }
 
@@ -473,6 +536,16 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 		return refuse("exactly one positive fee rate is required")
 	case r.SatPerVbyte > uint64(p.MaxFeeRate) || r.SatPerByte > p.MaxFeeRate:
 		return refuse("fee rate over %d sat/vB", p.MaxFeeRate)
+	}
+	if p.LockupFeeFactor > 0 {
+		rate := float64(r.SatPerVbyte) + float64(r.SatPerByte)
+		est, err := p.Chain.FeeRate(ctx)
+		if err != nil || est < 1 {
+			est = 1
+		}
+		if cap := math.Max(2, math.Ceil(est*p.LockupFeeFactor)); rate > cap {
+			return refuse("fee rate %.0f sat/vB over %.0f (%.1fx the node's estimate)", rate, cap, p.LockupFeeFactor)
+		}
 	}
 	want, err := p.addrScript(r.Addr)
 	if err != nil {
@@ -555,8 +628,12 @@ func (p *Policy) checkReverse(ctx context.Context, s ReverseSwap, want []byte, h
 	if len(inv.HTLCExpiries) == 0 {
 		return nil, refuse("the hold invoice holds no HTLC")
 	}
+	if p.MaxHoldParts > 0 && len(inv.HTLCExpiries) > p.MaxHoldParts {
+		return nil, refuse("the hold invoice holds %d HTLCs, at most %d", len(inv.HTLCExpiries), p.MaxHoldParts)
+	}
+	margin := max(p.SafetyBlocks, p.ReverseMarginBlocks)
 	for _, e := range inv.HTLCExpiries {
-		if int64(e)-p.HoldExpiryDelta-p.SafetyBlocks <= s.Timeout {
+		if int64(e)-p.HoldExpiryDelta-margin <= s.Timeout {
 			return nil, refuse("an HTLC expires at %d, too close to the timeout %d to settle after a claim", e, s.Timeout)
 		}
 	}
@@ -624,6 +701,8 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 		return refuse("a fee limit is required")
 	case r.CltvLimit <= 0:
 		return refuse("a cltv_limit is required")
+	case r.TimeoutSeconds < 60 || r.TimeoutSeconds > 120:
+		return refuse("timeout_seconds must be within 60..120")
 	}
 	pr, err := p.LN.DecodePayReq(ctx, r.PaymentRequest)
 	if err != nil {
@@ -638,6 +717,9 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	sat := (pr.AmountMsat + 999) / 1000
 	if sat > p.MaxPerOpSat {
 		return refuse("%d sat is over the %d sat limit per operation", sat, p.MaxPerOpSat)
+	}
+	if sat < p.MinInvoiceSat {
+		return refuse("%d sat is under the %d sat minimum", sat, p.MinInvoiceSat)
 	}
 	hh := hex.EncodeToString(pr.Hash)
 	s, err := p.Swaps.SwapByInvoice(ctx, r.PaymentRequest)
@@ -679,11 +761,15 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if !out.Matches(o.PkScript) {
 		return refuse("the lockup output is not the swap output the guard rebuilds")
 	}
-	if o.Confirmations < p.RequiredConfs {
-		return refuse("the lockup has %d confirmations, %d needed", o.Confirmations, p.RequiredConfs)
+	if need := p.confsFor(o.Sat); o.Confirmations < need {
+		return refuse("the lockup has %d confirmations, %d needed for %d sat", o.Confirmations, need, o.Sat)
 	}
-	if o.Sat < sat+p.ClaimMarginSat {
-		return refuse("the lockup pays %d sat, less than the %d sat invoice plus %d to claim", o.Sat, sat, p.ClaimMarginSat)
+	maxFeeMsat := int64(math.Ceil(math.Max(float64(pr.AmountMsat)*p.FeeRatio, float64(p.MinFeeSat*1000))))
+	// the lockup must cover the invoice, the most routing may cost and our
+	// claim at the highest fee rate, and leave more than dust
+	cover := sat + (maxFeeMsat+999)/1000 + ClaimVbytes*p.MaxFeeRate + dust + p.ClaimMarginSat
+	if o.Sat < cover {
+		return refuse("the lockup pays %d sat, less than the %d sat invoice plus routing and claim costs (%d)", o.Sat, sat, cover)
 	}
 	unspent, err := p.Chain.Unspent(ctx, s.LockupTxID, vout)
 	if err != nil {
@@ -696,10 +782,13 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if err != nil {
 		return refuse("node height: %v", err)
 	}
-	if left := s.Timeout - height - p.SafetyBlocks; int64(r.CltvLimit) > left || left <= 0 {
-		return refuse("cltv_limit %d leaves no time to claim before the timeout (%d blocks left)", r.CltvLimit, s.Timeout-height)
+	if s.Timeout-height < p.MinSubTimeoutBlocks {
+		return refuse("the swap's timeout is %d blocks away, at least %d needed", s.Timeout-height, p.MinSubTimeoutBlocks)
 	}
-	maxFeeMsat := int64(math.Ceil(math.Max(float64(pr.AmountMsat)*p.FeeRatio, float64(p.MinFeeSat*1000))))
+	margin := max(p.SafetyBlocks, p.ClaimMarginBlocks)
+	if left := s.Timeout - height - margin; int64(r.CltvLimit) > left || left <= 0 {
+		return refuse("cltv_limit %d leaves no time to claim before the timeout (%d blocks left, %d kept to claim)", r.CltvLimit, s.Timeout-height, margin)
+	}
 	feeMsat := r.FeeLimitMsat
 	if r.FeeLimitSat != 0 {
 		if r.FeeLimitMsat != 0 {
@@ -761,6 +850,9 @@ func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHold
 	}
 	if sat <= 0 || sat > p.MaxPerOpSat {
 		return refuse("%d sat is not within 1..%d", sat, p.MaxPerOpSat)
+	}
+	if p.MaxHoldCltv > 0 && r.CltvExpiry > p.MaxHoldCltv {
+		return refuse("cltv_expiry %d over %d", r.CltvExpiry, p.MaxHoldCltv)
 	}
 	if inv, err := p.LN.LookupInvoice(ctx, r.Hash); err != nil {
 		return refuse("lnd invoice: %v", err)

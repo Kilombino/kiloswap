@@ -150,7 +150,8 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 	if !out.Matches(o.PkScript) {
 		return "", 0, errors.New("the lockup output changed")
 	}
-	sp := &spendFee{}
+	height, _ := p.Chain.Height(ctx)
+	sp := &spendFee{urgent: p.urgent(x, height)}
 	tx, fee, err := p.spendLeafWith(ctx, out, out.ClaimLeaf, x.LockupTx, x.Vout, o, 0, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, preimage, leaf, cb}
 	}, server, sp)
@@ -161,7 +162,6 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 	if err != nil {
 		return "", 0, err
 	}
-	height, _ := p.Chain.Height(ctx)
 	p.Ledger.Lock()
 	x.ClaimTx, x.ClaimFee, x.State = txid, fee, PayClaimed
 	x.Bump = Bump{TxIDs: []string{txid}, Dest: sp.dest, Rate: sp.rate, Height: height}
@@ -226,8 +226,15 @@ func (p *Policy) spendLeafWith(ctx context.Context, out *swapscript.Output, leaf
 	if rate < sp.minRate {
 		rate = sp.minRate
 	}
-	if rate > float64(p.MaxFeeRate) {
-		rate = float64(p.MaxFeeRate)
+	maxRate := float64(p.MaxFeeRate)
+	if sp.urgent && p.UrgentFeeFraction > 0 {
+		// close to the timeout a claim must confirm whatever it costs
+		// (at least MAX_FEE_RATE, doubling with each replacement)
+		maxRate = math.Max(maxRate, float64(o.Sat)*p.UrgentFeeFraction/float64(vsize))
+		rate = math.Max(rate, math.Max(float64(p.MaxFeeRate), sp.minRate*2))
+	}
+	if rate > maxRate {
+		rate = maxRate
 	}
 	fee := int64(math.Ceil(float64(vsize) * rate))
 	if o.Sat-fee < dust {
@@ -246,6 +253,7 @@ type spendFee struct {
 	dest    string
 	minRate float64
 	rate    float64
+	urgent  bool // a claim close to its timeout: past MaxFeeRate if needed
 }
 
 func (p *Policy) broadcast(ctx context.Context, tx *wire.MsgTx) (string, error) {
@@ -517,6 +525,12 @@ const bumpEvery = 3
 // 1 sat/vB, which also covers BIP 125's increment over the replaced fee.
 func nextRate(last float64) float64 { return last*1.5 + 1 }
 
+// urgent tells whether the claim of x is close enough to the swap's timeout
+// to pay past MaxFeeRate.
+func (p *Policy) urgent(x *Payment, height int64) bool {
+	return p.UrgentBlocks > 0 && int64(x.Timeout)-height <= p.UrgentBlocks
+}
+
 // replacementRate is the least fee rate for replacing (or broadcasting
 // again) a guard spend last broadcast as b, and whether to do it now: one
 // still in the mempool after bumpEvery blocks gets a higher fee (none past
@@ -645,7 +659,14 @@ func (p *Policy) bumpClaim(ctx context.Context, x *Payment, height int64, inMemp
 	p.Ledger.Lock()
 	b, pre := x.Bump, x.Preimage
 	p.Ledger.Unlock()
-	min, ok := replacementRate(b, height, inMempool, float64(p.MaxFeeRate))
+	limit := float64(p.MaxFeeRate)
+	if p.urgent(x, height) {
+		limit = math.MaxFloat64 // bounded by UrgentFeeFraction when built
+		if inMempool && height > b.Height {
+			b.Height = height - bumpEvery // near the timeout: replace every block
+		}
+	}
+	min, ok := replacementRate(b, height, inMempool, limit)
 	if !ok {
 		return nil
 	}
@@ -670,7 +691,7 @@ func (p *Policy) bumpClaim(ctx context.Context, x *Payment, height int64, inMemp
 	if !out.Matches(o.PkScript) {
 		return errors.New("the lockup output changed")
 	}
-	sp := &spendFee{dest: b.Dest, minRate: min}
+	sp := &spendFee{dest: b.Dest, minRate: min, urgent: p.urgent(x, height)}
 	tx, fee, err := p.spendLeafWith(ctx, out, out.ClaimLeaf, x.LockupTx, x.Vout, o, 0, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, preimage, leaf, cb}
 	}, server, sp)

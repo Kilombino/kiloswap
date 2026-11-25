@@ -35,11 +35,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	stdnet "net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -86,6 +88,19 @@ func num(k string, def int64) int64 {
 		log.Fatalf("%s: not a number", k)
 	}
 	return v
+}
+
+// tiers reads "maxsat:confs,..." (CONF_TIERS).
+func tiers(k, def string) []policy.ConfTier {
+	var out []policy.ConfTier
+	for _, part := range strings.Split(env(k, def), ",") {
+		var t policy.ConfTier
+		if _, err := fmt.Sscanf(strings.TrimSpace(part), "%d:%d", &t.MaxSat, &t.Confs); err != nil || t.Confs < 1 {
+			log.Fatalf("%s: maxsat:confs,...", k)
+		}
+		out = append(out, t)
+	}
+	return out
 }
 
 func main() {
@@ -146,22 +161,32 @@ func main() {
 		logger.Fatal("FEE_RATIO: between 0 and 0.01")
 	}
 	p := &policy.Policy{
-		MaxPerOpSat:       num("MAX_PER_OP_SAT", 100_000_000),
-		DailySat:          num("DAILY_SAT", 200_000_000),
-		ReserveSat:        num("RESERVE_SAT", 50_000_000),
-		MaxPendingReverse: int(num("MAX_PENDING_REVERSE", 5)),
-		FeeRatio:          ratio,
-		MinFeeSat:         num("MIN_FEE_SAT", 121),
-		MaxFeeRate:        num("MAX_FEE_RATE", 25),
-		RequiredConfs:     num("REQUIRED_CONFS", 3),
-		MinLockBlocks:     num("MIN_LOCK_BLOCKS", 12),
-		MaxLockBlocks:     num("MAX_LOCK_BLOCKS", 4320),
-		HoldExpiryDelta:   num("HOLD_EXPIRY_DELTA", 18),
-		SafetyBlocks:      num("SAFETY_BLOCKS", 6),
-		ClaimMarginSat:    num("CLAIM_MARGIN_SAT", 100),
-		Net:               net,
-		Swaps:             db,
-		LN:                sources.LN{Conn: conn},
+		MaxPerOpSat:         num("MAX_PER_OP_SAT", 100_000_000),
+		DailySat:            num("DAILY_SAT", 200_000_000),
+		ReserveSat:          num("RESERVE_SAT", 50_000_000),
+		MaxPendingReverse:   int(num("MAX_PENDING_REVERSE", 5)),
+		FeeRatio:            ratio,
+		MinFeeSat:           num("MIN_FEE_SAT", 121),
+		MaxFeeRate:          num("MAX_FEE_RATE", 25),
+		RequiredConfs:       num("REQUIRED_CONFS", 3),
+		MinLockBlocks:       num("MIN_LOCK_BLOCKS", 72),
+		MaxLockBlocks:       num("MAX_LOCK_BLOCKS", 288),
+		HoldExpiryDelta:     num("HOLD_EXPIRY_DELTA", 18),
+		SafetyBlocks:        num("SAFETY_BLOCKS", 6),
+		ClaimMarginSat:      num("CLAIM_MARGIN_SAT", 100),
+		MinInvoiceSat:       num("MIN_INVOICE_SAT", 10_000),
+		ClaimMarginBlocks:   num("CLAIM_MARGIN_BLOCKS", 60),
+		MinSubTimeoutBlocks: num("MIN_SUB_TIMEOUT_BLOCKS", 144),
+		ConfTiers:           tiers("CONF_TIERS", "1000000:3,10000000:6,100000000:12"),
+		UrgentBlocks:        num("URGENT_BLOCKS", 24),
+		UrgentFeeFraction:   0.1,
+		MaxHoldParts:        int(num("MAX_HOLD_PARTS", 16)),
+		ReverseMarginBlocks: num("REVERSE_MARGIN_BLOCKS", 36),
+		MaxHoldCltv:         uint64(num("MAX_HOLD_CLTV", 432)),
+		LockupFeeFactor:     2,
+		Net:                 net,
+		Swaps:               db,
+		LN:                  sources.LN{Conn: conn},
 		Chain: sources.Chain{URL: must("CHAIN_RPC_URL"), User: must("CHAIN_RPC_USER"),
 			Password: secret("CHAIN_RPC_PASSWORD")},
 		Keys:   swapKeys,
@@ -169,22 +194,48 @@ func main() {
 		Ledger: ledger,
 	}
 	alertURL := os.Getenv("ALERT_URL")
+	// alerts go out one at a time from a bounded queue; the same refusal or
+	// stall repeated within a minute is sent once (the log keeps them all)
+	alerts := make(chan map[string]any, 100)
+	var seenMu sync.Mutex
+	seen := map[string]time.Time{}
+	go func() {
+		c := http.Client{Timeout: 5 * time.Second}
+		for m := range alerts {
+			b, _ := json.Marshal(m)
+			if r, err := c.Post(alertURL, "application/json", bytes.NewReader(b)); err == nil {
+				r.Body.Close()
+			}
+		}
+	}()
 	p.Notify = func(event string, kv map[string]any) {
 		logger.Printf("%s %v", event, kv)
 		if alertURL == "" {
 			return
 		}
+		if event == "guard_refusal" || event == "guard_stall" {
+			key := fmt.Sprint(event, kv["method"], kv["reason"])
+			seenMu.Lock()
+			last, dup := seen[key]
+			if !dup || time.Since(last) > time.Minute {
+				seen[key] = time.Now()
+			}
+			if len(seen) > 1000 {
+				seen = map[string]time.Time{}
+			}
+			seenMu.Unlock()
+			if dup && time.Since(last) <= time.Minute {
+				return
+			}
+		}
 		m := map[string]any{"event": event}
 		for k, v := range kv {
 			m[k] = v
 		}
-		go func() {
-			b, _ := json.Marshal(m)
-			c := http.Client{Timeout: 5 * time.Second}
-			if r, err := c.Post(alertURL, "application/json", bytes.NewReader(b)); err == nil {
-				r.Body.Close()
-			}
-		}()
+		select {
+		case alerts <- m:
+		default: // the queue is full: dropped, the log has it
+		}
 	}
 	logger.Printf("kiloswap-guard: per op %d sat, daily %d sat, LSP reserve %d sat, %d pending reverse swaps",
 		p.MaxPerOpSat, p.DailySat, p.ReserveSat, p.MaxPendingReverse)
@@ -203,6 +254,10 @@ func main() {
 		}
 	}()
 	if addr := os.Getenv("API_ADDR"); addr != "" {
+		// the API claims and refunds: never on every interface
+		if h, _, err := stdnet.SplitHostPort(addr); err != nil || h == "" || h == "0.0.0.0" || h == "::" {
+			logger.Fatal("API_ADDR: bind to the internal network's address, not all interfaces")
+		}
 		go api.Serve(ctx, addr, secret("API_TOKEN"), p, logger)
 	}
 	middleware.Run(ctx, conn, p, logger)

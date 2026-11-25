@@ -208,6 +208,10 @@ func newEnv(t *testing.T) *env {
 		MaxPerOpSat: 100_000_000, DailySat: 200_000_000, ReserveSat: 50_000_000, MaxPendingReverse: 5,
 		FeeRatio: 0.0001, MinFeeSat: 121, MaxFeeRate: 25, RequiredConfs: 3,
 		MinLockBlocks: 12, MaxLockBlocks: 4320, HoldExpiryDelta: 18, SafetyBlocks: 6, ClaimMarginSat: 100,
+		MinInvoiceSat: 10_000, ClaimMarginBlocks: 40, MinSubTimeoutBlocks: 72,
+		ConfTiers:    []ConfTier{{1_000_000, 3}, {10_000_000, 6}, {100_000_000, 12}},
+		UrgentBlocks: 24, UrgentFeeFraction: 0.1, MaxHoldParts: 16, ReverseMarginBlocks: 36,
+		MaxHoldCltv: 288, LockupFeeFactor: 2,
 		Net: &chaincfg.RegressionNetParams, Swaps: e.swaps, LN: e.ln, Chain: e.chain, Keys: k,
 		LSP: fakeLSP{}, Ledger: led,
 	}
@@ -915,5 +919,124 @@ func TestInflightTrackedEvenWithStreamOpen(t *testing.T) {
 	e.p.Tick(context.Background())
 	if len(e.chain.broadcast) != 1 {
 		t.Fatalf("a payment that succeeded behind an open stream was not claimed: %v %+v", e.notes, e.p.Ledger.Payments[s.PreimageHash])
+	}
+}
+
+// ---- the second review: margins, minimums, depth, griefing ----
+
+func TestSubmarineMinimumsAndMargins(t *testing.T) {
+	e := newEnv(t)
+	inv, _, _ := e.submarine(70, 9_999, 200_000, 70)
+	_, err := e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "minimum")
+	// the lockup must cover routing and our claim at the highest fee rate
+	inv, _, _ = e.submarine(71, 100_000, 100_000+121+100, 71)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "routing and claim costs")
+	// cltv_limit must leave ClaimMarginBlocks before the timeout
+	inv, _, _ = e.submarine(72, 100_000, 200_000, 72)
+	r := payReq(inv)
+	r.CltvLimit = 61 // timeout 1100, height 1000: 100 - 40 = 60 at most
+	_, err = e.call(payURI, r)
+	mustRefuse(t, err, "kept to claim")
+	r.CltvLimit = 60
+	r.TimeoutSeconds = 3600
+	_, err = e.call(payURI, r)
+	mustRefuse(t, err, "timeout_seconds")
+	r.TimeoutSeconds = 60
+	_, err = e.call(payURI, r)
+	mustAllow(t, err)
+	// a timeout too close: refused whatever the cltv_limit
+	inv, _, _ = e.submarine(73, 100_000, 200_000, 73)
+	e.chain.height = 1040 // 60 blocks left, 72 needed
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "at least 72")
+}
+
+func TestConfirmationsScaleWithAmount(t *testing.T) {
+	e := newEnv(t)
+	if e.p.confsFor(500_000) != 3 || e.p.confsFor(5_000_000) != 6 || e.p.confsFor(99_000_000) != 12 || e.p.confsFor(200_000_000) != 12 {
+		t.Fatal("tiers")
+	}
+	inv, s, _ := e.submarine(74, 5_000_000, 5_100_000, 74)
+	_, err := e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "6 needed")
+	e.chain.txs[s.LockupTxID][0].Confirmations = 6
+	_, err = e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+}
+
+func TestLockupFeeCappedByEstimate(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(75, 1_000_000, 75)
+	req := sendReq(r)
+	req.SatPerByte = 5 // estimate 2 sat/vB: at most 4
+	_, err := e.call(sendURI, req)
+	mustRefuse(t, err, "estimate")
+	req.SatPerByte = 4
+	_, err = e.call(sendURI, req)
+	mustAllow(t, err)
+}
+
+func TestHoldInvoiceGriefingLimits(t *testing.T) {
+	e := newEnv(t)
+	_, hash := preimage(76)
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000, CltvExpiry: 1000})
+	mustRefuse(t, err, "cltv_expiry")
+	// many HTLC parts: no lockup
+	r, _, _ := e.reverse(77, 1_000_000, 77)
+	_, h := preimage(77)
+	inv := e.ln.invoices[hex.EncodeToString(h)]
+	inv.HTLCExpiries = make([]int32, 17)
+	for i := range inv.HTLCExpiries {
+		inv.HTLCExpiries[i] = 1200
+	}
+	_, err = e.call(sendURI, sendReq(r))
+	mustRefuse(t, err, "HTLCs")
+	// an HTLC expiring within timeout + delta + margin: no lockup
+	inv.HTLCExpiries = []int32{1100 + 18 + 36}
+	_, err = e.call(sendURI, sendReq(r))
+	mustRefuse(t, err, "too close")
+}
+
+// Hold invoices allowed but not yet created by lnd count against the limit.
+func TestHoldCountReservedAtOnce(t *testing.T) {
+	e := newEnv(t)
+	for i := byte(0); i < 5; i++ {
+		_, hash := preimage(80 + i)
+		_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+		mustAllow(t, err) // no answers from lnd yet
+	}
+	_, hash := preimage(90)
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Value: 50_000})
+	mustRefuse(t, err, "pending")
+}
+
+// Close to the timeout a claim pays past MAX_FEE_RATE (up to a fraction of
+// the lockup) and is replaced every block.
+func TestUrgentClaimFee(t *testing.T) {
+	e := newEnv(t)
+	inv, s, pre := e.submarine(78, 100_000, 200_000, 78)
+	id, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	e.answer(id, &lnrpc.Payment{Status: paymentSucceeded, PaymentPreimage: hex.EncodeToString(pre)}, false)
+	e.chain.height = 1090 // 10 blocks before the timeout
+	if _, _, err := e.p.Claim(context.Background(), s.ID); err != nil {
+		t.Fatal(err)
+	}
+	o := e.chain.txs[s.LockupTxID][0]
+	first := e.chain.broadcast[0]
+	if feeOf(first, o.Sat) > o.Sat/10 {
+		t.Fatal("an urgent claim paid over the fraction")
+	}
+	e.chain.height++
+	e.p.Tick(context.Background())
+	if len(e.chain.broadcast) != 2 {
+		t.Fatal("an urgent claim was not replaced the next block")
+	}
+	second := e.chain.broadcast[1]
+	vsize := int64((second.SerializeSizeStripped()*3 + second.SerializeSize() + 3) / 4)
+	if rate := float64(feeOf(second, o.Sat)) / float64(vsize); rate <= float64(e.p.MaxFeeRate)*1.5 {
+		t.Fatalf("the urgent replacement stayed under MAX_FEE_RATE: %.1f", rate)
 	}
 }
