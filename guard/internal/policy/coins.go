@@ -18,8 +18,10 @@ import (
 // and the LSP, the reserve and the next swaps all see an empty wallet. The
 // guard names the coins instead (SendCoins' outpoints, by replacing the
 // request): the smallest confirmed coin that covers the lockup and its fee,
-// or else the fewest of the smaller coins, and the biggest coin only when
-// nothing else can pay (lnd's own choice then, as before).
+// or else the smaller coins smallest first (the lockup consolidates dust,
+// up to MaxLockupInputs), or else the fewest of them largest first, and the
+// biggest coin only when nothing else can pay (lnd's own choice then, as
+// before). A coin worth less than what spending it costs is left alone.
 
 // MaxLockupInputs is the most coins one lockup may gather.
 const MaxLockupInputs = 10
@@ -67,12 +69,28 @@ func pickCoins(coins []Utxo, amount int64, rate float64) []Utxo {
 			return []Utxo{u}
 		}
 	}
-	// the fewest of the smaller coins: largest first
+	// coins that pay more than they cost to spend
+	var worth []Utxo
+	for _, u := range others {
+		if float64(u.Sat) > inputVbytes(u.Type)*rate {
+			worth = append(worth, u)
+		}
+	}
+	// the smaller coins smallest first: the lockup gathers the dust
 	var in []Utxo
 	var sum int64
-	for i := len(others) - 1; i >= 0 && len(in) < MaxLockupInputs; i-- {
-		in = append(in, others[i])
-		sum += others[i].Sat
+	for i := 0; i < len(worth) && len(in) < MaxLockupInputs; i++ {
+		in = append(in, worth[i])
+		sum += worth[i].Sat
+		if sum >= amount+lockupFee(rate, in) {
+			return in
+		}
+	}
+	// too many small ones for MaxLockupInputs: the fewest, largest first
+	in, sum = nil, 0
+	for i := len(worth) - 1; i >= 0 && len(in) < MaxLockupInputs; i-- {
+		in = append(in, worth[i])
+		sum += worth[i].Sat
 		if sum >= amount+lockupFee(rate, in) {
 			return in
 		}

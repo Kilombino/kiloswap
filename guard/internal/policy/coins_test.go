@@ -22,9 +22,29 @@ func TestPickCoins(t *testing.T) {
 	if len(in) != 1 || in[0].Sat != 12_000 {
 		t.Fatalf("picked %v", in)
 	}
-	// 220,000: no single small coin; 200,000 + 30,000 (fewest, largest first)
+	// 220,000: no single small coin; the small ones smallest first, gathering the dust
 	in = pickCoins(all, 220_000, 2)
-	if len(in) != 2 || in[0].Sat != 200_000 || in[1].Sat != 30_000 {
+	if len(in) != 4 || in[0].Sat != 5_000 || in[3].Sat != 200_000 {
+		t.Fatalf("picked %v", in)
+	}
+	// more small coins than MaxLockupInputs can gather smallest first: the fewest, largest first
+	many := []Utxo{big}
+	for i := 0; i < 15; i++ {
+		many = append(many, coin(byte(10+i), 10_000))
+	}
+	many = append(many, coin(40, 150_000), coin(41, 100_000))
+	in = pickCoins(many, 240_000, 2)
+	if len(in) != 2 || in[0].Sat != 150_000 || in[1].Sat != 100_000 {
+		t.Fatalf("picked %v", in)
+	}
+	// a coin worth less than spending it costs is left alone
+	in = pickCoins([]Utxo{big, coin(50, 50), coin(51, 30_000), coin(52, 30_000)}, 50_000, 2)
+	for _, u := range in {
+		if u.Sat == 50 {
+			t.Fatalf("spent a coin worth less than its input: %v", in)
+		}
+	}
+	if len(in) != 2 {
 		t.Fatalf("picked %v", in)
 	}
 	// only the big coin pays: lnd's own choice
