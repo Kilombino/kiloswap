@@ -107,7 +107,9 @@ services:
       lnd: {}
       default: {}
     environment:
-      LND_GRPC: ${LND_HOST:?set LND_HOST in .env}:10009
+      # LND_ADDR: how to reach lnd (an address its tls.cert names, e.g. its
+      # fixed IP); defaults to LND_HOST
+      LND_GRPC: ${LND_ADDR:-${LND_HOST:?set LND_HOST in .env}}:10009
       GOMEMLIMIT: 100MiB
       LND_TLSCERT: /lnd/tls.cert
       LND_MACAROON: /lnd/kiloswap-guard.macaroon
@@ -167,10 +169,14 @@ services:
     security_opt: [no-new-privileges:true]
     read_only: true
     restart: unless-stopped
-    entrypoint: ["/bin/sh", "-c", "sed \"s/LND_HOST/$$LND_HOST/g\" /etc/lnd-proxy/nginx.conf > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf -g 'daemon off;'"]
+    entrypoint: ["/bin/sh", "-c", "sed -e \"s/LND_ADDR/$$LND_ADDR/g\" -e \"s/LND_TLS_NAME/$$LND_TLS_NAME/g\" /etc/lnd-proxy/nginx.conf > /tmp/nginx.conf && exec nginx -c /tmp/nginx.conf -g 'daemon off;'"]
     environment:
-      LND_HOST: ${LND_HOST:?set LND_HOST in .env}
-    tmpfs: [/tmp]
+      # where lnd is and the name its tls.cert is checked against (one of its
+      # SANs, e.g. localhost when lnd is reached by its IP)
+      LND_ADDR: ${LND_ADDR:-${LND_HOST:?set LND_HOST in .env}}
+      LND_TLS_NAME: ${LND_TLS_NAME:-${LND_HOST}}
+    # read-only image: nginx's caches and pid on tmpfs
+    tmpfs: [/tmp, /var/cache/nginx, /var/run]
     networks: [lnd, internal]
     volumes:
       - ./lnd-proxy/nginx.conf:/etc/lnd-proxy/nginx.conf:ro

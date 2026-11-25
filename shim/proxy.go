@@ -350,10 +350,14 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		out = p.patchBatch(r, trimmed, out)
 	case len(trimmed) > 0 && trimmed[0] == '{':
 		var resp rawResponse
-		if req, err := parseRequest(trimmed); err == nil && json.Unmarshal(out, &resp) == nil && isNotFound(resp) {
+		req, perr := parseRequest(trimmed)
+		if perr == nil && json.Unmarshal(out, &resp) == nil && isNotFound(resp) {
 			if better, ok := p.retry(r, req); ok {
 				out, status = better, http.StatusOK
 			}
+		}
+		if perr == nil && req.Method == "getzmqnotifications" {
+			out = zmqWildcard(out)
 		}
 	}
 
@@ -423,4 +427,30 @@ func (p *proxy) patchBatch(r *http.Request, body, out []byte) []byte {
 		return out
 	}
 	return patched
+}
+
+// zmqWildcard rewrites the hosts of getzmqnotifications' addresses to
+// 0.0.0.0: the backend then connects to them at its RPC host, this shim,
+// which relays them (SHIM_FORWARD). A node that publishes on its LAN
+// address is not reachable from the backend's internal network.
+func zmqWildcard(out []byte) []byte {
+	var resp struct {
+		Result []map[string]any `json:"result"`
+		Error  json.RawMessage  `json:"error"`
+		ID     json.RawMessage  `json:"id"`
+	}
+	if json.Unmarshal(out, &resp) != nil || resp.Result == nil {
+		return out
+	}
+	for _, n := range resp.Result {
+		a, _ := n["address"].(string)
+		if i := strings.LastIndex(a, ":"); strings.HasPrefix(a, "tcp://") && i > len("tcp://") {
+			n["address"] = "tcp://0.0.0.0" + a[i:]
+		}
+	}
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return out
+	}
+	return b
 }

@@ -9,6 +9,9 @@ set -a; . ./.env; set +a
 R=${KILOSWAP_ROOT:?}
 umask 077
 mkdir -p "$R"/{secrets,postgres,shim,boltz,guard,macaroons,webapp,backups} "$R/secrets/lnd-proxy"
+# data dirs owned by the containers' users: postgres (alpine) 70, the shim 65532
+sudo chown 70:70 "$R/postgres"
+sudo chown 65532:65532 "$R/shim"
 # lnd-proxy's own certificate (the backend trusts it for lnd-proxy:10009)
 if [ ! -s "$R/secrets/lnd-proxy/proxy.crt" ]; then
 	openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 3650 \
@@ -49,6 +52,8 @@ sudo docker run --rm -v "$R/secrets/swap_seed:/s:ro" -e SWAP_MNEMONIC_FILE=/s ki
 # The guard runs as distroless's nonroot (65532): its state and secrets;
 # the backend (root in its image) reads its own copy of the API token
 sudo chown -R 65532:65532 "$R/guard"
+# postgres (uid 70) reads its two password files at the first start
+sudo chown 70:70 "$R/secrets/postgres_password" "$R/secrets/postgres_admin_password"
 sudo chown 65532:65532 "$R/secrets/guard_db_url" "$R/secrets/guard_rpc_password" "$R/secrets/guard_api_token"
 # rpcauth lines for the node (Core's share/rpcauth: HMAC-SHA256 with a salt)
 auth() {
