@@ -15,6 +15,11 @@ SELECT format('CREATE ROLE kiloswap_guard LOGIN NOSUPERUSER PASSWORD %L', :'gpw'
   WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'kiloswap_guard') \gexec
 SELECT 'CREATE ROLE kiloswap_watch LOGIN NOSUPERUSER'
   WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'kiloswap_watch') \gexec
+-- connections: boltz at most 25 of the server's 40, so the guard (8) and
+-- the bot (2) always find one
+ALTER ROLE boltz CONNECTION LIMIT 25;
+ALTER ROLE kiloswap_guard CONNECTION LIMIT 8;
+ALTER ROLE kiloswap_watch CONNECTION LIMIT 2;
 -- the guard's statements never wait long, whatever its connection asks
 ALTER ROLE kiloswap_guard SET statement_timeout = '1s';
 ALTER ROLE kiloswap_guard SET lock_timeout = '500ms';

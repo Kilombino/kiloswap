@@ -160,9 +160,16 @@ func main() {
 	if err != nil || ratio < 0 || ratio > 0.01 {
 		logger.Fatal("FEE_RATIO: between 0 and 0.01")
 	}
+	// launch mode (the default): 0.1 BTC per operation and 0.25 BTC a day;
+	// LAUNCH_MODE=0 gives the later 1 BTC and 2 BTC (MAX_PER_OP_SAT and
+	// DAILY_SAT override either way)
+	perOp, daily := int64(10_000_000), int64(25_000_000)
+	if env("LAUNCH_MODE", "1") == "0" {
+		perOp, daily = 100_000_000, 200_000_000
+	}
 	p := &policy.Policy{
-		MaxPerOpSat:          num("MAX_PER_OP_SAT", 100_000_000),
-		DailySat:             num("DAILY_SAT", 200_000_000),
+		MaxPerOpSat:          num("MAX_PER_OP_SAT", perOp),
+		DailySat:             num("DAILY_SAT", daily),
 		ReserveSat:           num("RESERVE_SAT", 50_000_000),
 		MaxPendingReverse:    int(num("MAX_PENDING_REVERSE", 5)),
 		FeeRatio:             ratio,

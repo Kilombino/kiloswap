@@ -60,7 +60,7 @@ fee = 0.15
 # On-chain → Lightning (submarine): 0.01 %
 swapInFee = 0.01
 minSwapAmount = 10000
-maxSwapAmount = 100000000
+maxSwapAmount = 10000000 # launch mode: 0.1 BTC (the guard: LAUNCH_MODE); later 100000000
 
   [pairs.timeoutDelta]
   # in minutes; chain swaps are off (swapTypes), the sidecar wants the key
@@ -77,7 +77,7 @@ network = "bitcoinMainnet"
 preferredWallet = "lnd"
 minWalletBalance = 0
 minSwapAmount = 10000
-maxSwapAmount = 100000000
+maxSwapAmount = 10000000 # launch mode: 0.1 BTC (the guard: LAUNCH_MODE); later 100000000
 maxZeroConfAmount = 0
 # A lockup is paid against only once this deep
 requiredConfirmations = 3

@@ -134,6 +134,24 @@ guard stopped.
   a big lockup's payment is refused by the guard until it is deep enough
   and the backend tries again.
 
+- **One unhardened key family.** The backend holds the extended public key
+  at `m/0/0` and the guard derives each swap's key from it unhardened. Under
+  BIP32, one leaked child private key plus that public key gives the parent
+  and so every swap key. Child keys never leave the guard, so a leak needs
+  the guard itself; a later step could have the guard hand per-swap public
+  keys from a hardened path through its API instead of an xpub.
+- **The node's RPC under load.** The backend's calls go to the node through
+  the shim; heavy use could fill the node's `rpcworkqueue`, which DATUM
+  shares. Keep `rpcworkqueue` at its raised value on the node and watch for
+  "work queue depth exceeded" in its log.
+
+### Launch mode
+
+The guard starts in launch mode (`LAUNCH_MODE`, default on): 0.1 BTC per
+operation and 0.25 BTC a day, with the backend's `maxSwapAmount` at 0.1 BTC.
+`LAUNCH_MODE=0` (and `maxSwapAmount = 100000000`) gives the later 1 BTC per
+operation and 2 BTC a day.
+
 ### What the guard does about slow or hostile backends
 
 - Each lnd interception is judged in its own goroutine with a 1.5 s
@@ -152,7 +170,19 @@ guard stopped.
   72..288 blocks, hold invoices with at most 16 HTLCs, a cltv_expiry of at
   most 432 and every HTLC expiring 18 + 36 blocks after the timeout.
 - The guard's own spends are done at 3 confirmations (reorgs) and are
-  replaced (RBF) when stuck or dropped.
+  replaced (RBF) when stuck or dropped; a refund cancels its hold invoice
+  only as deep as the amount's tier, and pays what it takes near the HTLCs'
+  deadline.
+- A cancel and a lockup of one hold invoice are judged under one lock (the
+  invoice is "canceling" until lnd answers).
+- Depth is asked of the total not yet deep: all payments whose lockups are
+  under 12 confirmations plus the new one (splitting a lockup does not help).
+- Lockups lnd sent without telling the guard are looked for only among
+  lnd's own wallet transactions; one never seen expires after 72 blocks.
+- AddInvoice is judged (amount, a day's expiry, 30 a minute) and at most
+  5000 of its hashes are kept a week; DescribeGraph, QueryRoutes,
+  GetTransactions and GetNodeInfo are limited per minute; Postgres caps the
+  backend's connections at 25 so the guard always finds one.
 
 ## Layout
 

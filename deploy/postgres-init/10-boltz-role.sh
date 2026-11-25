@@ -7,6 +7,6 @@
 set -eu
 pw=$(cat /run/secrets/postgres_password)
 psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres -v pw="$pw" <<'SQL'
-SELECT format('CREATE ROLE boltz LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION PASSWORD %L', :'pw') \gexec
+SELECT format('CREATE ROLE boltz LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION CONNECTION LIMIT 25 PASSWORD %L', :'pw') \gexec
 CREATE DATABASE boltz OWNER boltz;
 SQL
