@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync"
 	"time"
 
 	"google.golang.org/grpc"
@@ -73,40 +74,108 @@ func Serve(ctx context.Context, conn grpc.ClientConnInterface, p *policy.Policy,
 	}); err != nil {
 		return err
 	}
+	// lnd waits a few seconds for each answer: judgments run side by side
+	// (a slow one must not hold back the others), each with a deadline
+	// shorter than lnd's, and the answers share the stream under a lock
+	var send sync.Mutex
+	slots := make(chan struct{}, MaxConcurrent)
+	reply := func(msgID uint64, feedback *lnrpc.InterceptFeedback) error {
+		send.Lock()
+		defer send.Unlock()
+		return stream.SendMsg(&lnrpc.RPCMiddlewareResponse{
+			RefMsgId:          msgID,
+			MiddlewareMessage: &lnrpc.RPCMiddlewareResponse_Feedback{Feedback: feedback},
+		})
+	}
+	errs := make(chan error, 1)
 	for {
-		var req lnrpc.RPCMiddlewareRequest
-		if err := stream.RecvMsg(&req); err != nil {
+		req := new(lnrpc.RPCMiddlewareRequest)
+		if err := stream.RecvMsg(req); err != nil {
 			return err
 		}
-		feedback := &lnrpc.InterceptFeedback{}
-		switch t := req.InterceptType.(type) {
-		case *lnrpc.RPCMiddlewareRequest_RegComplete:
+		select {
+		case err := <-errs:
+			return err
+		default:
+		}
+		if _, ok := req.InterceptType.(*lnrpc.RPCMiddlewareRequest_RegComplete); ok {
 			logger.Printf("registered with lnd for the %q caveat", policy.CaveatName)
 			continue
-		case *lnrpc.RPCMiddlewareRequest_StreamAuth:
-			if err := p.Stream(t.StreamAuth.GetMethodFullUri()); err != nil {
-				feedback.Error = err.Error()
-				logger.Printf("refused stream %s: %v", t.StreamAuth.GetMethodFullUri(), err)
-			}
-		case *lnrpc.RPCMiddlewareRequest_Request:
-			if err := p.Intercept(ctx, req.CustomCaveatCondition, req.RequestId, t.Request); err != nil {
-				feedback.Error = err.Error()
-				logger.Printf("refused %s: %v", t.Request.GetMethodFullUri(), err)
-			} else if j := policy.Allowed[t.Request.GetMethodFullUri()]; j {
-				logger.Printf("allowed %s (request %d)", t.Request.GetMethodFullUri(), req.RequestId)
-			}
-		case *lnrpc.RPCMiddlewareRequest_Response:
-			p.Answered(req.RequestId, t.Response)
+		}
+		select {
+		case slots <- struct{}{}:
 		default:
-			feedback.Error = "kiloswap guard: unknown interception"
+			// too many judgments at once: refuse at once rather than queue
+			p.Stall("too many requests at once")
+			if err := reply(req.MsgId, &lnrpc.InterceptFeedback{Error: "kiloswap guard: busy"}); err != nil {
+				return err
+			}
+			continue
 		}
-		if err := stream.SendMsg(&lnrpc.RPCMiddlewareResponse{
-			RefMsgId:          req.MsgId,
-			MiddlewareMessage: &lnrpc.RPCMiddlewareResponse_Feedback{Feedback: feedback},
-		}); err != nil {
-			return err
-		}
+		go func(req *lnrpc.RPCMiddlewareRequest) {
+			defer func() { <-slots }()
+			feedback := judge(ctx, p, req, logger)
+			if err := reply(req.MsgId, feedback); err != nil {
+				select {
+				case errs <- err:
+				default:
+				}
+				cancel()
+			}
+		}(req)
 	}
+}
+
+// MaxConcurrent is how many interceptions are judged at once.
+const MaxConcurrent = 32
+
+// JudgeTimeout is how long one judgment may take: lnd gives up on an
+// answer after a few seconds, and a late "allowed" must never happen.
+var JudgeTimeout = 1500 * time.Millisecond
+
+// Judge is what judge needs of the policy (an interface for the tests).
+type Judge interface {
+	Stream(uri string) error
+	Intercept(ctx context.Context, condition string, requestID uint64, m *lnrpc.RPCMessage) error
+	Answered(requestID uint64, m *lnrpc.RPCMessage)
+	Stall(why string)
+	Forget(requestID uint64)
+}
+
+func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger *log.Logger) *lnrpc.InterceptFeedback {
+	feedback := &lnrpc.InterceptFeedback{}
+	switch t := req.InterceptType.(type) {
+	case *lnrpc.RPCMiddlewareRequest_StreamAuth:
+		if err := p.Stream(t.StreamAuth.GetMethodFullUri()); err != nil {
+			feedback.Error = err.Error()
+			logger.Printf("refused stream %s: %v", t.StreamAuth.GetMethodFullUri(), err)
+		}
+	case *lnrpc.RPCMiddlewareRequest_Request:
+		jctx, cancel := context.WithTimeout(ctx, JudgeTimeout)
+		defer cancel()
+		done := make(chan error, 1)
+		go func() { done <- p.Intercept(jctx, req.CustomCaveatCondition, req.RequestId, t.Request) }()
+		var err error
+		select {
+		case err = <-done:
+		case <-jctx.Done():
+			err = fmt.Errorf("kiloswap guard: no judgment within %v", JudgeTimeout)
+			p.Stall(fmt.Sprintf("%s took over %v", t.Request.GetMethodFullUri(), JudgeTimeout))
+			// the late judgment, whatever it says, must not stay recorded
+			go func() { <-done; p.Forget(req.RequestId) }()
+		}
+		if err != nil {
+			feedback.Error = err.Error()
+			logger.Printf("refused %s: %v", t.Request.GetMethodFullUri(), err)
+		} else if j := policy.Allowed[t.Request.GetMethodFullUri()]; j {
+			logger.Printf("allowed %s (request %d)", t.Request.GetMethodFullUri(), req.RequestId)
+		}
+	case *lnrpc.RPCMiddlewareRequest_Response:
+		p.Answered(req.RequestId, t.Response)
+	default:
+		feedback.Error = "kiloswap guard: unknown interception"
+	}
+	return feedback
 }
 
 // Run keeps the guard registered: after any error it registers again,

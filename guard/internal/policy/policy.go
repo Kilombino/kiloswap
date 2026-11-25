@@ -997,3 +997,39 @@ func (p *Policy) failed(pay *Payment) {
 	_ = p.Ledger.save()
 	p.notify("payment_failed", map[string]any{"swap": pay.SwapID, "sat": pay.Sat})
 }
+
+// Stall reports a judgment that took too long or requests that came too
+// fast: the backend's database blocked or slowed down, or lnd flooded. The
+// request was refused; the operator should know.
+func (p *Policy) Stall(why string) {
+	p.notify("guard_stall", map[string]any{"reason": why})
+}
+
+// Forget undoes what an allowed judgment recorded when lnd was told no
+// after all (its judgment came too late): lnd never runs the call, so
+// nothing may stay counted or reserved for it.
+func (p *Policy) Forget(requestID uint64) {
+	r, ok := p.pendingFor(requestID)
+	if !ok {
+		return
+	}
+	p.done(requestID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.Ledger.Lock()
+	defer p.Ledger.Unlock()
+	switch r.method {
+	case "/lnrpc.Lightning/SendCoins":
+		if l := p.Ledger.Lockups[r.hash]; l != nil && l.State == LockApproved {
+			delete(p.Ledger.Lockups, r.hash)
+			delete(p.Ledger.Entries, "send:"+r.hash)
+		}
+	case "/routerrpc.Router/SendPaymentV2":
+		if x := p.Ledger.Payments[r.hash]; x != nil && x.Request == requestID && x.State == PayInflight {
+			delete(p.Ledger.Payments, r.hash)
+			delete(p.Ledger.Outpoints, fmt.Sprintf("%s:%d", x.LockupTx, x.Vout))
+			delete(p.Ledger.Entries, "pay:"+r.hash)
+		}
+	}
+	_ = p.Ledger.save()
+}

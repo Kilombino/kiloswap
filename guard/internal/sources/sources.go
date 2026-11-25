@@ -28,8 +28,22 @@ import (
 // DB reads the backend's Postgres.
 type DB struct{ Pool *pgxpool.Pool }
 
+// OpenDB connects with the guard's read-only role. Every statement has a
+// deadline of its own on the server (and the judgment's context on the
+// client): a backend that locks the tables or plants huge rows makes the
+// guard refuse, never wait.
 func OpenDB(ctx context.Context, url string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, err
+	}
+	rp := cfg.ConnConfig.RuntimeParams
+	rp["statement_timeout"] = "1000"
+	rp["lock_timeout"] = "500"
+	rp["idle_in_transaction_session_timeout"] = "5000"
+	rp["default_transaction_read_only"] = "on"
+	cfg.MaxConns = 8
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -40,7 +54,7 @@ func (d *DB) ReverseByLockup(ctx context.Context, address string) ([]policy.Reve
 	rows, err := d.Pool.Query(ctx,
 		`SELECT id, "lockupAddress", "onchainAmount", "preimageHash", coalesce("claimPublicKey",''),
 		        coalesce("keyIndex",-1), "timeoutBlockHeight", version
-		   FROM "reverseSwaps" WHERE "lockupAddress" = $1`, address)
+		   FROM "reverseSwaps" WHERE "lockupAddress" = $1 LIMIT 4`, address)
 	if err != nil {
 		return nil, err
 	}
@@ -62,7 +76,7 @@ func (d *DB) SwapByInvoice(ctx context.Context, invoice string) (*policy.Swap, e
 	err := d.Pool.QueryRow(ctx,
 		`SELECT id, "preimageHash", coalesce("refundPublicKey",''), coalesce("keyIndex",-1),
 		        "timeoutBlockHeight", coalesce("lockupTransactionId",''), coalesce("lockupTransactionVout",-1), version
-		   FROM swaps WHERE lower(invoice) = lower($1)`, invoice).
+		   FROM swaps WHERE lower(invoice) = lower($1) LIMIT 1`, invoice).
 		Scan(&s.ID, &s.PreimageHash, &s.RefundKey, &s.KeyIndex, &s.Timeout, &s.LockupTxID, &s.LockupVout, &s.Version)
 	if err != nil {
 		if strings.Contains(err.Error(), "no rows") {
