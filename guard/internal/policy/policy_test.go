@@ -1189,3 +1189,51 @@ func TestMaxSubmarineTimeout(t *testing.T) {
 	_, err := e.call(payURI, payReq(inv))
 	mustRefuse(t, err, "at most 50")
 }
+
+
+// A big reverse lockup's refund cancels the hold invoice only at the depth
+// its amount asks; near the HTLCs' deadline the refund pays what it takes.
+func TestRefundFinalityByAmountAndUrgency(t *testing.T) {
+	e := newEnv(t)
+	r, _, _ := e.reverse(115, 50_000_000, 115) // tier: 12 confirmations
+	txid, pk := e.sent(r, 115)
+	r2, _, _ := e.reverse(116, 1_000_000, 116)
+	txid2, pk2 := e.sent(r2, 116)
+	e.chain.height = 1100
+	e.p.Tick(context.Background())
+	var first *wire.MsgTx
+	for _, tx := range e.chain.broadcast {
+		if tx.TxIn[0].PreviousOutPoint.Hash.String() == txid {
+			first = tx
+		}
+	}
+	op := txid + ":1"
+	_, hash := preimage(115)
+	e.chain.spenders[op] = &Spend{TxID: first.TxHash().String(), Witness: first.TxIn[0].Witness, Confirmations: 3}
+	e.p.Tick(context.Background())
+	if e.ln.invoices[hex.EncodeToString(hash)].State == InvoiceCanceled {
+		t.Fatal("cancelled a 50M-sat lockup's invoice at 3 confirmations")
+	}
+	e.chain.spenders[op].Confirmations = 12
+	e.p.Tick(context.Background())
+	if e.ln.invoices[hex.EncodeToString(hash)].State != InvoiceCanceled {
+		t.Fatal("not cancelled at 12")
+	}
+	// urgency: the other refund stuck past timeout + 18
+	_ = pk
+	n := len(e.chain.broadcast)
+	e.chain.height = 1100 + 18
+	e.p.Tick(context.Background())
+	if len(e.chain.broadcast) != n+1 {
+		t.Fatal("an urgent refund was not replaced")
+	}
+	last := e.chain.broadcast[len(e.chain.broadcast)-1]
+	if last.TxIn[0].PreviousOutPoint.Hash.String() != txid2 {
+		t.Fatal("the replacement is not the stuck refund's")
+	}
+	verify(t, last, pk2, r2.OnchainAmount)
+	vsize := int64((last.SerializeSizeStripped()*3 + last.SerializeSize() + 3) / 4)
+	if rate := float64(feeOf(last, r2.OnchainAmount)) / float64(vsize); rate < float64(e.p.MaxFeeRate) {
+		t.Fatalf("urgent refund at %.1f sat/vB", rate)
+	}
+}

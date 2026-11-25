@@ -415,7 +415,10 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 			if sp.Confirmations < 1 {
 				return p.bumpRefund(ctx, l, out, o, vout, height, true)
 			}
-			if sp.Confirmations >= finalConfs {
+			// the hold invoice is cancelled only when the refund is as deep as
+			// the amount asks (a reorg that undid it would let the user claim
+			// with the preimage after getting the payment back)
+			if sp.Confirmations >= max(finalConfs, p.confsFor(l.Sat)) {
 				p.Ledger.Lock()
 				l.State = LockRefunded
 				_ = p.Ledger.save()
@@ -586,7 +589,17 @@ func (p *Policy) bumpRefund(ctx context.Context, l *Lockup, out *swapscript.Outp
 	if b.Dest == "" {
 		return nil // a refund from before bumps were kept: nothing to replace it with
 	}
-	min, ok := replacementRate(b, height, inMempool, float64(p.MaxFeeRate))
+	// the hold invoice's HTLCs expire some blocks after the timeout: past
+	// half that margin the refund pays what it takes, every block
+	urgent := p.ReverseMarginBlocks > 0 && height-int64(l.Timeout) >= p.ReverseMarginBlocks/2
+	limit := float64(p.MaxFeeRate)
+	if urgent {
+		limit = math.MaxFloat64
+		if inMempool && height > b.Height {
+			b.Height = height - bumpEvery
+		}
+	}
+	min, ok := replacementRate(b, height, inMempool, limit)
 	if !ok {
 		return nil
 	}
@@ -594,7 +607,7 @@ func (p *Policy) bumpRefund(ctx context.Context, l *Lockup, out *swapscript.Outp
 	if err != nil {
 		return err
 	}
-	sp := &spendFee{dest: b.Dest, minRate: min}
+	sp := &spendFee{dest: b.Dest, minRate: min, urgent: urgent}
 	tx, fee, err := p.spendLeafWith(ctx, out, out.RefundLeaf, l.TxID, vout, o, l.Timeout, func(sig, leaf, cb []byte) wire.TxWitness {
 		return wire.TxWitness{sig, leaf, cb}
 	}, server, sp)
