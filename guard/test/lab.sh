@@ -142,7 +142,8 @@ start_guard() {
 		-e DATABASE_URL=postgres://kiloswap_guard:guardlab@postgres:5432/boltz \
 		-e LSP_STATE=/lsp/state.json -e LEDGER=/state/ledger.json -e NETWORK=regtest \
 		-e SWAP_MNEMONIC_FILE=/seed/swap-seed -e API_ADDR=$GUARD:8091 -e API_TOKEN=labtoken \
-		-e CHAIN_RPC_URL=http://shim:8332/ -e CHAIN_RPC_USER=lab -e CHAIN_RPC_PASSWORD=lab "$@" \
+		-e CHAIN_RPC_URL=http://shim:8332/ -e CHAIN_RPC_USER=lab -e CHAIN_RPC_PASSWORD=lab \
+		-e LAUNCH_MODE=0 -e ROUTING_CAP=0 -e MIN_FEE_SAT=121 -e CONF_TIERS=1000000:1,10000000:2,100000000:3 -e REQUIRED_CONFS=1 "$@" \
 		alpine:3.22 /kiloswap-guard >/dev/null
 	for _ in $(seq 1 30); do docker logs $GUARD 2>&1 | grep -q registered && return 0; sleep 1; done
 	docker logs $GUARD >&2; return 1
@@ -231,7 +232,7 @@ if [ -z "${SKIP_E2E:-}" ]; then
 fi
 
 start_guard
-docker logs $GUARD 2>&1 | grep -q "per op 10000000 sat, daily 25000000 sat.*2 unresolved lockups" && ok "with no limits in its environment the guard starts with the launch limits (and says so)" || bad "the guard's default limits: $(docker logs $GUARD 2>&1 | grep 'per op' | tail -1)"
+docker logs $GUARD 2>&1 | grep -q "per op 100000000 sat, daily 200000000 sat.*2 unresolved lockups.*routing cap false" && ok "with the production settings the guard starts with 1 BTC / 2 BTC and routing like upstream (and says so)" || bad "the guard's default limits: $(docker logs $GUARD 2>&1 | grep 'per op' | tail -1)"
 log "a backend taken over: direct calls with its macaroon"
 addr=$(LU newaddress p2wkh | jq -r .address)
 refused "SendCoins to a random address" KS sendcoins --addr "$addr" --amt 100000 --force --sat_per_vbyte 2
@@ -525,9 +526,9 @@ refused "an AMP invoice" KS addinvoice --amt 1000 --amp
 refused "a private invoice (advertising private channels)" KS addinvoice --amt 1000 --private
 allowed "a plain invoice" KS addinvoice --amt 1000
 
-log "option A: the routing fee paid from the lockup's surplus (10 sat floor), rewritten by the guard"
+log "routing like upstream: a hard ceiling of max(121 sat, 0.01%), rewritten by the guard"
 # an attacker's invoice: the payment must go through their node (a route
-# hint through lnd-user, a 60 sat fee) to a key of theirs
+# hint through lnd-user, a 200 sat fee, over the 121 sat ceiling) to a key of theirs
 upk=$(LU getinfo | jq -r .identity_pubkey)
 start_guard -e DAILY_SAT=10000000000 # the e2e part filled the launch daily limit
 subswap() { # invoice -> creates the swap and pays its lockup; the backend pays once it is confirmed
@@ -548,17 +549,17 @@ subswap() { # invoice -> creates the swap and pays its lockup; the backend pays 
 attempts() { docker compose logs lnd-swap 2>&1 | grep -F "for payment $1 failed" | grep -c "Attempt" || true; }
 paystate() { LS listpayments --include_incomplete | jq -c --arg h "$1" '[.payments[] | select(.payment_hash == $h)] | last | {status, failure_reason, htlcs: (.htlcs | length)}'; }
 upb() { docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1; for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done; }
-read -r inv1 ph1 < <("$work/hintinv" 20000 "$upk" 60000 0 | paste -sd' ')
+read -r inv1 ph1 < <("$work/hintinv" 20000 "$upk" 200000 0 | paste -sd' ')
 if subswap "$inv1"; then
 	stb=$(paystate "$ph1")
-	grep -q '"status":"FAILED"' <<<"$stb" && grep -q '"htlcs":0' <<<"$stb" && ok "the backend's own payment through the 60 sat hop: rewritten limit, no route, nothing sent ($stb)" || bad "backend payment through the attacker's hop: $stb"
+	grep -q '"status":"FAILED"' <<<"$stb" && grep -q '"htlcs":0' <<<"$stb" && ok "the backend's own payment through a 200 sat hop: over the 121 sat ceiling, no route, nothing sent ($stb)" || bad "backend payment through the attacker's hop: $stb"
 	# the backend taken over asks a 5000 sat limit: the guard lowers it
 	docker compose stop boltz >/dev/null 2>&1
 	KS payinvoice --pay_req "$inv1" --force --fee_limit 5000 --cltv_limit 40 >"$work/r1" 2>&1 || true
 	st1=$(paystate "$ph1")
 	grep -q '"status":"FAILED"' <<<"$st1" && grep -q '"htlcs":0' <<<"$st1" && grep -q NO_ROUTE <<<"$st1" \
 		&& [ "$(attempts "$ph1")" = 0 ] \
-		&& ok "a 5000 sat fee limit through the attacker's 60 sat hop: lowered by the guard, no route, never attempted ($st1)" \
+		&& ok "a 5000 sat fee limit through the attacker's 200 sat hop: lowered by the guard to the 121 sat ceiling, no route, never attempted ($st1)" \
 		|| bad "attacker route: $st1 $(head -c 200 "$work/r1")"
 	upb
 	# the backend retries every 15 s; the third "no route" gives the swap up
@@ -571,13 +572,13 @@ if subswap "$inv1"; then
 	docker logs $GUARD >"$work/glog" 2>&1
 	grep -q 'payment_failed' "$work/glog" && ok "the guard released the payment on lnd's FAILED" || bad "no payment_failed in the guard's log"
 else bad "attacker swap not created"; upb; fi
-# a free hop (the same 9-block hint, no fee) is tried within the same
-# rewritten limit (its fake end fails it): the attacker's hop failed on its
-# fee, not on the route's length
-read -r inv2 ph2 < <("$work/hintinv" 20000 "$upk" 0 0 | paste -sd' ')
+# a 60 sat hop (the same 9-block hint) is under the 121 sat ceiling: it is
+# tried (its fake end fails it), so the 200 sat hop failed on its fee only
+# and routing is not clamped to the lockup's surplus any more
+read -r inv2 ph2 < <("$work/hintinv" 20000 "$upk" 60000 0 | paste -sd' ')
 if subswap "$inv2"; then
 	n2=$(attempts "$ph2")
-	[ "$n2" -gt 0 ] && ok "a free hop is attempted within the rewritten limit ($n2 attempts in lnd's log; its fake end fails them, as expected)" || {
+	[ "$n2" -gt 0 ] && ok "a 60 sat hop is attempted under the 121 sat ceiling ($n2 attempts in lnd's log; its fake end fails them, as expected)" || {
 		bad "the cheap route was not attempted: $(paystate "$ph2")"
 		docker compose logs boltz 2>&1 | grep -E "$sid" | grep -iE "pay|cltv|fail" | tail -5 >&2
 	}
