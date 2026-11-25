@@ -158,6 +158,12 @@ start_guard -e DAILY_SAT=10000000000 -e LAUNCH_MODE=0
 ok "registered with lnd-swap ($(docker logs $GUARD 2>&1 | grep -c registered)x)"
 allowed "GetInfo through the guard" KS getinfo
 
+log "an inflated lnd wallet history (the backend's listings must stay bounded)"
+own=$(LS newaddress p2tr | jq -r .address)
+for i in $(seq 1 300); do LS sendcoins --addr "$own" --amt 5000 --sat_per_vbyte 1 --force >/dev/null 2>&1 || true; [ $((i % 50)) = 0 ] && K generatetoaddress 1 "$(K getnewaddress)" >/dev/null; done
+K generatetoaddress 1 "$(K getnewaddress)" >/dev/null
+ok "lnd-swap's wallet history: $(LS listchaintxns | jq '.transactions | length') transactions"
+
 log "backend on the guarded macaroon and the xpub: the e2e scenarios"
 cp boltz.conf "$work/boltz.conf.orig"
 # lnd-proxy as in production: nginx's gRPC proxy capping requests at 256 KiB
@@ -395,6 +401,24 @@ sleep 4
 code=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null -w '%{http_code}' -X POST "http://$gip:8091/v1/health" 2>/dev/null || true)
 [ "$(restarts)" = "$before" ] && [ "$mid" = "$before" ] && ok "4500 slow connections ($(cat "$work/slow.out")): the guard stayed up" || bad "the guard went down under slow connections: $(restarts)"
 [ "$code" = 204 ] && ok "the API answers again after them" || bad "API after slowloris: $code"
+
+log "the sixth review: canonical addresses, bounded listings, memo nonce, the shim's limits"
+upaddr=$(tr '[:lower:]' '[:upper:]' <<<"$addr")
+refused "SendCoins to an uppercase (non-canonical) address" KS sendcoins --addr "$upaddr" --amt 100000 --sat_per_vbyte 1 --force
+refused "the whole wallet history (from height 0, unbounded)" KS listchaintxns --start_height 0
+tip=$(K getblockcount)
+allowed "a recent page of the wallet history" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 100
+nh=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
+allowed "a hold invoice (memo of its own)" KS addholdinvoice "$nh" --amt 20000 --expiry 3600 --memo backend-memo
+memo=$(LS lookupinvoice "$nh" | jq -r .memo)
+[[ $memo == kiloswap\ * ]] && ok "lnd made it with the guard's memo nonce ($memo)" || bad "the hold's memo is '$memo', not the guard's"
+KS cancelinvoice "$nh" >/dev/null 2>&1 || true
+shim() { docker compose exec -T knots sh -c "wget -q -O- --header 'content-type: application/json' --post-data '$2' http://lab:lab@shim:8332$1 2>&1 || true"; }
+shimcode() { docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/null -w '%{http_code}' -u lab:lab -H 'content-type: application/json' -d "$2" "http://shim:8332$1"; }
+[ "$(shimcode / '[{"id":1,"method":"getblockcount","params":[]}]')" = 400 ] && ok "the shim refuses batches" || bad "the shim took a batch"
+[ "$(shimcode / '{"id":1,"method":"stop","params":[]}')" = 403 ] && ok "the shim refuses methods outside its list (stop)" || bad "the shim forwarded stop"
+[ "$(shimcode /wallet/other '{"id":1,"method":"listunspent","params":[]}')" = 403 ] && ok "the shim refuses other wallets" || bad "the shim reached another wallet"
+[ "$(shimcode / '{"id":1,"method":"getblockcount","params":[]}')" = 200 ] && ok "the shim still answers the backend's methods" || bad "the shim refused getblockcount"
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
