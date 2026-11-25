@@ -191,7 +191,11 @@ func main() {
 		MaxHoldParts:         int(num("MAX_HOLD_PARTS", 16)),
 		ReverseMarginBlocks:  num("REVERSE_MARGIN_BLOCKS", 36),
 		MaxHoldCltv:          uint64(num("MAX_HOLD_CLTV", 432)),
-		LockupFeeFactor:      2,
+		LockupFeeFactor:      1.25,
+		MinReverseSat:        num("MIN_REVERSE_SAT", 10_000),
+		MaxLockupsPerBlock:   int(num("MAX_LOCKUPS_PER_BLOCK", 2)),
+		RoutingCap:           env("ROUTING_CAP", "0") == "1", // off until the operator decides
+		RoutingFloorSat:      num("ROUTING_FLOOR_SAT", 121),
 		ApprovedExpireBlocks: num("APPROVED_EXPIRE_BLOCKS", 72),
 		MaxSubTimeoutBlocks:  num("MAX_SUB_TIMEOUT_BLOCKS", 1200),
 		MaxInflightPayments:  int(num("MAX_INFLIGHT_PAYMENTS", 10)),

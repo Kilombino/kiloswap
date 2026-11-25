@@ -265,7 +265,7 @@ func newEnv(t *testing.T) *env {
 		MinInvoiceSat: 10_000, ClaimMarginBlocks: 40, MinSubTimeoutBlocks: 72,
 		ConfTiers:    []ConfTier{{1_000_000, 3}, {10_000_000, 6}, {100_000_000, 12}},
 		UrgentBlocks: 24, UrgentFeeFraction: 0.1, MaxHoldParts: 16, ReverseMarginBlocks: 36,
-		MaxHoldCltv: 288, LockupFeeFactor: 2,
+		MaxHoldCltv: 288, LockupFeeFactor: 2, MinReverseSat: 10_000, MaxLockupsPerBlock: 2,
 		Net: &chaincfg.RegressionNetParams, Swaps: e.swaps, LN: e.ln, Chain: e.chain, Keys: k,
 		LSP: fakeLSP{}, Ledger: led,
 	}
@@ -521,7 +521,7 @@ const (
 // and the backend's row for its lockup.
 func (e *env) reverse(idx uint32, sat int64, b byte) (ReverseSwap, []byte, *btcec.PrivateKey) {
 	pre, hash := preimage(b)
-	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: sat + 1000})
+	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: sat + 2000})
 	if err != nil {
 		e.t.Fatal(err)
 	}
@@ -529,7 +529,7 @@ func (e *env) reverse(idx uint32, sat int64, b byte) (ReverseSwap, []byte, *btce
 	e.p.Ledger.Lock()
 	memo := e.p.Ledger.Holds[hex.EncodeToString(hash)].Memo // lnd keeps the guard's memo
 	e.p.Ledger.Unlock()
-	e.ln.invoices[hex.EncodeToString(hash)] = &InvoiceInfo{State: InvoiceAccepted, Memo: memo, PaidMsat: (sat + 1000) * 1000, HTLCExpiries: []int32{1200}}
+	e.ln.invoices[hex.EncodeToString(hash)] = &InvoiceInfo{State: InvoiceAccepted, Memo: memo, PaidMsat: (sat + 2000) * 1000, HTLCExpiries: []int32{1200}}
 	user := randKey()
 	server, _ := e.keys.Public(idx)
 	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
@@ -621,7 +621,7 @@ func TestCancelOnlyOwnAndNotWhileLockedUp(t *testing.T) {
 	mustRefuse(t, err, "stays until")
 	// a hold invoice the backend tried to add with an existing hash is never its own
 	e.ln.invoices[hex.EncodeToString(other)] = &InvoiceInfo{State: InvoiceAccepted}
-	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: other, Expiry: 3600, Value: 1000})
+	_, err = e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: other, Expiry: 3600, Value: 20000})
 	mustRefuse(t, err, "already exists")
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: other})
 	mustRefuse(t, err, "not a Kiloswap")
@@ -630,7 +630,7 @@ func TestCancelOnlyOwnAndNotWhileLockedUp(t *testing.T) {
 func TestHoldRecordedOnlyWhenLndCreatedIt(t *testing.T) {
 	e := newEnv(t)
 	_, hash := preimage(40)
-	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 1000})
+	id, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 20000})
 	mustAllow(t, err)
 	e.answer(id, nil, true) // lnd refused it
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
@@ -645,7 +645,7 @@ func TestPendingCountIsTheGuards(t *testing.T) {
 	e.reverse(41, 100_000, 41)
 	e.reverse(42, 100_000, 42)
 	_, hash := preimage(43)
-	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 1000})
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: hash, Expiry: 3600, Value: 20000})
 	mustRefuse(t, err, "pending")
 }
 
@@ -1164,7 +1164,7 @@ func TestLockupCheckedBeforeCancelRefused(t *testing.T) {
 	_, hash := preimage(102)
 	_, err = e.call(cancelURI, &lnrpc.CancelInvoiceMsg{PaymentHash: hash})
 	mustAllow(t, err)
-	err = e.p.allowSend(context.Background(), 999, l, 1000)
+	err = e.p.allowSend(context.Background(), 999, l, 1000, 2)
 	mustRefuse(t, err, "no longer open")
 }
 
@@ -1272,11 +1272,11 @@ func TestGetTransactionsBounded(t *testing.T) {
 	e.chain.height = 10_000
 	_, err := e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 0, EndHeight: -1, MaxTransactions: 0})
 	mustRefuse(t, err, "max_transactions")
-	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 0, EndHeight: -1, MaxTransactions: 50})
+	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 0, EndHeight: -1, MaxTransactions: 7})
 	mustRefuse(t, err, "too old")
-	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 51})
+	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 8})
 	mustRefuse(t, err, "max_transactions")
-	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 50})
+	_, err = e.call(uri, &lnrpc.GetTransactionsRequest{StartHeight: 9000, EndHeight: -1, MaxTransactions: 7})
 	mustAllow(t, err)
 }
 
@@ -1449,10 +1449,10 @@ func TestHeavyCallsRateLimited(t *testing.T) {
 	_, err := e.call("/lnrpc.Lightning/DescribeGraph", &lnrpc.WalletBalanceRequest{})
 	mustRefuse(t, err, "not allowed") // the backend has no use for the whole graph
 	for i := 0; i < 60; i++ {
-		_, err := e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 50})
+		_, err := e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 7})
 		mustAllow(t, err)
 	}
-	_, err = e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 50})
+	_, err = e.call("/lnrpc.Lightning/GetTransactions", &lnrpc.GetTransactionsRequest{StartHeight: 900, EndHeight: -1, MaxTransactions: 7})
 	mustRefuse(t, err, "a minute")
 }
 
@@ -1548,7 +1548,7 @@ func TestAllowSendLooksAgainUnderTheLock(t *testing.T) {
 	mustAllow(t, err)
 	_, hash := preimage(150)
 	e.ln.invoices[hex.EncodeToString(hash)].State = InvoiceCanceled
-	err = e.p.allowSend(context.Background(), 1, l, 1000)
+	err = e.p.allowSend(context.Background(), 1, l, 1000, 2)
 	mustRefuse(t, err, "no longer paid")
 }
 

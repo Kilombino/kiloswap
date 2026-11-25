@@ -205,6 +205,9 @@ func judge(ctx context.Context, p Judge, req *lnrpc.RPCMiddlewareRequest, logger
 		if err != nil {
 			feedback.Error = err.Error()
 			logger.Printf("refused %s: %v", t.Request.GetMethodFullUri(), err)
+			if jctx.Err() == nil {
+				p.Replacement(req.RequestId) // a refused request's replacement is dropped
+			}
 		} else {
 			if j := policy.Allowed[t.Request.GetMethodFullUri()]; j {
 				logger.Printf("allowed %s (request %d)", t.Request.GetMethodFullUri(), req.RequestId)

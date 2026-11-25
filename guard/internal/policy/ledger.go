@@ -113,6 +113,7 @@ type Payment struct {
 	LockupSat int64     `json:"lockupSat"`
 	ClaimTx   string    `json:"claimTx,omitempty"`
 	ClaimFee  int64     `json:"claimFee,omitempty"`
+	LostTx    string    `json:"lostTx,omitempty"` // the user's refund that spent the lockup
 	Bump      Bump      `json:"claimBump,omitempty"`
 	At        time.Time `json:"at"`
 }
@@ -124,6 +125,10 @@ const (
 	PaySucceeded = "succeeded"
 	PayFailed    = "failed"
 	PayClaimed   = "claimed"
+	// PayLost: paid, yet the user's refund spent the lockup first (the
+	// guard was down past the timeout). Followed only by whether the lockup
+	// is unspent again (a reorg), never by a new chain search each round.
+	PayLost = "lost"
 )
 
 // Ledger is the guard's memory, on disk so a restart forgets nothing. Only

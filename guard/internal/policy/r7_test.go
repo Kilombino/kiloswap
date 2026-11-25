@@ -18,7 +18,7 @@ import (
 func TestR7CancelForeignAfterLostAnswer(t *testing.T) {
 	e := newEnv(t)
 	_, h := preimage(90)
-	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h, Expiry: 3600, Value: 1000, CltvExpiry: 5})
+	_, err := e.call(holdURI, &lnrpc.AddHoldInvoiceRequest{Hash: h, Expiry: 3600, Value: 20000, CltvExpiry: 5})
 	mustAllow(t, err)
 	e.p.ResetPending() // stream reset: lnd's error answer never seen
 	e.ln.invoices[hex.EncodeToString(h)] = &InvoiceInfo{Memo: "bridge", State: InvoiceAccepted, PaidMsat: 5e9, ValueMsat: 5e9, Created: time.Now()}
@@ -79,16 +79,17 @@ func TestR7DecoyedApprovalsStarveSettlement(t *testing.T) {
 	e.p.Chain = sc
 	e.p.ApprovedExpireBlocks = 72
 	e.p.MaxPendingReverse = 10
+	e.p.MaxLockupsPerBlock = 0 // this test is about the tick, not the rate
 	now := time.Now()
 	e.p.Now = func() time.Time { return now }
 	var hashes []string
 	for i := byte(0); i < 5; i++ {
-		r, _, _ := e.reverse(uint32(100+i), 2000, 100+i)
+		r, _, _ := e.reverse(uint32(100+i), 20000, 100+i)
 		id, err := e.call(sendURI, sendReq(r))
 		mustAllow(t, err)
 		e.answer(id, nil, true)
 		pk, _ := e.p.addrScript(r.LockupAddress)
-		e.chain.txs["decoy"+string(rune('a'+i))] = []Output{{PkScript: pk, Sat: 2000, Confirmations: 2}}
+		e.chain.txs["decoy"+string(rune('a'+i))] = []Output{{PkScript: pk, Sat: 20000, Confirmations: 2}}
 		_, h := preimage(100 + i)
 		hashes = append(hashes, hex.EncodeToString(h))
 	}
@@ -141,7 +142,7 @@ func TestR7UnresolvedCapped(t *testing.T) {
 	e.p.MaxUnresolved = 2
 	e.p.MaxPendingReverse = 10
 	for i := byte(0); i < 3; i++ {
-		r, _, _ := e.reverse(uint32(130+i), 2000, 130+i)
+		r, _, _ := e.reverse(uint32(130+i), 20000, 130+i)
 		_, err := e.call(sendURI, sendReq(r))
 		if i < 2 {
 			mustAllow(t, err)

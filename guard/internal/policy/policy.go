@@ -292,6 +292,20 @@ type Policy struct {
 	// LockupFeeFactor caps a lockup's fee rate at this times the node's
 	// estimate (at least 2 sat/vB): no paying the miners to grief.
 	LockupFeeFactor float64
+	// MinReverseSat is the smallest reverse swap (its hold invoice; the
+	// backend's minSwapAmount): tiny ones cost the operator more in miner
+	// fees than they could ever pay.
+	MinReverseSat int64
+	// MaxLockupsPerBlock caps the lockups allowed at one height (a loop of
+	// swaps never claimed spends the operator's coins on fees one block at
+	// a time, not all at once).
+	MaxLockupsPerBlock int
+	// RoutingCap (off until the operator decides): a submarine payment's
+	// routing fee limit is lowered, by replacing the request, to
+	// min(FeeRatio of the invoice, max(lockup surplus over the invoice and
+	// the claim, RoutingFloorSat)).
+	RoutingCap      bool
+	RoutingFloorSat int64
 	Net             *chaincfg.Params
 	Swaps           Swaps
 	LN              Lightning
@@ -405,6 +419,23 @@ func (p *Policy) cachedConfs(ctx context.Context, txid string, height int64, use
 // ClaimVbytes is what the guard's claim of a submarine lockup weighs at
 // most (one taproot script-path input with preimage, one output).
 const ClaimVbytes = 151
+
+// What a reverse swap's hold invoice must pay over the lockup, at the
+// lockup's own fee rate: the lockup transaction (LockupVbytes), a refund if
+// the user never claims (RefundVbytes) and RefundDustSat (the refund's
+// output and rounding). The backend charges the same as the reverse
+// "lockup" miner fee.
+const (
+	LockupVbytes  = 155
+	RefundVbytes  = 111
+	RefundDustSat = 330
+)
+
+// ReverseCostSat is what a lockup at rate costs the operator beyond its
+// amount, at worst (sent and later refunded).
+func ReverseCostSat(rate float64) int64 {
+	return int64(math.Ceil(float64(LockupVbytes+RefundVbytes)*rate)) + RefundDustSat
+}
 
 type pendingReq struct {
 	epoch  uint64 // the registration with lnd it belongs to
@@ -644,6 +675,10 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 		return refuse("coins may not be chosen")
 	case r.Amount <= 0:
 		return refuse("amount must be positive")
+	case r.Amount < p.MinReverseSat/2:
+		// a lockup is the hold invoice less the fees: never under half the
+		// smallest reverse swap
+		return refuse("%d sat is under the %d sat minimum of a lockup", r.Amount, p.MinReverseSat/2)
 	case r.Amount > p.MaxPerOpSat:
 		return refuse("%d sat is over the %d sat limit per operation", r.Amount, p.MaxPerOpSat)
 	case r.TargetConf != 0:
@@ -698,7 +733,7 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 			lastErr = err
 			continue
 		}
-		return p.allowSend(ctx, requestID, l, height)
+		return p.allowSend(ctx, requestID, l, height, float64(r.SatPerVbyte)+float64(r.SatPerByte))
 	}
 	return lastErr
 }
@@ -779,7 +814,7 @@ func (p *Policy) checkReverse(ctx context.Context, s ReverseSwap, want []byte, h
 	}, nil
 }
 
-func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, height int64) error {
+func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, height int64, rate float64) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.Ledger.Lock()
@@ -799,6 +834,20 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 	if p.MaxUnresolved > 0 && unresolved >= p.MaxUnresolved {
 		return refuse("%d lockups allowed and not seen on chain yet, the limit is %d", unresolved, p.MaxUnresolved)
 	}
+	if p.MaxLockupsPerBlock > 0 {
+		n := 0
+		for _, x := range p.Ledger.Lockups {
+			if x.SentAt == height {
+				n++
+			}
+		}
+		if n >= p.MaxLockupsPerBlock {
+			return refuse("%d lockups allowed at height %d already, at most %d a block", n, height, p.MaxLockupsPerBlock)
+		}
+	}
+	if h := p.Ledger.Holds[l.Hash]; h != nil && h.Sat < p.MinReverseSat {
+		return refuse("the hold invoice is %d sat, under the %d sat minimum", h.Sat, p.MinReverseSat)
+	}
 	// and lnd still holds it paid, asked again under the lock
 	hb, _ := hex.DecodeString(l.Hash)
 	p.Ledger.Unlock()
@@ -806,6 +855,10 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 	p.Ledger.Lock()
 	if err != nil || inv == nil || inv.State != InvoiceAccepted || inv.PaidMsat < l.Sat*1000 {
 		return refuse("the hold invoice is no longer paid and held")
+	}
+	// what the payer paid must cover the lockup, its fee and a refund's
+	if cover := l.Sat + ReverseCostSat(rate); inv.PaidMsat < cover*1000 {
+		return refuse("the hold invoice holds %d msat, less than the lockup with its fee and a refund's (%d sat at %.0f sat/vB)", inv.PaidMsat, cover, rate)
 	}
 	if h := p.Ledger.Holds[l.Hash]; h == nil || h.State != "open" {
 		return refuse("the hold invoice is no longer open (being cancelled?)")
@@ -969,6 +1022,20 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if p.MaxSubTimeoutBlocks > 0 && s.Timeout-height > p.MaxSubTimeoutBlocks {
 		return refuse("the swap's timeout is %d blocks away, at most %d", s.Timeout-height, p.MaxSubTimeoutBlocks)
 	}
+	if p.RoutingCap {
+		// routing paid out of what the lockup brings over the invoice and
+		// the claim (never under the floor, never over FeeRatio)
+		capMsat := min(maxFeeMsat, max((o.Sat-cover)*1000, p.RoutingFloorSat*1000))
+		if feeMsat > capMsat {
+			repl := proto.Clone(r).(*lnrpc.SendPaymentRequest)
+			repl.FeeLimitSat, repl.FeeLimitMsat = 0, capMsat
+			b, err := proto.Marshal(repl)
+			if err != nil {
+				return refuse("replacing the fee limit: %v", err)
+			}
+			p.setReplacement(requestID, b)
+		}
+	}
 	return p.allowPay(ctx, o.Confirmations, &Payment{
 		SwapID: s.ID, Hash: hh, Sat: sat, Request: requestID, State: PayInflight,
 		KeyIndex: uint32(s.KeyIndex), UserKey: strings.ToLower(s.RefundKey), Timeout: uint32(s.Timeout),
@@ -1031,6 +1098,9 @@ func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHold
 	}
 	if sat <= 0 || sat > p.MaxPerOpSat {
 		return refuse("%d sat is not within 1..%d", sat, p.MaxPerOpSat)
+	}
+	if sat < p.MinReverseSat {
+		return refuse("%d sat is under the %d sat minimum of a reverse swap", sat, p.MinReverseSat)
 	}
 	if p.MaxHoldCltv > 0 && r.CltvExpiry > p.MaxHoldCltv {
 		return refuse("cltv_expiry %d over %d", r.CltvExpiry, p.MaxHoldCltv)
@@ -1174,6 +1244,12 @@ func (p *Policy) settle(requestID uint64, hash []byte) error {
 	}
 	p.Ledger.Lock()
 	defer p.Ledger.Unlock()
+	if l := p.Ledger.Lockups[h]; l != nil && (l.State == LockRefunding || l.State == LockRefunded || l.State == LockExpired) {
+		// the coins are coming (or came) back to the operator: the payer
+		// keeps the payment too. A user's claim that wins over the refund
+		// is seen on chain and the guard settles then itself.
+		return refuse("the lockup is %s: the hold invoice is settled only from a claim on chain", l.State)
+	}
 	p.track(requestID, pendingReq{method: "/invoicesrpc.Invoices/SettleInvoice", hash: h})
 	return nil
 }
@@ -1372,6 +1448,7 @@ func (p *Policy) ResetPending() {
 	p.pmu.Lock()
 	old := p.pending
 	p.pending = map[uint64]pendingReq{}
+	p.replace = nil // replacements of requests lnd will never send again
 	p.epoch++
 	p.pmu.Unlock()
 	_ = old // holds, lockups and payments of those calls are on the ledger:
@@ -1394,9 +1471,10 @@ func (p *Policy) judgeGetTransactions(ctx context.Context, m *lnrpc.RPCMessage) 
 	switch {
 	case r.Account != "":
 		return refuse("the default account only")
-	case r.MaxTransactions == 0 || r.MaxTransactions > 50:
-		// a page must stay far under the guard's message limit
-		return refuse("max_transactions must be 1..50")
+	case r.MaxTransactions == 0 || r.MaxTransactions > MaxTxPage:
+		// lnd's answer carries each transaction's raw hex (up to ~800 KB
+		// each): a page must stay under the guard's 8 MiB message limit
+		return refuse("max_transactions must be 1..%d", MaxTxPage)
 	case int64(r.StartHeight) < tip-4320:
 		return refuse("start_height %d is too old (at most 4320 blocks back)", r.StartHeight)
 	case r.EndHeight != -1 && r.EndHeight < r.StartHeight:
@@ -1469,6 +1547,9 @@ func (p *Policy) addInvoice(requestID uint64, m *lnrpc.RPCMessage) error {
 	p.track(requestID, pendingReq{method: "/lnrpc.Lightning/AddInvoice"})
 	return nil
 }
+
+// MaxTxPage is the most transactions one GetTransactions page may ask.
+const MaxTxPage = 7
 
 // MaxInvoicesPerMinute caps AddInvoice.
 const MaxInvoicesPerMinute = 30
@@ -1543,6 +1624,11 @@ func (p *Policy) Epoch() uint64 {
 // ForgetIn is Forget for a judgment begun in registration epoch: a request
 // id reused after lnd restarted belongs to another call, never undone.
 func (p *Policy) ForgetIn(requestID, epoch uint64) {
+	p.pmu.Lock()
+	if p.epoch == epoch {
+		delete(p.replace, requestID) // a late judgment's replacement is never sent
+	}
+	p.pmu.Unlock()
 	r, ok := p.pendingFor(requestID)
 	if !ok || r.epoch != epoch {
 		return

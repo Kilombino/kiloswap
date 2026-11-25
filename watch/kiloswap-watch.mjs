@@ -198,6 +198,7 @@ if (ALERT_PORT) {
         claimed: () => `✅ Kiloswap: el guardián ha cobrado ${sat(j.sat)} sats (comisión de red ${sat(j.fee)}) — ${String(j.txid).slice(0, 16)}…`,
         refunded: () => `↩️ Kiloswap: el guardián ha reembolsado ${sat(j.sat)} sats (swap ${j.swap})`,
         settled: () => `💰 Kiloswap: factura liquidada ${sat(j.sat)} sats (swap ${j.swap})`,
+        guard_payment_lost: () => `🚨 Kiloswap: pagado por Lightning pero el usuario recuperó su depósito antes del cobro (swap ${j.swap}, ${sat(j.sat)} sats perdidos) — ${String(j.txid).slice(0, 16)}…`,
         guard_claim_failed: () => `🚨 Kiloswap: el guardián no ha podido cobrar (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
         guard_lockup_error: () => `🚨 Kiloswap: depósito con problemas (swap ${j.swap}): ${String(j.error).slice(0, 200)}`,
         lockup_allowed: () => `🟢 Kiloswap: depósito permitido ${sat(j.sat)} sats (swap ${j.swap})`,

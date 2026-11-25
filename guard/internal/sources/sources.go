@@ -244,7 +244,11 @@ func (l LN) TrackPayment(ctx context.Context, hash []byte) (int32, string, error
 	var p lnrpc.Payment
 	if err := st.RecvMsg(&p); err != nil {
 		// only lnd's own NotFound means "no such payment"; anything else is
-		// unknown (a payment is never given back on a guess)
+		// unknown (a payment is never given back on a guess). Checked in the
+		// lnd fork (0.21.8-beta-blake2b.24.1): TrackPaymentV2 ->
+		// subscribePayment maps paymentsdb.ErrPaymentNotInitiated (FetchPayment
+		// of a hash never initiated) to codes.NotFound, nothing else
+		// (lnrpc/routerrpc/router_server.go, payments/db/kv_store.go)
 		if status.Code(err) == codes.NotFound {
 			return 0, "", nil
 		}

@@ -81,12 +81,26 @@ func (p *Policy) reconcilePayments(ctx context.Context) {
 func (p *Policy) claimPaid(ctx context.Context) {
 	p.Ledger.Lock()
 	var todo []*Payment
+	var lost []*Payment
 	for _, x := range p.Ledger.Payments {
-		if x.State == PaySucceeded {
+		switch x.State {
+		case PaySucceeded:
 			todo = append(todo, x)
+		case PayLost:
+			lost = append(lost, x)
 		}
 	}
 	p.Ledger.Unlock()
+	for _, x := range lost {
+		// a reorg that undid the user's refund: claim again
+		if unspent, err := p.Chain.Unspent(ctx, x.LockupTx, x.Vout); err == nil && unspent {
+			p.Ledger.Lock()
+			x.State, x.LostTx = PaySucceeded, ""
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+			todo = append(todo, x)
+		}
+	}
 	for _, x := range todo {
 		if _, _, err := p.claim(ctx, x); err != nil && !errors.Is(err, ErrNotYet) {
 			p.pmu.Lock()
@@ -157,7 +171,18 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 	// a claim broadcast before a crash, not recorded: only our key can spend
 	// the claim leaf, so a claim-leaf spend is ours
 	if unspent, err := p.Chain.Unspent(ctx, x.LockupTx, x.Vout); err == nil && !unspent {
-		if sp, err := p.Chain.Spender(ctx, x.LockupTx, x.Vout, height-maxScanBack); err == nil && sp != nil && out.SpendsLeaf(sp.Witness, out.ClaimLeaf) {
+		sp, err := p.Chain.Spender(ctx, x.LockupTx, x.Vout, height-maxScanBack)
+		if err == nil && sp != nil && !out.SpendsLeaf(sp.Witness, out.ClaimLeaf) {
+			// not our claim: the user's refund won. Remembered, so the chain
+			// is not searched again every round
+			p.Ledger.Lock()
+			x.State, x.LostTx = PayLost, sp.TxID
+			_ = p.Ledger.save()
+			p.Ledger.Unlock()
+			p.notify("guard_payment_lost", map[string]any{"swap": x.SwapID, "sat": x.Sat, "txid": sp.TxID})
+			return "", 0, fmt.Errorf("the lockup was spent by %s, not our claim", sp.TxID)
+		}
+		if err == nil && sp != nil && out.SpendsLeaf(sp.Witness, out.ClaimLeaf) {
 			p.Ledger.Lock()
 			x.ClaimTx, x.State = sp.TxID, PayClaimed
 			x.Bump = Bump{TxIDs: []string{sp.TxID}, Dest: x.Bump.Dest, Height: height, Rate: 1}
