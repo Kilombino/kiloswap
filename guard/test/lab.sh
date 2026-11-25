@@ -230,6 +230,7 @@ if [ -z "${SKIP_E2E:-}" ]; then
 fi
 
 start_guard
+docker logs $GUARD 2>&1 | grep -q "per op 10000000 sat, daily 25000000 sat.*2 unresolved lockups" && ok "with no limits in its environment the guard starts with the launch limits (and says so)" || bad "the guard's default limits: $(docker logs $GUARD 2>&1 | grep 'per op' | tail -1)"
 log "a backend taken over: direct calls with its macaroon"
 addr=$(LU newaddress p2wkh | jq -r .address)
 refused "SendCoins to a random address" KS sendcoins --addr "$addr" --amt 100000 --force --sat_per_vbyte 2
@@ -407,7 +408,7 @@ upaddr=$(tr '[:lower:]' '[:upper:]' <<<"$addr")
 refused "SendCoins to an uppercase (non-canonical) address" KS sendcoins --addr "$upaddr" --amt 100000 --sat_per_vbyte 1 --force
 refused "the whole wallet history (from height 0, unbounded)" KS listchaintxns --start_height 0
 tip=$(K getblockcount)
-allowed "a recent page of the wallet history" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 100
+allowed "a recent page of the wallet history" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 50
 nh=$(openssl rand -hex 32 | xxd -r -p | sha256sum | cut -d' ' -f1)
 allowed "a hold invoice (memo of its own)" KS addholdinvoice "$nh" --amt 20000 --expiry 3600 --memo backend-memo
 memo=$(LS lookupinvoice "$nh" | jq -r .memo)
@@ -419,6 +420,32 @@ shimcode() { docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -o /dev/
 [ "$(shimcode / '{"id":1,"method":"stop","params":[]}')" = 403 ] && ok "the shim refuses methods outside its list (stop)" || bad "the shim forwarded stop"
 [ "$(shimcode /wallet/other '{"id":1,"method":"listunspent","params":[]}')" = 403 ] && ok "the shim refuses other wallets" || bad "the shim reached another wallet"
 [ "$(shimcode / '{"id":1,"method":"getblockcount","params":[]}')" = 200 ] && ok "the shim still answers the backend's methods" || bad "the shim refused getblockcount"
+
+log "the seventh review: canonical SendCoins, pages of 50, the shim's strict parameters and caps"
+refused "SendCoins with a 200-character label (lnd would refuse it after approval)" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 1 --label "$(printf 'x%.0s' $(seq 200))" --force
+refused "SendCoins with min_confs 1000" KS sendcoins --addr "$addr" --amt 100000 --sat_per_vbyte 1 --min_confs 1000 --force
+refused "a wallet history page of 51" KS listchaintxns --start_height $((tip - 100)) --end_height -1 --max_transactions 51
+fh=$(openssl rand -hex 32)
+LS addinvoice --amt 1000 --preimage "$fh" --memo bridge >/dev/null 2>&1 || true
+fhash=$(printf '%s' "$fh" | xxd -r -p | sha256sum | cut -d' ' -f1)
+refused "cancelling the operator's own invoice (not a guard hold)" KS cancelinvoice "$fhash"
+bh=$(K getbestblockhash)
+[ "$(shimcode / '{"id":1,"method":"getblockcount","method":"stop","params":[]}')" = 400 ] && ok "the shim refuses a request with duplicate keys" || bad "the shim took duplicate keys"
+[ "$(shimcode / '{"id":1,"method":"getblock","params":{"blockhash":"'"$bh"'"}}')" = 400 ] && ok "the shim refuses named parameters" || bad "the shim took named parameters"
+[ "$(shimcode / '{"id":1,"method":"getblock","params":["'"$bh"'",2]}')" = 400 ] && ok "the shim refuses getblock verbosity 2" || bad "the shim took verbosity 2"
+[ "$(shimcode / '{"id":1,"method":"getblock","params":["'"$bh"'",1]}')" = 200 ] && ok "the shim answers getblock verbosity 1" || bad "the shim refused getblock verbosity 1"
+b10="[$(for i in $(seq 10); do printf '{"method":"getblock","params":["%s",0]},' "$bh"; done | sed 's/,$//')]"
+b11="[$(for i in $(seq 11); do printf '{"method":"getblock","params":["%s",0]},' "$bh"; done | sed 's/,$//')]"
+[ "$(shimcode / "$b10")" = 200 ] && ok "the shim answers a batch of 10 raw blocks (the sidecar's rescan)" || bad "the shim refused 10 raw blocks"
+[ "$(shimcode / "$b11")" = 400 ] && ok "the shim refuses 11 whole blocks in one batch" || bad "the shim took 11 blocks"
+knots=$(docker compose ps -q knots)
+rss() { docker stats --no-stream --format '{{.MemUsage}}' "$knots" | cut -d/ -f1 | tr -d ' '; }
+heavy="[$(for i in $(seq 100); do printf '{"method":"getblock","params":["%s",2]},' "$bh"; done | sed 's/,$//')]"
+r0=$(rss)
+codes=""
+for i in $(seq 20); do codes+="$(shimcode / "$heavy") "; done
+r1=$(rss)
+[ -z "$(tr -d '4 0' <<<"$codes")" ] && ok "20 batches of 100x getblock verbosity 2 refused before the node (knots RSS $r0 -> $r1)" || bad "heavy batches reached the node: $codes (RSS $r0 -> $r1)"
 
 log "guard stopped again"
 docker stop $GUARD >/dev/null
