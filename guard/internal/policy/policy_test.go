@@ -63,14 +63,14 @@ func (f *fakeLN) SettleInvoice(_ context.Context, pre []byte) error {
 	}
 	return nil
 }
-func (f *fakeLN) TrackPayment(_ context.Context, h []byte) (int32, string, error) {
+func (f *fakeLN) TrackPayment(_ context.Context, h []byte) (int32, string, int64, error) {
 	t, ok := f.tracks[hex.EncodeToString(h)]
 	if !ok {
-		return 0, "", nil
+		return 0, "", 0, nil
 	}
 	var s int32
 	fmt.Sscan(t[0], &s)
-	return s, t[1], nil
+	return s, t[1], 0, nil
 }
 func (f *fakeLN) CancelInvoice(_ context.Context, h []byte) error {
 	f.mu.Lock()
@@ -396,9 +396,14 @@ func TestPaymentChecks(t *testing.T) {
 	_, err = e.call(payURI, r)
 	mustRefuse(t, err, "outgoing")
 	r = payReq(inv)
-	r.FeeLimitSat = 5000
-	_, err = e.call(payURI, r)
-	mustRefuse(t, err, "fee limit")
+	r.FeeLimitSat = 5000 // over max(MinFeeSat, FeeRatio): lowered, never refused
+	id, err = e.call(payURI, r)
+	mustAllow(t, err)
+	q = lnrpc.SendPaymentRequest{}
+	if proto.Unmarshal(e.p.Replacement(id), &q) != nil || q.FeeLimitSat != 0 || q.FeeLimitMsat <= 0 || q.FeeLimitMsat >= 5_000_000 {
+		t.Fatalf("fee limit 5000 sat rewritten to %d msat (sat %d)", q.FeeLimitMsat, q.FeeLimitSat)
+	}
+	e.answer(id, &lnrpc.Payment{Status: paymentFailed}, false)
 	e.chain.txs[s.LockupTxID][0].Confirmations = 2
 	_, err = e.call(payURI, payReq(inv))
 	mustRefuse(t, err, "confirmations")

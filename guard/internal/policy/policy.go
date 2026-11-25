@@ -153,7 +153,7 @@ type Lightning interface {
 	CancelInvoice(ctx context.Context, hash []byte) error
 	// TrackPayment returns the payment's status (1 in flight, 2 succeeded,
 	// 3 failed) and its preimage once succeeded; 0 if lnd has no payment.
-	TrackPayment(ctx context.Context, hash []byte) (int32, string, error)
+	TrackPayment(ctx context.Context, hash []byte) (int32, string, int64, error)
 	NewAddress(ctx context.Context) (string, error)
 	// WalletOwns tells whether txid, mined at height, was sent by lnd's own
 	// wallet.
@@ -1027,9 +1027,6 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 		}
 		feeMsat = r.FeeLimitSat * 1000
 	}
-	if !p.RoutingCap && feeMsat > maxFeeMsat+999 { // the backend rounds up to whole sat
-		return refuse("routing fee limit %d msat over %d msat", feeMsat, maxFeeMsat)
-	}
 	if p.MaxSubTimeoutBlocks > 0 && s.Timeout-height > p.MaxSubTimeoutBlocks {
 		return refuse("the swap's timeout is %d blocks away, at most %d", s.Timeout-height, p.MaxSubTimeoutBlocks)
 	}
@@ -1039,6 +1036,10 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	// FeeRatio), the parts (MaxPayParts) and cltv_limit (the blocks left to
 	// claim, at most MaxPayCltv). Never raised, never anything else
 	wantFee, wantParts, wantCltv := feeMsat, r.MaxParts, r.CltvLimit
+	// without RoutingCap (Kilombino, 25 Nov 2026: routing like upstream):
+	// any limit over max(MinFeeSat, FeeRatio of the invoice) is lowered to
+	// it, never refused
+	wantFee = min(feeMsat, maxFeeMsat)
 	if p.RoutingCap {
 		wantFee = min(feeMsat, min(maxFeeMsat, max((o.Sat-cover)*1000, p.RoutingFloorSat*1000)))
 	}
@@ -1048,7 +1049,7 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if int64(wantCltv) > min(left, MaxPayCltv) {
 		wantCltv = int32(min(left, MaxPayCltv))
 	}
-	if wantFee != feeMsat || (p.RoutingCap && r.FeeLimitSat != 0) || wantParts != r.MaxParts || wantCltv != r.CltvLimit {
+	if wantFee != feeMsat || r.FeeLimitSat != 0 || wantParts != r.MaxParts || wantCltv != r.CltvLimit {
 		repl := proto.Clone(r).(*lnrpc.SendPaymentRequest)
 		repl.FeeLimitSat, repl.FeeLimitMsat = 0, wantFee
 		repl.MaxParts, repl.CltvLimit = wantParts, wantCltv
@@ -1453,7 +1454,7 @@ func (p *Policy) answeredPayment(requestID uint64, r pendingReq, m *lnrpc.RPCMes
 	switch u.Status {
 	case paymentSucceeded:
 		p.done(requestID)
-		p.paid(pay, u.PaymentPreimage)
+		p.paid(pay, u.PaymentPreimage, u.FeeMsat, true)
 	case paymentFailed:
 		p.done(requestID)
 		p.failed(pay)
@@ -1462,7 +1463,7 @@ func (p *Policy) answeredPayment(requestID uint64, r pendingReq, m *lnrpc.RPCMes
 
 // paid records a payment lnd reports as succeeded (caller holds the
 // ledger lock).
-func (p *Policy) paid(pay *Payment, preimage string) {
+func (p *Policy) paid(pay *Payment, preimage string, routingMsat int64, known bool) {
 	pre, err := hex.DecodeString(preimage)
 	h := sha256.Sum256(pre)
 	if err != nil || len(pre) != 32 || hex.EncodeToString(h[:]) != pay.Hash {
@@ -1471,12 +1472,16 @@ func (p *Policy) paid(pay *Payment, preimage string) {
 		return
 	}
 	pay.State, pay.Preimage = PaySucceeded, hex.EncodeToString(pre)
+	if known {
+		pay.RoutingMsat, pay.RoutingKnown = routingMsat, true
+	}
 	if e, ok := p.Ledger.Entries["pay:"+pay.Hash]; ok {
 		e.Done = true
 		p.Ledger.Entries["pay:"+pay.Hash] = e
 	}
 	_ = p.Ledger.save()
-	p.notify("payment_succeeded", map[string]any{"swap": pay.SwapID, "sat": pay.Sat})
+	p.notify("payment_succeeded", map[string]any{"swap": pay.SwapID, "sat": pay.Sat,
+		"routing": (pay.RoutingMsat + 999) / 1000, "routingKnown": pay.RoutingKnown})
 }
 
 // failed gives back a payment lnd reports as failed (caller holds the lock).

@@ -3,6 +3,17 @@
 Kiloswap's guard, shim and deployment, by review round (local history before
 the first deployment).
 
+## 25 Nov 2026 (production settings)
+
+- Routing like upstream (Kilombino): with `ROUTING_CAP=0` the guard no longer
+  refuses a submarine payment whose fee limit is over
+  max(`MIN_FEE_SAT`, `FEE_RATIO` of the invoice): it lowers it to that ceiling
+  (production: `MIN_FEE_SAT=121`, `FEE_RATIO=0.0001`, Paul's formula). The
+  backend's routing floor is back to 121 sat.
+- The guard reports the routing fee lnd paid (`payment_succeeded`) and, when it
+  claims a submarine lockup, the swap's net result (claimed − invoice −
+  routing); the watcher shows both on Telegram.
+
 ## Review v9 (25 Nov 2026)
 
 - Shim: `getrawmempool` only on its own, never inside a batch.

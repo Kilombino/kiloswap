@@ -193,9 +193,11 @@ if (ALERT_PORT) {
       const sat = (n) => Number(n || 0).toLocaleString('es-ES');
       const moves = {
         lockup_sent: () => `⛓️ Kiloswap: depósito enviado ${sat(j.sat)} sats (swap ${j.swap})`,
-        payment_succeeded: () => `⚡ Kiloswap: pago hecho ${sat(j.sat)} sats (swap ${j.swap})`,
+        payment_succeeded: () => `⚡ Kiloswap: pago hecho ${sat(j.sat)} sats, ruta ${j.routingKnown ? sat(j.routing) + ' sats' : '¿?'} (swap ${j.swap})`,
         payment_failed: () => `⚠️ Kiloswap: pago fallido ${sat(j.sat)} sats (swap ${j.swap})`,
-        claimed: () => `✅ Kiloswap: el guardián ha cobrado ${sat(j.sat)} sats (comisión de red ${sat(j.fee)}) — ${String(j.txid).slice(0, 16)}…`,
+        claimed: () => j.invoice === undefined
+          ? `✅ Kiloswap: el guardián ha cobrado ${sat(j.sat)} sats (comisión de red ${sat(j.fee)}) — ${String(j.txid).slice(0, 16)}…`
+          : `✅ Kiloswap: on-chain → LN cerrado (swap ${j.swap}): cobrado ${sat(j.sat)} − pagado ${sat(j.invoice)} − ruta ${j.routingKnown ? sat(j.routing) : '¿?'} = ${Number(j.net) >= 0 ? '+' : ''}${sat(j.net)} sats netos (red del cobro ${sat(j.fee)})`,
         refunded: () => `↩️ Kiloswap: el guardián ha reembolsado ${sat(j.sat)} sats (swap ${j.swap})`,
         settled: () => `💰 Kiloswap: factura liquidada ${sat(j.sat)} sats (swap ${j.swap})`,
         guard_payment_lost: () => `🚨 Kiloswap: pagado por Lightning pero el usuario recuperó su depósito antes del cobro (swap ${j.swap}, ${sat(j.sat)} sats perdidos) — ${String(j.txid).slice(0, 16)}…`,

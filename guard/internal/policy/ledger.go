@@ -99,23 +99,26 @@ const HoldCreating = "creating"
 // Payment is a submarine swap's invoice the guard allowed to be paid, with
 // the lockup output it checked: what it claims on its own once paid.
 type Payment struct {
-	SwapID    string    `json:"swapId"`
-	Hash      string    `json:"hash"`
-	Sat       int64     `json:"sat"`
-	Request   uint64    `json:"request"`
-	State     string    `json:"state"`
-	Preimage  string    `json:"preimage,omitempty"`
-	KeyIndex  uint32    `json:"keyIndex"`
-	UserKey   string    `json:"userKey"`
-	Timeout   uint32    `json:"timeout"`
-	LockupTx  string    `json:"lockupTx"`
-	Vout      uint32    `json:"vout"`
-	LockupSat int64     `json:"lockupSat"`
-	ClaimTx   string    `json:"claimTx,omitempty"`
-	ClaimFee  int64     `json:"claimFee,omitempty"`
-	LostTx    string    `json:"lostTx,omitempty"` // the user's refund that spent the lockup
-	Bump      Bump      `json:"claimBump,omitempty"`
-	At        time.Time `json:"at"`
+	SwapID    string `json:"swapId"`
+	Hash      string `json:"hash"`
+	Sat       int64  `json:"sat"`
+	Request   uint64 `json:"request"`
+	State     string `json:"state"`
+	Preimage  string `json:"preimage,omitempty"`
+	KeyIndex  uint32 `json:"keyIndex"`
+	UserKey   string `json:"userKey"`
+	Timeout   uint32 `json:"timeout"`
+	LockupTx  string `json:"lockupTx"`
+	Vout      uint32 `json:"vout"`
+	LockupSat int64  `json:"lockupSat"`
+	ClaimTx   string `json:"claimTx,omitempty"`
+	ClaimFee  int64  `json:"claimFee,omitempty"`
+	// RoutingMsat: the routing fee lnd reports for the payment (when known)
+	RoutingMsat  int64     `json:"routingMsat,omitempty"`
+	RoutingKnown bool      `json:"routingKnown,omitempty"`
+	LostTx       string    `json:"lostTx,omitempty"` // the user's refund that spent the lockup
+	Bump         Bump      `json:"claimBump,omitempty"`
+	At           time.Time `json:"at"`
 }
 
 // Payment states.

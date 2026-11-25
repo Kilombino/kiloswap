@@ -56,14 +56,14 @@ func (p *Policy) reconcilePayments(ctx context.Context) {
 		// asked even while its stream looks open: a stalled stream must not
 		// hide a payment that succeeded (and must be claimed in time)
 		h, _ := hex.DecodeString(x.Hash)
-		status, pre, err := p.LN.TrackPayment(ctx, h)
+		status, pre, feeMsat, err := p.LN.TrackPayment(ctx, h)
 		if err != nil {
 			continue
 		}
 		p.Ledger.Lock()
 		switch status {
 		case paymentSucceeded:
-			p.paid(x, pre)
+			p.paid(x, pre, feeMsat, true)
 		case paymentFailed:
 			p.failed(x)
 		case 0:
@@ -214,7 +214,11 @@ func (p *Policy) claim(ctx context.Context, x *Payment) (string, int64, error) {
 	x.Bump = Bump{TxIDs: []string{txid}, Dest: sp.dest, Rate: sp.rate, Height: height}
 	_ = p.Ledger.save()
 	p.Ledger.Unlock()
-	p.notify("claimed", map[string]any{"swap": x.SwapID, "sat": o.Sat - fee, "fee": fee, "txid": txid})
+	// the swap's result for the operator: what the claim brings in, minus
+	// the invoice paid and its routing fee (Kilombino watches it for abuse)
+	routing := (x.RoutingMsat + 999) / 1000
+	p.notify("claimed", map[string]any{"swap": x.SwapID, "sat": o.Sat - fee, "fee": fee, "txid": txid,
+		"invoice": x.Sat, "routing": routing, "routingKnown": x.RoutingKnown, "net": o.Sat - fee - x.Sat - routing})
 	return txid, fee, nil
 }
 

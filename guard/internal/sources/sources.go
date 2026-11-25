@@ -228,18 +228,18 @@ func (l LN) NewAddress(ctx context.Context) (string, error) {
 var trackDesc = &grpc.StreamDesc{StreamName: "TrackPaymentV2", ServerStreams: true}
 
 // TrackPayment reads lnd's first answer on the payment (its current state).
-func (l LN) TrackPayment(ctx context.Context, hash []byte) (int32, string, error) {
+func (l LN) TrackPayment(ctx context.Context, hash []byte) (int32, string, int64, error) {
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	st, err := l.Conn.NewStream(ctx, trackDesc, "/routerrpc.Router/TrackPaymentV2")
 	if err != nil {
-		return 0, "", err
+		return 0, "", 0, err
 	}
 	if err := st.SendMsg(&lnrpc.TrackPaymentRequest{PaymentHash: hash, NoInflightUpdates: true}); err != nil {
-		return 0, "", err
+		return 0, "", 0, err
 	}
 	if err := st.CloseSend(); err != nil {
-		return 0, "", err
+		return 0, "", 0, err
 	}
 	var p lnrpc.Payment
 	if err := st.RecvMsg(&p); err != nil {
@@ -250,11 +250,11 @@ func (l LN) TrackPayment(ctx context.Context, hash []byte) (int32, string, error
 		// of a hash never initiated) to codes.NotFound, nothing else
 		// (lnrpc/routerrpc/router_server.go, payments/db/kv_store.go)
 		if status.Code(err) == codes.NotFound {
-			return 0, "", nil
+			return 0, "", 0, nil
 		}
-		return 0, "", err
+		return 0, "", 0, err
 	}
-	return p.Status, p.PaymentPreimage, nil
+	return p.Status, p.PaymentPreimage, p.FeeMsat, nil
 }
 
 // emptyMsg reads an answer the guard does not need.
