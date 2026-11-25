@@ -149,7 +149,8 @@ services:
     volumes:
       - ${LND_DIR:?}/tls.cert:/lnd/tls.cert:ro
       - ${KILOSWAP_ROOT:?}/macaroons/kiloswap-guard.macaroon:/lnd/kiloswap-guard.macaroon:ro
-      - ${LSP_STATE:?}:/lsp/state.json:ro
+      # a directory, not the file: the LSP replaces the file on every save
+      - ${LSP_STATE_DIR:?}:/lsp:ro
       - ${KILOSWAP_ROOT:?}/guard:/state
       - ${KILOSWAP_ROOT:?}/secrets/guard_db_url:/run/secrets/guard_db_url:ro
       - ${KILOSWAP_ROOT:?}/secrets/guard_rpc_password:/run/secrets/guard_rpc_password:ro
