@@ -101,16 +101,39 @@ const REV = { // Lightning → on-chain (reverse): the user pays us, we lock on-
 const FINAL = new Set(['transaction.claimed', 'invoice.failedToPay', 'transaction.lockupFailed', 'swap.expired',
   'invoice.settled', 'transaction.failed', 'transaction.refunded', 'invoice.expired']);
 
+// Only these statuses reach Telegram: the lockup seen and confirmed, the
+// payment, the end (claimed / settled / refunded / failed / expired). The
+// rest (swap.created, invoice.set, transaction.zeroconf.rejected,
+// invoice.pending, minerfee.paid…) are intermediate and only noise. An
+// expiry or failure of a swap that never got that far (nobody paid or
+// locked anything) is not reported either.
+const NOTIFY = {
+  sub: new Set(['transaction.mempool', 'transaction.confirmed', 'invoice.paid', 'transaction.claimed',
+    'invoice.failedToPay', 'transaction.lockupFailed', 'swap.expired']),
+  rev: new Set(['transaction.mempool', 'transaction.confirmed', 'invoice.settled', 'transaction.failed',
+    'transaction.refunded', 'swap.expired', 'invoice.expired']),
+};
+const ONLY_IF_SEEN = new Set(['swap.expired', 'invoice.expired', 'invoice.failedToPay', 'transaction.failed']);
+// Test swaps (ids) that must never alert, from the environment
+const IGNORE = new Set((env.IGNORE_SWAPS || '').split(/[\s,]+/).filter(Boolean));
+
 function text(s) {
   const map = s.kind === 'sub' ? SUB : REV;
   const [icon, what] = map[s.status] || ['•', s.status];
   const dir = s.kind === 'sub' ? 'On-chain → Lightning' : 'Lightning → on-chain';
-  const lines = [`${icon} Kiloswap ${short(s.id)} · ${dir}`, `${fmt(s.amount)} sats · ${what}`];
+  const lines = [`${icon} Kiloswap ${short(s.id)} · ${dir}`, what];
+  if (s.kind === 'sub') {
+    lines.push(`On-chain: el usuario envía ${fmt(s.onchain)} sats`);
+    lines.push(`Lightning: le pagamos ${fmt(s.ln)} sats`);
+  } else {
+    lines.push(`Lightning: el usuario nos paga ${fmt(s.ln)} sats`);
+    lines.push(`On-chain: le enviamos ${fmt(s.onchain)} sats`);
+  }
   if (s.status === 'transaction.claimed' || s.status === 'invoice.settled') {
     // Earned = the fee charged (service % + miner fee the user paid) minus what it cost us.
     const cost = s.kind === 'sub' ? (s.routingFeeMsat || 0) / 1000 : (s.ourMinerFee || 0);
     const earned = (s.fee || 0) - cost;
-    lines.push(`Comisión cobrada ${fmt(s.fee || 0)} − ${s.kind === 'sub' ? 'ruta LN' : 'red on-chain'} ${fmt(cost)} = ganado ≈ ${fmt(earned)} sats`);
+    lines.push(`Comisión cobrada ${fmt(s.fee || 0)} − ${s.kind === 'sub' ? 'ruta LN' : 'red on-chain'} ${fmt(cost)} = neto ≈ ${earned >= 0 ? '+' : ''}${fmt(earned)} sats`);
   }
   if (s.failureReason) lines.push(`Motivo: ${s.failureReason}`);
   return lines.join('\n');
@@ -118,18 +141,26 @@ function text(s) {
 
 let changed = false, lastBackup = 0;
 async function swaps() {
-  const subs = sql(`SELECT id, status, COALESCE("invoiceAmount", "expectedAmount", 0), COALESCE(fee,0), COALESCE("routingFee",0), COALESCE("failureReason",'') FROM swaps WHERE "createdAt" > now() - interval '7 days'`)
-    .map(([id, status, amount, fee, rf, fr]) => ({ kind: 'sub', id, status, amount: +amount, fee: +fee, routingFeeMsat: +rf, failureReason: fr }));
-  const revs = sql(`SELECT id, status, "invoiceAmount", COALESCE(fee,0), COALESCE("minerFeeOnchainAmount",0), COALESCE("failureReason",'') FROM "reverseSwaps" WHERE "createdAt" > now() - interval '7 days'`)
-    .map(([id, status, amount, fee, mf, fr]) => ({ kind: 'rev', id, status, amount: +amount, fee: +fee, ourMinerFee: +mf, failureReason: fr }));
+  const subs = sql(`SELECT id, status, COALESCE("expectedAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("routingFee",0), COALESCE("failureReason",'') FROM swaps WHERE "createdAt" > now() - interval '7 days'`)
+    .map(([id, status, onchain, ln, fee, rf, fr]) => ({ kind: 'sub', id, status, onchain: +onchain, ln: +ln, fee: +fee, routingFeeMsat: +rf, failureReason: fr }));
+  const revs = sql(`SELECT id, status, COALESCE("onchainAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("minerFeeOnchainAmount",0), COALESCE("failureReason",'') FROM "reverseSwaps" WHERE "createdAt" > now() - interval '7 days'`)
+    .map(([id, status, onchain, ln, fee, mf, fr]) => ({ kind: 'rev', id, status, onchain: +onchain, ln: +ln, fee: +fee, ourMinerFee: +mf, failureReason: fr }));
   for (const s of [...subs, ...revs]) {
+    if (IGNORE.has(s.id)) continue;
     const known = state.swaps[s.id];
     if (known && known.status === s.status) continue;
+    // Any status change counts for the backup, reported or not
+    changed = true;
+    const report = NOTIFY[s.kind].has(s.status) && !(ONLY_IF_SEEN.has(s.status) && !known?.msg);
+    if (!report) {
+      state.swaps[s.id] = { ...(known || {}), status: s.status, final: FINAL.has(s.status) };
+      save();
+      continue;
+    }
     const t = text(s);
     if (known?.msg) await edit(known.msg, t);
-    else { const m = await send(t); state.swaps[s.id] = { msg: m.message_id }; }
+    else { const m = await send(t); state.swaps[s.id] = { ...(known || {}), msg: m.message_id }; }
     state.swaps[s.id].status = s.status;
-    changed = true;
     state.swaps[s.id].final = FINAL.has(s.status);
     if (['invoice.failedToPay', 'transaction.lockupFailed', 'transaction.failed'].includes(s.status))
       await alert(`fail-${s.id}`, `⚠️ Kiloswap: swap ${short(s.id)} ha fallado (${s.status}). Revísalo si se repite.`);
