@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/kiloswap.png" alt="Kiloswap" width="160"></p>
+
 # Kiloswap
 
 Swaps sin custodia entre BTC on-chain de la cadena Bitcoin BLAKE2b y su red

@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/kiloswap.png" alt="Kiloswap" width="160"></p>
+
 # Kiloswap
 
 Non-custodial swaps between on-chain BTC on the Bitcoin BLAKE2b chain and its
