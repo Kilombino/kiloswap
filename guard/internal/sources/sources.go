@@ -102,7 +102,7 @@ func (l LN) Balance(ctx context.Context) (policy.Balance, error) {
 	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/WalletBalance", &lnrpc.WalletBalanceRequest{}, &r); err != nil {
 		return policy.Balance{}, err
 	}
-	return policy.Balance{Confirmed: r.ConfirmedBalance, Locked: r.LockedBalance, AnchorReserve: r.ReservedBalanceAnchorChan}, nil
+	return policy.Balance{Confirmed: r.ConfirmedBalance, Locked: r.LockedBalance, AnchorReserve: r.ReservedBalanceAnchorChan, Unconfirmed: r.UnconfirmedBalance}, nil
 }
 
 // WalletOwns tells whether txid, mined at height, is a transaction lnd's

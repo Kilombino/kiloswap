@@ -230,6 +230,7 @@ type Swaps interface {
 // Balance is lnd's on-chain wallet as WalletBalance reports it.
 type Balance struct {
 	Confirmed, Locked, AnchorReserve int64
+	Unconfirmed                      int64 // pending (our own change too): never counted, only told
 }
 
 // LSP reports the sats the LSP has promised to open channels with and not
@@ -339,6 +340,7 @@ type Policy struct {
 	pending     map[uint64]pendingReq
 	claimErr    map[string]string // last claim error per payment hash
 	calls       map[string][]time.Time
+	lastBal     Balance
 	chosen      map[string]time.Time // coins given to lockups lately (lnd may not have spent them yet)
 	epoch       uint64               // bumped on each registration with lnd (ids start over)
 	lastSaveErr string
@@ -630,7 +632,22 @@ func (p *Policy) available(ctx context.Context) (int64, error) {
 			inflight += l.Sat
 		}
 	}
+	p.pmu.Lock()
+	p.lastBal = b
+	p.pmu.Unlock()
 	return b.Confirmed - b.Locked - b.AnchorReserve - p.ReserveSat - lsp - inflight, nil
+}
+
+// balanceNote says how the last balance read splits into confirmed and
+// pending (a lockup's change is pending until the next block).
+func (p *Policy) balanceNote() string {
+	p.pmu.Lock()
+	b := p.lastBal
+	p.pmu.Unlock()
+	if b.Unconfirmed > 0 {
+		return fmt.Sprintf("; confirmado %d, pendiente %d — se resuelve con el próximo bloque si lo pendiente es cambio propio", b.Confirmed, b.Unconfirmed)
+	}
+	return fmt.Sprintf("; confirmado %d", b.Confirmed)
 }
 
 // promised is what open hold invoices without a lockup may still lock.
@@ -909,7 +926,7 @@ func (p *Policy) allowSend(ctx context.Context, requestID uint64, l *Lockup, hei
 	// same coins
 	need := l.Sat + 2*ClaimVbytes*p.MaxFeeRate
 	if need > avail {
-		return refuse("%d sat (with the lockup's and a refund's fees) would cut into the LSP reserve (%d available)", need, avail)
+		return refuse("%d sat (with the lockup's and a refund's fees) would cut into the LSP reserve (%d available%s)", need, avail, p.balanceNote())
 	}
 	l.At, l.SentAt = now, height
 	p.Ledger.Lockups[l.Hash] = l
@@ -1199,7 +1216,7 @@ func (p *Policy) addHold(ctx context.Context, requestID uint64, r *lnrpc.AddHold
 		return err
 	}
 	if promised := p.promised(); promised+sat > avail {
-		return refuse("%d sat more would not fit the coins left (%d promised, %d available)", sat, promised, avail)
+		return refuse("%d sat more would not fit the coins left (%d promised, %d available%s)", sat, promised, avail, p.balanceNote())
 	}
 	// recorded before lnd is told yes: an answer lost on the way (a stream
 	// reset) leaves the hold known, and closeHolds settles it from lnd

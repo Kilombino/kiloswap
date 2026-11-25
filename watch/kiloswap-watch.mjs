@@ -23,6 +23,7 @@
 //   LOW_LN_OUT_SAT     alert below this Lightning outbound   (default 5000000)
 //   LOW_LN_IN_SAT      alert below this Lightning inbound    (default 5000000)
 //   INTERVAL_S         seconds between passes (default 20; 0 = one pass)
+//   MEMPOOL_URL        explorer for the transaction links (default https://mempool.kilombino.com)
 'use strict';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -42,17 +43,34 @@ const BACKUP = env.BACKUP_CMD ? split(env.BACKUP_CMD) : null;
 const LOW_OUT = Number(env.LOW_LN_OUT_SAT || 5_000_000);
 const LOW_IN = Number(env.LOW_LN_IN_SAT || 5_000_000);
 const INTERVAL = Number(env.INTERVAL_S ?? 20);
+const MEMPOOL = (env.MEMPOOL_URL || 'https://mempool.kilombino.com').replace(/\/+$/, '');
+const txLink = txid => `${MEMPOOL}/tx/${txid}`;
 const readSecret = f => { try { return fs.readFileSync(f, 'utf8').trim(); } catch { return ''; } };
 const TOKEN = env.TELEGRAM_TOKEN || (env.TELEGRAM_TOKEN_FILE ? readSecret(env.TELEGRAM_TOKEN_FILE) : '');
 const CHAT = env.TELEGRAM_CHAT || '';
 
-const run = (cmd, args = []) => execFileSync(cmd[0], [...cmd.slice(1), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const run = (cmd, args = []) => execFileSync(cmd[0], [...cmd.slice(1), ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 256 << 20 });
 const sql = q => run(PSQL, ['-c', q]).trim().split('\n').filter(Boolean).map(l => l.split('|'));
 const fmt = n => Math.round(Number(n)).toLocaleString('es-ES');
 const short = id => String(id).slice(0, 8);
 
 let state = { swaps: {}, alerts: {} };
 try { state = JSON.parse(fs.readFileSync(STATE, 'utf8')); } catch { /* first run */ }
+state.extra ||= {}; // per swap: the guard's claim (txid, fee), our lockup's fee
+
+// What lnd's wallet paid in fees for one of its own transactions (our
+// reverse lockups), from its wallet history (read at most once a minute);
+// undefined when not found.
+let walletTxs = { at: 0, fees: new Map() };
+function walletTxFee(txid) {
+  if (Date.now() - walletTxs.at > 60_000) {
+    try {
+      const txs = JSON.parse(run(LNCLI, ['listchaintxns'])).transactions || [];
+      walletTxs = { at: Date.now(), fees: new Map(txs.map(t => [t.tx_hash, Number(t.total_fees)])) };
+    } catch { return undefined; }
+  }
+  return walletTxs.fees.get(txid);
+}
 const save = () => { fs.writeFileSync(STATE + '.tmp', JSON.stringify(state), { mode: 0o600 }); fs.renameSync(STATE + '.tmp', STATE); };
 
 // Telegram, or the dry-run log. send() returns a message id that edit() takes.
@@ -129,40 +147,63 @@ function text(s) {
     lines.push(`Lightning: el usuario nos paga ${fmt(s.ln)} sats`);
     lines.push(`On-chain: le enviamos ${fmt(s.onchain)} sats`);
   }
+  const x = state.extra[s.id] || {};
   if (s.status === 'transaction.claimed' || s.status === 'invoice.settled') {
-    // Earned = the fee charged (service % + miner fee the user paid) minus what it cost us.
-    const cost = s.kind === 'sub' ? (s.routingFeeMsat || 0) / 1000 : (s.ourMinerFee || 0);
-    const earned = (s.fee || 0) - cost;
-    lines.push(`Comisión cobrada ${fmt(s.fee || 0)} − ${s.kind === 'sub' ? 'ruta LN' : 'red on-chain'} ${fmt(cost)} = neto ≈ ${earned >= 0 ? '+' : ''}${fmt(earned)} sats`);
+    if (s.kind === 'sub') {
+      // charged: the service % and the claim's miner fee (both in s.fee);
+      // cost: the route and our claim's actual fee
+      const route = (s.routingFeeMsat || 0) / 1000, claim = x.claimFee;
+      const cost = route + (claim || 0);
+      const earned = (s.fee || 0) - cost;
+      lines.push(`Comisión cobrada ${fmt(s.fee || 0)} (servicio + red del cobro) − ruta LN ${fmt(route)} − red del cobro ${claim === undefined ? '¿?' : fmt(claim)} = neto ≈ ${earned >= 0 ? '+' : ''}${fmt(earned)} sats`);
+    } else {
+      // the user's Lightning payment less what they got on-chain is the
+      // service % (s.fee) plus the miner fee charged (lockup + a possible
+      // refund); our cost is the lockup's actual fee
+      const charged = s.ln - s.onchain, service = s.fee || 0, minerCharged = charged - service;
+      if (x.lockupFee === undefined && s.lockupTx) x.lockupFee = walletTxFee(s.lockupTx), state.extra[s.id] = x;
+      const lf = x.lockupFee;
+      const earned = charged - (lf || 0);
+      lines.push(`Cobrado ${fmt(charged)} = servicio ${fmt(service)} + red ${fmt(minerCharged)} (depósito y reserva de reembolso)`);
+      lines.push(`Red del depósito ${lf === undefined ? '¿?' : fmt(lf)} → neto ≈ ${earned >= 0 ? '+' : ''}${fmt(earned)} sats`);
+    }
   }
   if (s.failureReason) lines.push(`Motivo: ${s.failureReason}`);
+  if (s.lockupTx) lines.push(`Depósito: ${txLink(s.lockupTx)}`);
+  if (x.claimTx) lines.push(`Cobro: ${txLink(x.claimTx)}`);
   return lines.join('\n');
 }
 
 let changed = false, lastBackup = 0;
 async function swaps() {
-  const subs = sql(`SELECT id, status, COALESCE("expectedAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("routingFee",0), COALESCE("failureReason",'') FROM swaps WHERE "createdAt" > now() - interval '7 days'`)
-    .map(([id, status, onchain, ln, fee, rf, fr]) => ({ kind: 'sub', id, status, onchain: +onchain, ln: +ln, fee: +fee, routingFeeMsat: +rf, failureReason: fr }));
-  const revs = sql(`SELECT id, status, COALESCE("onchainAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("minerFeeOnchainAmount",0), COALESCE("failureReason",'') FROM "reverseSwaps" WHERE "createdAt" > now() - interval '7 days'`)
-    .map(([id, status, onchain, ln, fee, mf, fr]) => ({ kind: 'rev', id, status, onchain: +onchain, ln: +ln, fee: +fee, ourMinerFee: +mf, failureReason: fr }));
+  const subs = sql(`SELECT id, status, COALESCE("expectedAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("routingFee",0), COALESCE("failureReason",''), COALESCE("lockupTransactionId",'') FROM swaps WHERE "createdAt" > now() - interval '7 days'`)
+    .map(([id, status, onchain, ln, fee, rf, fr, tx]) => ({ kind: 'sub', id, status, onchain: +onchain, ln: +ln, fee: +fee, routingFeeMsat: +rf, failureReason: fr, lockupTx: tx }));
+  const revs = sql(`SELECT id, status, COALESCE("onchainAmount",0), COALESCE("invoiceAmount",0), COALESCE(fee,0), COALESCE("failureReason",''), COALESCE("transactionId",'') FROM "reverseSwaps" WHERE "createdAt" > now() - interval '7 days'`)
+    .map(([id, status, onchain, ln, fee, fr, tx]) => ({ kind: 'rev', id, status, onchain: +onchain, ln: +ln, fee: +fee, failureReason: fr, lockupTx: tx }));
   for (const s of [...subs, ...revs]) {
     if (IGNORE.has(s.id)) continue;
     const known = state.swaps[s.id];
     if (known && known.status === s.status) continue;
     // Any status change counts for the backup, reported or not
     changed = true;
-    const report = NOTIFY[s.kind].has(s.status) && !(ONLY_IF_SEEN.has(s.status) && !known?.msg);
+    // a failure or expiry of a swap no money ever moved for (no lockup on
+    // chain: the user never deposited, or we never locked up) is no news,
+    // whatever its status history says
+    const failure = ONLY_IF_SEEN.has(s.status) || ['transaction.lockupFailed'].includes(s.status);
+    const noFunds = !s.lockupTx;
+    const report = NOTIFY[s.kind].has(s.status) && !(ONLY_IF_SEEN.has(s.status) && !known?.msg) && !(failure && noFunds);
     if (!report) {
       state.swaps[s.id] = { ...(known || {}), status: s.status, final: FINAL.has(s.status) };
       save();
       continue;
     }
     const t = text(s);
+    state.extra[s.id] = { ...(state.extra[s.id] || {}), last: s };
     if (known?.msg) await edit(known.msg, t);
     else { const m = await send(t); state.swaps[s.id] = { ...(known || {}), msg: m.message_id }; }
     state.swaps[s.id].status = s.status;
     state.swaps[s.id].final = FINAL.has(s.status);
-    if (['invoice.failedToPay', 'transaction.lockupFailed', 'transaction.failed'].includes(s.status))
+    if (['invoice.failedToPay', 'transaction.lockupFailed', 'transaction.failed'].includes(s.status) && !noFunds)
       await alert(`fail-${s.id}`, `⚠️ Kiloswap: swap ${short(s.id)} ha fallado (${s.status}). Revísalo si se repite.`);
     save();
   }
@@ -175,9 +216,24 @@ function clear(key) { if (state.alerts[key]) { delete state.alerts[key]; save();
 async function liquidity() {
   try {
     const b = JSON.parse(run(LNCLI, ['walletbalance']));
-    const avail = Number(b.confirmed_balance) - Number(b.locked_balance || 0) - Number(b.reserved_balance_anchor_chan || 0) - RESERVE;
-    avail < 0 ? await alert('reserve', `🪫 Kiloswap: el on-chain de lnd (${fmt(b.confirmed_balance)} sats) está por debajo de la reserva del LSP (${fmt(RESERVE)}). Los swaps Lightning → on-chain se rechazan.`) : clear('reserve');
-    avail >= 0 && avail < LOW_AVAIL ? await alert('avail', `🪫 Kiloswap: solo quedan ${fmt(avail)} sats on-chain por encima de la reserva del LSP. Los swaps Lightning → on-chain grandes se rechazarán.`) : clear('avail');
+    const conf = Number(b.confirmed_balance), pend = Number(b.unconfirmed_balance || 0);
+    const avail = conf - Number(b.locked_balance || 0) - Number(b.reserved_balance_anchor_chan || 0) - RESERVE;
+    const height = Number(JSON.parse(run(LNCLI, ['getinfo'])).block_height);
+    // Short only because our own change is unconfirmed (a lockup spent a
+    // big coin): it fixes itself with the next block. Alert only if, a block
+    // later, it is still short; a real shortfall (confirmed + pending not
+    // enough) at once.
+    const split = `confirmado ${fmt(conf)}, pendiente ${fmt(pend)}`;
+    const shortBy = (lim) => {
+      if (avail >= lim) { delete state.alerts[`short-${lim}`]; return false; }
+      if (avail + pend < lim) return true; // even with the pending coins
+      const since = state.alerts[`short-${lim}`] ||= height;
+      return height > since; // still short after the next block
+    };
+    if (shortBy(0)) await alert('reserve', `🪫 Kiloswap: el on-chain de lnd está por debajo de la reserva del LSP (${fmt(RESERVE)}): ${split}${avail + pend >= 0 ? ' — debería haberse resuelto con el último bloque, revisa lnd' : ` — faltan ${fmt(-(avail + pend))} sats aun contando lo pendiente`}. Los swaps Lightning → on-chain se rechazan.`);
+    else clear('reserve');
+    if (avail >= 0 && shortBy(LOW_AVAIL)) await alert('avail', `🪫 Kiloswap: solo quedan ${fmt(avail)} sats on-chain por encima de la reserva del LSP (${split}). Los swaps Lightning → on-chain grandes se rechazarán.`);
+    else if (avail >= LOW_AVAIL || avail < 0) clear('avail');
   } catch (e) { await alert('wallet-read', `⚠️ Kiloswap: no puedo leer el on-chain de lnd (${e.message.split('\n')[0]})`); }
   try {
     const [[n]] = sql(`SELECT count(*) FROM "reverseSwaps" WHERE status IN ('swap.created','invoice.set','invoice.pending','minerfee.paid','transaction.mempool','transaction.confirmed')`);
@@ -201,7 +257,7 @@ async function pass() {
   }
   // forget finished swaps after a week
   const cut = Date.now() - 8 * 864e5;
-  for (const [id, s] of Object.entries(state.swaps)) if (s.final && (s.at ||= Date.now()) < cut) delete state.swaps[id];
+  for (const [id, s] of Object.entries(state.swaps)) if (s.final && (s.at ||= Date.now()) < cut) { delete state.swaps[id]; delete state.extra[id]; }
   save();
 }
 
@@ -259,7 +315,20 @@ if (ALERT_PORT) {
         const now = Date.now(); burst = now - last < 60_000 ? burst + 1 : 0; last = now;
         if (burst > 5) return;
       }
-      if (moves[j.event]) { try { await send(moves[j.event]()); } catch { /* next one */ } return; }
+      if ((j.event === 'claimed' || j.event === 'settled') && j.swap) {
+        const x = state.extra[j.swap] ||= {};
+        if (j.event === 'claimed') { x.claimTx = j.txid; x.claimFee = Number(j.fee); }
+        else if (j.claim) x.claimTx = j.claim;
+        save();
+        const k = state.swaps[j.swap];
+        if (k?.msg && x.last) { try { await edit(k.msg, text(x.last)); } catch { /* next one */ } }
+      }
+      if (moves[j.event]) {
+        let m = moves[j.event]();
+        const tx = j.event === 'claimed' ? j.txid : j.event === 'settled' ? j.claim : j.event === 'lockup_sent' ? j.txid : j.event === 'refunded' ? j.txid : undefined;
+        if (tx && /^[0-9a-f]{64}$/.test(tx)) m += `\n${txLink(tx)}`;
+        try { await send(m); } catch { /* next one */ } return;
+      }
       if (j.event !== 'guard_refusal') return;
       const now = Date.now(); burst = now - last < 60_000 ? burst + 1 : 0; last = now;
       if (burst > 5) return; // at most a few a minute; the guard's log has them all
