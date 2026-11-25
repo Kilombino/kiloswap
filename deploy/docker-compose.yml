@@ -70,8 +70,11 @@ services:
   shim:
     image: kiloswap/txindex-shim:${SHIM_TAG:-dev}
     # Paul's txindex shim with Kiloswap's limits (../shim): the backend's
-    # methods only (batches judged per element, at most 100), the empty
-    # wallet only, 8 calls at once
+    # methods only with their parameters checked (batches judged per
+    # element, at most 100 and at most 10 raw items, 4 of them blocks),
+    # the empty wallet only, 8 calls at once, answers up to 32 MB (256 MB
+    # of memory leaves room for one held twice), ZMQ relayed to at most
+    # 16 subscribers, a stalled one dropped after 10 s
     build: ../shim
     security_opt: [no-new-privileges:true]
     restart: unless-stopped
@@ -87,7 +90,7 @@ services:
     volumes:
       - ${KILOSWAP_ROOT:?}/shim:/data
     logging: *logging
-    mem_limit: 128m
+    mem_limit: 256m
 
   guard:
     image: kiloswap/guard:${GUARD_TAG:-dev}

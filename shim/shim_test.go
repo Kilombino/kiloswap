@@ -725,7 +725,8 @@ func TestProxyStrictParams(t *testing.T) {
 		`{"id":1,"method":"getblock","params":["` + bh + `",1]}`,
 		`{"method":"getblock","params":["` + bh + `",1]}`,
 		`{"method":"getblockchaininfo","params":null}`,
-		"[" + strings.Repeat(`{"method":"getblock","params":["`+bh+`",0]},`, 9) + `{"method":"getblock","params":["` + bh + `",0]}]`,
+		"[" + strings.Repeat(`{"method":"getblock","params":["`+bh+`",0]},`, 3) + `{"method":"getblock","params":["` + bh + `",0]}]`,
+		"[" + strings.Repeat(`{"method":"getblock","params":["`+bh+`",0]},`, 2) + strings.Repeat(`{"method":"getrawtransaction","params":["`+bh+`"]},`, 7) + `{"method":"getrawtransaction","params":["` + bh + `"]}]`,
 		"[" + strings.Repeat(`{"method":"getblockhash","params":[1]},`, 63) + `{"method":"getblockhash","params":[2]}]`,
 	}
 	for _, body := range allowed {
@@ -801,5 +802,54 @@ func TestForwardConnectionCap(t *testing.T) {
 	_ = extra.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := extra.Read(make([]byte, 1)); err != io.EOF {
 		t.Fatalf("connection over the cap not closed: %v", err)
+	}
+}
+
+// Kiloswap: a ZMQ subscriber that stops reading is dropped, and its slot
+// freed, instead of the shim buffering for it.
+func TestForwardDropsStalledReader(t *testing.T) {
+	old := writeTimeout.Load()
+	writeTimeout.Store(int64(300 * time.Millisecond))
+	defer writeTimeout.Store(old)
+	up, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer up.Close()
+	pushed := make(chan error, 1)
+	go func() {
+		c, err := up.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		chunk := make([]byte, 64<<10)
+		for {
+			if _, err := c.Write(chunk); err != nil {
+				pushed <- err // the shim closed the node's side
+				return
+			}
+		}
+	}()
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	addr := l.Addr().String()
+	l.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = forward(ctx, addr, up.Addr().String()) }()
+	time.Sleep(100 * time.Millisecond)
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetReadBuffer(4096)
+	}
+	// the subscriber never reads
+	select {
+	case <-pushed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the shim kept buffering for a subscriber that stopped reading")
 	}
 }

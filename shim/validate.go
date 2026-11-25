@@ -21,15 +21,20 @@ import (
 // raw (verbosity 0) there, and nothing verbose in batches.
 
 const (
-	maxGetblockPerBatch = 10
+	// a batch carries at most maxRawPerBatch raw items (whole blocks and
+	// raw transactions together), at most maxGetblockPerBatch of them blocks
+	maxRawPerBatch      = 10
+	maxGetblockPerBatch = 4
 	maxSpendingPrevouts = 10
 	maxMempoolAccept    = 25
 	maxUnspentAddresses = 100
 )
 
-// maxResponse is the most the shim reads back from the node for one call:
-// ten whole 4 MB blocks in hex, and the JSON around them.
-var maxResponse = 96 << 20
+// maxResponse is the most the shim reads back from the node for one call
+// (three whole 4 MB blocks in hex fit, the backend asks three at a time);
+// with the batch held twice while patched it stays far under the shim's
+// 256 MB memory limit.
+var maxResponse = 32 << 20
 
 var errDuplicateKey = errors.New("duplicate key")
 

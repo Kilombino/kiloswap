@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -103,12 +104,50 @@ func relay(ctx context.Context, conn net.Conn, target string) {
 	wg.Add(2)
 	copyHalf := func(dst, src net.Conn) {
 		defer wg.Done()
-		_, _ = io.Copy(dst, src)
+		_, _ = copyWithDeadline(dst, src)
 		if tc, ok := dst.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
 	}
 	go copyHalf(up, conn)
-	go copyHalf(conn, up)
+	go func() {
+		// Kiloswap: a subscriber that stops reading is dropped (both ends
+		// closed), never buffered for: the node's ZMQ queue (hwm) drops
+		// for it instead
+		copyHalf(conn, up)
+		conn.Close()
+		up.Close()
+	}()
 	wg.Wait()
+}
+
+// writeTimeout is how long one write to a peer may block (nanoseconds).
+var writeTimeout atomic.Int64
+
+func init() { writeTimeout.Store(int64(10 * time.Second)) }
+
+// copyWithDeadline is io.Copy with a deadline on each write.
+func copyWithDeadline(dst, src net.Conn) (int64, error) {
+	buf := make([]byte, 32<<10)
+	var n int64
+	for {
+		r, rerr := src.Read(buf)
+		if r > 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(time.Duration(writeTimeout.Load())))
+			w, werr := dst.Write(buf[:r])
+			n += int64(w)
+			if werr != nil {
+				if ne, ok := werr.(net.Error); ok && ne.Timeout() {
+					log.Printf("forward: dropping a peer that stopped reading")
+				}
+				return n, werr
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				return n, nil
+			}
+			return n, rerr
+		}
+	}
 }

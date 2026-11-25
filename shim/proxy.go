@@ -276,20 +276,24 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "unreadable or oversized batch", http.StatusBadRequest)
 			return
 		}
-		blocks := 0
+		blocks, rawItems := 0, 0
 		for _, raw := range raws {
 			req, err := strictRequest(raw, true)
 			if err != nil {
 				http.Error(w, "request in batch refused: "+err.Error(), refusalStatus(err))
 				return
 			}
-			if req.Method == "getblock" {
+			switch req.Method {
+			case "getblock":
 				blocks++
+				rawItems++
+			case "getrawtransaction":
+				rawItems++
 			}
 			reqs = append(reqs, req)
 		}
-		if blocks > maxGetblockPerBatch {
-			http.Error(w, "too many whole blocks in one batch", http.StatusBadRequest)
+		if blocks > maxGetblockPerBatch || rawItems > maxRawPerBatch {
+			http.Error(w, "too many whole blocks or raw transactions in one batch", http.StatusBadRequest)
 			return
 		}
 	default:

@@ -41,6 +41,11 @@ datos en `${KILOSWAP_ROOT}`.
    decisión expresa (cambiar `.env`), nunca un olvido. Al arrancar, el
    guardián escribe en el log y avisa por Telegram (`guard_limits`) de los
    límites en vigor: comprobar ese aviso tras cada despliegue.
+   Swaps inversos desde 10000 sat (`MIN_REVERSE_SAT`, igual que
+   `minSwapAmount` del backend) y 2 depósitos por bloque como mucho
+   (`MAX_LOCKUPS_PER_BLOCK`). El tope de comisión de enrutado
+   (`ROUTING_CAP=1`, con `ROUTING_FLOOR_SAT`) está preparado pero
+   **apagado** hasta que Kilombino decida cómo cubrir el suelo de 121 sat.
 4. **Cartera vacía del backend en el nodo**, en caliente:
    `bitcoin-cli createwallet kiloswap-empty true true`
    (sin claves y en blanco, solo para los caminos raros del backend).
@@ -188,6 +193,25 @@ en él.
    - Regla sudoers para que el vigilante lance la copia "change" tras cada
      cambio de swap:
      `<usuario> ALL=(root) NOPASSWD: /opt/kiloswap/deploy/backup/kiloswap-backup.sh change`
+
+## Ventana de mantenimiento: ZMQ del nodo (revisión 8)
+
+El shim reenvía los ZMQ de Knots (bloques y transacciones) al backend. Si
+un suscriptor deja de leer, el nodo acumula mensajes para él. Hay que
+limitarlo **en el nodo** (Knots de producción), en la próxima ventana de
+mantenimiento, no antes:
+
+```
+zmqpubrawblockhwm=20
+zmqpubrawtxhwm=20
+```
+
+en `bitcoin.conf` del nodo BLAKE2b y reiniciarlo (con LND parado antes,
+como en cualquier reinicio del nodo). Con eso, el nodo descarta lo que no
+quepa en 20 mensajes por socket en vez de crecer en memoria. Por su parte,
+el shim corta a un suscriptor que no lee en 10 s y acepta como mucho 16
+conexiones por puerto reenviado. El laboratorio ya corre con esos valores.
+Comprobación después: `bitcoin-cli getzmqnotifications` muestra `hwm: 20`.
 
 ## Pausar o apagar
 
