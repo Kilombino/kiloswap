@@ -99,7 +99,8 @@ LS bakemacaroon --save_to /root/.lnd/kiloswap-guard.macaroon \
 	uri:/lnrpc.Lightning/RegisterRPCMiddleware uri:/lnrpc.Lightning/WalletBalance \
 	uri:/lnrpc.Lightning/LookupInvoice uri:/lnrpc.Lightning/DecodePayReq \
 	uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice \
-	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress uri:/lnrpc.Lightning/GetTransactions >/dev/null
+	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress uri:/lnrpc.Lightning/GetTransactions \
+	uri:/lnrpc.Lightning/ListUnspent >/dev/null
 docker compose exec -T lnd-swap chmod 644 /root/.lnd/kiloswap.macaroon /root/.lnd/kiloswap-wide.macaroon /root/.lnd/kiloswap-guard.macaroon
 ok "kiloswap (caveat kiloswap=v1), kiloswap-wide, kiloswap-guard"
 
@@ -519,6 +520,27 @@ else
 fi
 hwm=$(docker run --rm --network "$NET" curlimages/curl:8.10.1 -s -u lab:lab -H 'content-type: application/json' -d '{"id":1,"method":"getzmqnotifications","params":[]}' http://shim:8332/ | jq -c '[.result[].hwm]' || true)
 [ "$hwm" = "[20,20]" ] && ok "knots queues at most 20 ZMQ messages per socket ($hwm)" || bad "zmq hwm: $hwm"
+
+log "coin selection: a lockup spends a small coin, not the wallet's big one"
+start_guard -e DAILY_SAT=10000000000
+own=$(LS newaddress p2tr | jq -r .address)
+for amt in 0.0005 0.0006 0.0007; do K sendtoaddress "$(LS newaddress p2tr | jq -r .address)" $amt >/dev/null; done
+K sendtoaddress "$own" 3 >/dev/null # the big coin
+K generatetoaddress 1 "$(K getnewaddress)" >/dev/null
+sleep 5
+small=$(LS listunspent --min_confs 1 | jq -r '.utxos[] | select(.amount_sat < 100000000) | .outpoint' | sort)
+mk8
+if out=$(KS sendcoins --addr "$la" --amt "$oa" --sat_per_vbyte 1 --force 2>&1); then
+	ltx=$(jq -r .txid <<<"$out")
+	ins=$(K getrawtransaction "$ltx" true | jq -r '.vin[] | "\(.txid):\(.vout)"' | sort)
+	if [ -n "$ins" ] && [ -z "$(comm -23 <(echo "$ins") <(echo "$small"))" ]; then
+		ok "the lockup ($oa sat) spent only small coins: $(tr '\n' ' ' <<<"$ins" | cut -c1-90)"
+	else bad "the lockup spent $(tr '\n' ' ' <<<"$ins") (small coins: $(echo "$small" | wc -l))"; fi
+else bad "coin selection lockup: ${out:0:200}"; fi
+K generatetoaddress 1 "$(K getnewaddress)" >/dev/null
+docker compose -f docker-compose.yml -f "$work/override.yml" up -d boltz >/dev/null 2>&1
+for _ in $(seq 1 60); do curl -sf http://127.0.0.1:29001/v2/swap/reverse >/dev/null && break; sleep 2; done
+start_guard
 
 log "the ninth review: getrawmempool alone, AddInvoice without AMP or private channels"
 [ "$(shimcode / '[{"id":1,"method":"getrawmempool","params":[]}]')" = 400 ] && ok "the shim refuses getrawmempool inside a batch" || bad "getrawmempool batched"

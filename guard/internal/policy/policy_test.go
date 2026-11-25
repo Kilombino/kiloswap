@@ -38,6 +38,7 @@ type fakeLN struct {
 	balance     Balance
 	addr        string
 	walletSends []walletSend
+	utxos       []Utxo
 	walletErr   error
 }
 
@@ -81,6 +82,16 @@ func (f *fakeLN) CancelInvoice(_ context.Context, h []byte) error {
 	return nil
 }
 func (f *fakeLN) NewAddress(context.Context) (string, error) { return f.addr, nil }
+func (f *fakeLN) ListUnspent(_ context.Context, minConfs int32) ([]Utxo, error) {
+	var out []Utxo
+	for _, u := range f.utxos {
+		if u.Confs >= int64(minConfs) {
+			out = append(out, u)
+		}
+	}
+	return out, nil
+}
+
 func (f *fakeLN) WalletOwns(_ context.Context, txid string, _ int64) (bool, error) {
 	for _, w := range f.walletSends {
 		if w.txid == txid {

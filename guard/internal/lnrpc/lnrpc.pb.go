@@ -2561,6 +2561,255 @@ func (x *AddInvoiceCheck) GetPrivate() bool {
 	return false
 }
 
+// ListUnspent: the guard picks which of lnd's coins a lockup spends
+type ListUnspentRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MinConfs      int32                  `protobuf:"varint,1,opt,name=min_confs,json=minConfs,proto3" json:"min_confs,omitempty"`
+	MaxConfs      int32                  `protobuf:"varint,2,opt,name=max_confs,json=maxConfs,proto3" json:"max_confs,omitempty"`
+	Account       string                 `protobuf:"bytes,3,opt,name=account,proto3" json:"account,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListUnspentRequest) Reset() {
+	*x = ListUnspentRequest{}
+	mi := &file_lnrpc_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListUnspentRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListUnspentRequest) ProtoMessage() {}
+
+func (x *ListUnspentRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListUnspentRequest.ProtoReflect.Descriptor instead.
+func (*ListUnspentRequest) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ListUnspentRequest) GetMinConfs() int32 {
+	if x != nil {
+		return x.MinConfs
+	}
+	return 0
+}
+
+func (x *ListUnspentRequest) GetMaxConfs() int32 {
+	if x != nil {
+		return x.MaxConfs
+	}
+	return 0
+}
+
+func (x *ListUnspentRequest) GetAccount() string {
+	if x != nil {
+		return x.Account
+	}
+	return ""
+}
+
+type ListUnspentResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Utxos         []*Utxo                `protobuf:"bytes,1,rep,name=utxos,proto3" json:"utxos,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ListUnspentResponse) Reset() {
+	*x = ListUnspentResponse{}
+	mi := &file_lnrpc_proto_msgTypes[33]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ListUnspentResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ListUnspentResponse) ProtoMessage() {}
+
+func (x *ListUnspentResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[33]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ListUnspentResponse.ProtoReflect.Descriptor instead.
+func (*ListUnspentResponse) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{33}
+}
+
+func (x *ListUnspentResponse) GetUtxos() []*Utxo {
+	if x != nil {
+		return x.Utxos
+	}
+	return nil
+}
+
+type Utxo struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	AddressType   int32                  `protobuf:"varint,1,opt,name=address_type,json=addressType,proto3" json:"address_type,omitempty"`
+	Address       string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	AmountSat     int64                  `protobuf:"varint,3,opt,name=amount_sat,json=amountSat,proto3" json:"amount_sat,omitempty"`
+	PkScript      string                 `protobuf:"bytes,4,opt,name=pk_script,json=pkScript,proto3" json:"pk_script,omitempty"`
+	Outpoint      *OutPoint              `protobuf:"bytes,5,opt,name=outpoint,proto3" json:"outpoint,omitempty"`
+	Confirmations int64                  `protobuf:"varint,6,opt,name=confirmations,proto3" json:"confirmations,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Utxo) Reset() {
+	*x = Utxo{}
+	mi := &file_lnrpc_proto_msgTypes[34]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Utxo) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Utxo) ProtoMessage() {}
+
+func (x *Utxo) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[34]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Utxo.ProtoReflect.Descriptor instead.
+func (*Utxo) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{34}
+}
+
+func (x *Utxo) GetAddressType() int32 {
+	if x != nil {
+		return x.AddressType
+	}
+	return 0
+}
+
+func (x *Utxo) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *Utxo) GetAmountSat() int64 {
+	if x != nil {
+		return x.AmountSat
+	}
+	return 0
+}
+
+func (x *Utxo) GetPkScript() string {
+	if x != nil {
+		return x.PkScript
+	}
+	return ""
+}
+
+func (x *Utxo) GetOutpoint() *OutPoint {
+	if x != nil {
+		return x.Outpoint
+	}
+	return nil
+}
+
+func (x *Utxo) GetConfirmations() int64 {
+	if x != nil {
+		return x.Confirmations
+	}
+	return 0
+}
+
+type OutPoint struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TxidBytes     []byte                 `protobuf:"bytes,1,opt,name=txid_bytes,json=txidBytes,proto3" json:"txid_bytes,omitempty"`
+	TxidStr       string                 `protobuf:"bytes,2,opt,name=txid_str,json=txidStr,proto3" json:"txid_str,omitempty"`
+	OutputIndex   uint32                 `protobuf:"varint,3,opt,name=output_index,json=outputIndex,proto3" json:"output_index,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *OutPoint) Reset() {
+	*x = OutPoint{}
+	mi := &file_lnrpc_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *OutPoint) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*OutPoint) ProtoMessage() {}
+
+func (x *OutPoint) ProtoReflect() protoreflect.Message {
+	mi := &file_lnrpc_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use OutPoint.ProtoReflect.Descriptor instead.
+func (*OutPoint) Descriptor() ([]byte, []int) {
+	return file_lnrpc_proto_rawDescGZIP(), []int{35}
+}
+
+func (x *OutPoint) GetTxidBytes() []byte {
+	if x != nil {
+		return x.TxidBytes
+	}
+	return nil
+}
+
+func (x *OutPoint) GetTxidStr() string {
+	if x != nil {
+		return x.TxidStr
+	}
+	return ""
+}
+
+func (x *OutPoint) GetOutputIndex() uint32 {
+	if x != nil {
+		return x.OutputIndex
+	}
+	return 0
+}
+
 var File_lnrpc_proto protoreflect.FileDescriptor
 
 const file_lnrpc_proto_rawDesc = "" +
@@ -2808,7 +3057,26 @@ const file_lnrpc_proto_rawDesc = "" +
 	"\x06expiry\x18\v \x01(\x03R\x06expiry\x12\x1d\n" +
 	"\n" +
 	"value_msat\x18\x17 \x01(\x03R\tvalueMsat\x12\x18\n" +
-	"\aprivate\x18\x0f \x01(\bR\aprivate2\xa8\x03\n" +
+	"\aprivate\x18\x0f \x01(\bR\aprivate\"h\n" +
+	"\x12ListUnspentRequest\x12\x1b\n" +
+	"\tmin_confs\x18\x01 \x01(\x05R\bminConfs\x12\x1b\n" +
+	"\tmax_confs\x18\x02 \x01(\x05R\bmaxConfs\x12\x18\n" +
+	"\aaccount\x18\x03 \x01(\tR\aaccount\"8\n" +
+	"\x13ListUnspentResponse\x12!\n" +
+	"\x05utxos\x18\x01 \x03(\v2\v.lnrpc.UtxoR\x05utxos\"\xd2\x01\n" +
+	"\x04Utxo\x12!\n" +
+	"\faddress_type\x18\x01 \x01(\x05R\vaddressType\x12\x18\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x1d\n" +
+	"\n" +
+	"amount_sat\x18\x03 \x01(\x03R\tamountSat\x12\x1b\n" +
+	"\tpk_script\x18\x04 \x01(\tR\bpkScript\x12+\n" +
+	"\boutpoint\x18\x05 \x01(\v2\x0f.lnrpc.OutPointR\boutpoint\x12$\n" +
+	"\rconfirmations\x18\x06 \x01(\x03R\rconfirmations\"g\n" +
+	"\bOutPoint\x12\x1d\n" +
+	"\n" +
+	"txid_bytes\x18\x01 \x01(\fR\ttxidBytes\x12\x19\n" +
+	"\btxid_str\x18\x02 \x01(\tR\atxidStr\x12!\n" +
+	"\foutput_index\x18\x03 \x01(\rR\voutputIndex2\xa8\x03\n" +
 	"\tLightning\x12V\n" +
 	"\x15RegisterRPCMiddleware\x12\x1c.lnrpc.RPCMiddlewareResponse\x1a\x1b.lnrpc.RPCMiddlewareRequest(\x010\x01\x12J\n" +
 	"\rWalletBalance\x12\x1b.lnrpc.WalletBalanceRequest\x1a\x1c.lnrpc.WalletBalanceResponse\x123\n" +
@@ -2830,7 +3098,7 @@ func file_lnrpc_proto_rawDescGZIP() []byte {
 	return file_lnrpc_proto_rawDescData
 }
 
-var file_lnrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_lnrpc_proto_msgTypes = make([]protoimpl.MessageInfo, 39)
 var file_lnrpc_proto_goTypes = []any{
 	(*RPCMiddlewareRequest)(nil),          // 0: lnrpc.RPCMiddlewareRequest
 	(*MetadataValues)(nil),                // 1: lnrpc.MetadataValues
@@ -2864,40 +3132,46 @@ var file_lnrpc_proto_goTypes = []any{
 	(*Transaction)(nil),                   // 29: lnrpc.Transaction
 	(*OutputDetail)(nil),                  // 30: lnrpc.OutputDetail
 	(*AddInvoiceCheck)(nil),               // 31: lnrpc.AddInvoiceCheck
-	nil,                                   // 32: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
-	nil,                                   // 33: lnrpc.SendPaymentRequest.DestCustomRecordsEntry
-	nil,                                   // 34: lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
+	(*ListUnspentRequest)(nil),            // 32: lnrpc.ListUnspentRequest
+	(*ListUnspentResponse)(nil),           // 33: lnrpc.ListUnspentResponse
+	(*Utxo)(nil),                          // 34: lnrpc.Utxo
+	(*OutPoint)(nil),                      // 35: lnrpc.OutPoint
+	nil,                                   // 36: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
+	nil,                                   // 37: lnrpc.SendPaymentRequest.DestCustomRecordsEntry
+	nil,                                   // 38: lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
 }
 var file_lnrpc_proto_depIdxs = []int32{
 	2,  // 0: lnrpc.RPCMiddlewareRequest.stream_auth:type_name -> lnrpc.StreamAuth
 	3,  // 1: lnrpc.RPCMiddlewareRequest.request:type_name -> lnrpc.RPCMessage
 	3,  // 2: lnrpc.RPCMiddlewareRequest.response:type_name -> lnrpc.RPCMessage
-	32, // 3: lnrpc.RPCMiddlewareRequest.metadata_pairs:type_name -> lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
+	36, // 3: lnrpc.RPCMiddlewareRequest.metadata_pairs:type_name -> lnrpc.RPCMiddlewareRequest.MetadataPairsEntry
 	5,  // 4: lnrpc.RPCMiddlewareResponse.register:type_name -> lnrpc.MiddlewareRegistration
 	6,  // 5: lnrpc.RPCMiddlewareResponse.feedback:type_name -> lnrpc.InterceptFeedback
 	12, // 6: lnrpc.Invoice.htlcs:type_name -> lnrpc.InvoiceHTLC
-	33, // 7: lnrpc.SendPaymentRequest.dest_custom_records:type_name -> lnrpc.SendPaymentRequest.DestCustomRecordsEntry
-	34, // 8: lnrpc.SendPaymentRequest.first_hop_custom_records:type_name -> lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
+	37, // 7: lnrpc.SendPaymentRequest.dest_custom_records:type_name -> lnrpc.SendPaymentRequest.DestCustomRecordsEntry
+	38, // 8: lnrpc.SendPaymentRequest.first_hop_custom_records:type_name -> lnrpc.SendPaymentRequest.FirstHopCustomRecordsEntry
 	29, // 9: lnrpc.TransactionDetails.transactions:type_name -> lnrpc.Transaction
 	30, // 10: lnrpc.Transaction.output_details:type_name -> lnrpc.OutputDetail
-	1,  // 11: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry.value:type_name -> lnrpc.MetadataValues
-	4,  // 12: lnrpc.Lightning.RegisterRPCMiddleware:input_type -> lnrpc.RPCMiddlewareResponse
-	8,  // 13: lnrpc.Lightning.WalletBalance:input_type -> lnrpc.WalletBalanceRequest
-	10, // 14: lnrpc.Lightning.LookupInvoice:input_type -> lnrpc.PaymentHash
-	13, // 15: lnrpc.Lightning.DecodePayReq:input_type -> lnrpc.PayReqString
-	15, // 16: lnrpc.Lightning.NewAddress:input_type -> lnrpc.NewAddressRequest
-	27, // 17: lnrpc.Lightning.GetTransactions:input_type -> lnrpc.GetTransactionsRequest
-	0,  // 18: lnrpc.Lightning.RegisterRPCMiddleware:output_type -> lnrpc.RPCMiddlewareRequest
-	9,  // 19: lnrpc.Lightning.WalletBalance:output_type -> lnrpc.WalletBalanceResponse
-	11, // 20: lnrpc.Lightning.LookupInvoice:output_type -> lnrpc.Invoice
-	14, // 21: lnrpc.Lightning.DecodePayReq:output_type -> lnrpc.PayReq
-	16, // 22: lnrpc.Lightning.NewAddress:output_type -> lnrpc.NewAddressResponse
-	28, // 23: lnrpc.Lightning.GetTransactions:output_type -> lnrpc.TransactionDetails
-	18, // [18:24] is the sub-list for method output_type
-	12, // [12:18] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	34, // 11: lnrpc.ListUnspentResponse.utxos:type_name -> lnrpc.Utxo
+	35, // 12: lnrpc.Utxo.outpoint:type_name -> lnrpc.OutPoint
+	1,  // 13: lnrpc.RPCMiddlewareRequest.MetadataPairsEntry.value:type_name -> lnrpc.MetadataValues
+	4,  // 14: lnrpc.Lightning.RegisterRPCMiddleware:input_type -> lnrpc.RPCMiddlewareResponse
+	8,  // 15: lnrpc.Lightning.WalletBalance:input_type -> lnrpc.WalletBalanceRequest
+	10, // 16: lnrpc.Lightning.LookupInvoice:input_type -> lnrpc.PaymentHash
+	13, // 17: lnrpc.Lightning.DecodePayReq:input_type -> lnrpc.PayReqString
+	15, // 18: lnrpc.Lightning.NewAddress:input_type -> lnrpc.NewAddressRequest
+	27, // 19: lnrpc.Lightning.GetTransactions:input_type -> lnrpc.GetTransactionsRequest
+	0,  // 20: lnrpc.Lightning.RegisterRPCMiddleware:output_type -> lnrpc.RPCMiddlewareRequest
+	9,  // 21: lnrpc.Lightning.WalletBalance:output_type -> lnrpc.WalletBalanceResponse
+	11, // 22: lnrpc.Lightning.LookupInvoice:output_type -> lnrpc.Invoice
+	14, // 23: lnrpc.Lightning.DecodePayReq:output_type -> lnrpc.PayReq
+	16, // 24: lnrpc.Lightning.NewAddress:output_type -> lnrpc.NewAddressResponse
+	28, // 25: lnrpc.Lightning.GetTransactions:output_type -> lnrpc.TransactionDetails
+	20, // [20:26] is the sub-list for method output_type
+	14, // [14:20] is the sub-list for method input_type
+	14, // [14:14] is the sub-list for extension type_name
+	14, // [14:14] is the sub-list for extension extendee
+	0,  // [0:14] is the sub-list for field type_name
 }
 
 func init() { file_lnrpc_proto_init() }
@@ -2921,7 +3195,7 @@ func file_lnrpc_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_lnrpc_proto_rawDesc), len(file_lnrpc_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   35,
+			NumMessages:   39,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

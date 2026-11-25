@@ -11,7 +11,8 @@
 #                            wallet balance, look up and decode invoices,
 #                            settle and cancel Kiloswap's hold invoices,
 #                            follow its payments, new addresses for its
-#                            claims and refunds
+#                            claims and refunds, list the wallet's coins (to
+#                            name the ones a lockup spends)
 set -euo pipefail
 cd "$(dirname "$0")"
 set -a; . ./.env; set +a
@@ -37,7 +38,7 @@ guard=(
 	uri:/lnrpc.Lightning/LookupInvoice uri:/lnrpc.Lightning/DecodePayReq
 	uri:/invoicesrpc.Invoices/SettleInvoice uri:/invoicesrpc.Invoices/CancelInvoice
 	uri:/routerrpc.Router/TrackPaymentV2 uri:/lnrpc.Lightning/NewAddress
-	uri:/lnrpc.Lightning/GetTransactions
+	uri:/lnrpc.Lightning/GetTransactions uri:/lnrpc.Lightning/ListUnspent
 )
 bake() { # NAME ROOT_KEY_ID OWNER ARGS...
 	local name=$1 key=$2 owner=$3; shift 3

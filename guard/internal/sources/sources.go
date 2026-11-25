@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -213,6 +214,23 @@ func (l LN) CancelInvoice(ctx context.Context, hash []byte) error {
 	defer cancel()
 	var r emptyMsg
 	return l.Conn.Invoke(ctx, "/invoicesrpc.Invoices/CancelInvoice", &lnrpc.CancelInvoiceMsg{PaymentHash: hash}, &r)
+}
+
+func (l LN) ListUnspent(ctx context.Context, minConfs int32) ([]policy.Utxo, error) {
+	ctx, cancel := call(ctx)
+	defer cancel()
+	var r lnrpc.ListUnspentResponse
+	if err := l.Conn.Invoke(ctx, "/lnrpc.Lightning/ListUnspent", &lnrpc.ListUnspentRequest{MinConfs: minConfs, MaxConfs: math.MaxInt32}, &r); err != nil {
+		return nil, err
+	}
+	var out []policy.Utxo
+	for _, u := range r.Utxos {
+		if u.Outpoint == nil {
+			continue
+		}
+		out = append(out, policy.Utxo{TxID: u.Outpoint.TxidStr, Vout: u.Outpoint.OutputIndex, Sat: u.AmountSat, Confs: u.Confirmations, Type: u.AddressType})
+	}
+	return out, nil
 }
 
 func (l LN) NewAddress(ctx context.Context) (string, error) {

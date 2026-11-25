@@ -284,3 +284,29 @@ message AddInvoiceCheck {
     int64 value_msat = 23;
     bool private = 15;
 }
+
+// ListUnspent: the guard picks which of lnd's coins a lockup spends
+message ListUnspentRequest {
+    int32 min_confs = 1;
+    int32 max_confs = 2;
+    string account = 3;
+}
+
+message ListUnspentResponse {
+    repeated Utxo utxos = 1;
+}
+
+message Utxo {
+    int32 address_type = 1;
+    string address = 2;
+    int64 amount_sat = 3;
+    string pk_script = 4;
+    OutPoint outpoint = 5;
+    int64 confirmations = 6;
+}
+
+message OutPoint {
+    bytes txid_bytes = 1;
+    string txid_str = 2;
+    uint32 output_index = 3;
+}

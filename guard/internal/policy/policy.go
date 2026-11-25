@@ -161,6 +161,18 @@ type Lightning interface {
 	// WalletPaid finds among all of lnd's wallet transactions from
 	// startHeight on (unconfirmed too) one paying sat to address.
 	WalletPaid(ctx context.Context, pkScript []byte, sat int64, startHeight int64) (string, uint32, int64, bool, error)
+	// ListUnspent lists lnd's spendable coins with at least minConfs
+	// confirmations (lnd leaves out the ones it has leased).
+	ListUnspent(ctx context.Context, minConfs int32) ([]Utxo, error)
+}
+
+// Utxo is one of lnd's wallet coins.
+type Utxo struct {
+	TxID  string
+	Vout  uint32
+	Sat   int64
+	Confs int64
+	Type  int32 // lnrpc.AddressType: 0 p2wkh, 1 np2wkh, 4 p2tr
 }
 
 // Output is one transaction output as the node sees it.
@@ -327,7 +339,8 @@ type Policy struct {
 	pending     map[uint64]pendingReq
 	claimErr    map[string]string // last claim error per payment hash
 	calls       map[string][]time.Time
-	epoch       uint64 // bumped on each registration with lnd (ids start over)
+	chosen      map[string]time.Time // coins given to lockups lately (lnd may not have spent them yet)
+	epoch       uint64               // bumped on each registration with lnd (ids start over)
 	lastSaveErr string
 	confCache   map[string]confAt
 	replace     map[uint64][]byte
@@ -743,7 +756,11 @@ func (p *Policy) sendCoins(ctx context.Context, requestID uint64, r *lnrpc.SendC
 			lastErr = err
 			continue
 		}
-		return p.allowSend(ctx, requestID, l, height, float64(r.SatPerVbyte)+float64(r.SatPerByte))
+		rate := float64(r.SatPerVbyte) + float64(r.SatPerByte)
+		if err := p.chooseCoins(ctx, requestID, r, rate); err != nil {
+			return err
+		}
+		return p.allowSend(ctx, requestID, l, height, rate)
 	}
 	return lastErr
 }
