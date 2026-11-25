@@ -3,6 +3,13 @@
 # Nothing restarts. Each gets its own root key, so either can be revoked
 # alone (lncli deletemacaroonid N).
 #
+# To re-bake one of them with new permissions (e.g. the guard's, when it
+# needs a new call), on a root key id nobody uses yet (lncli listmacaroonids):
+#   ONLY=kiloswap-guard.macaroon FORCE=1 GUARD_ROOT_KEY_ID=33 ./bake-macaroons.sh
+#   docker compose up -d --force-recreate guard
+# and then, once the guard runs on it, revoke the old id
+# (lncli deletemacaroonid 32).
+#
 #   kiloswap.macaroon        the backend: the calls it makes, all of them
 #                            with the custom caveat kiloswap=v1, so lnd hands
 #                            each one to the guard and refuses them all while
@@ -42,6 +49,7 @@ guard=(
 )
 bake() { # NAME ROOT_KEY_ID OWNER ARGS...
 	local name=$1 key=$2 owner=$3; shift 3
+	if [ -n "${ONLY:-}" ] && [ "$ONLY" != "$name" ]; then return; fi
 	if [ -s "$R/macaroons/$name" ] && [ "${FORCE:-}" != 1 ]; then echo "keep $name"; return; fi
 	local hex
 	hex=$($LNCLI bakemacaroon --root_key_id "$key" "$@")
