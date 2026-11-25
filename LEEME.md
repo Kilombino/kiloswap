@@ -22,8 +22,9 @@ a Bitcoin BLAKE2b por paulscode en
 |---|---|
 | On-chain → Lightning | 0,01 % + la comisión de red |
 | Lightning → on-chain | 0,15 % + la comisión de red |
-| Por swap | de 10.000 sats a 1 BTC |
-| Todos los swaps juntos | 2 BTC cada 24 horas |
+| Por swap | de 10.000 sats a 0,1 BTC (al principio; luego 1 BTC) |
+| Todos los swaps juntos | 0,25 BTC cada 24 horas (al principio; luego 2 BTC) |
+| Comisión de enrutado (on-chain → Lightning) | la paga lo que el depósito trae de más, al menos 10 sats |
 | Confirmaciones antes de pagar | 3 |
 
 ## Sin confiar en nadie

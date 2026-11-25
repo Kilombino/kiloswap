@@ -57,6 +57,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/txscript"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/reflect/protoreflect"
 
@@ -285,6 +286,8 @@ type Policy struct {
 	MaxSubTimeoutBlocks int64
 	// MaxInflightPayments caps payments made and not claimed yet.
 	MaxInflightPayments int
+	// MaxInflightSat caps their total value (independent of DailySat).
+	MaxInflightSat int64
 	// ApprovedExpireBlocks: a lockup allowed but never found in lnd's wallet
 	// after this many blocks is given up (its reserve released, its hold
 	// invoice cancellable).
@@ -300,10 +303,10 @@ type Policy struct {
 	// swaps never claimed spends the operator's coins on fees one block at
 	// a time, not all at once).
 	MaxLockupsPerBlock int
-	// RoutingCap (off until the operator decides): a submarine payment's
-	// routing fee limit is lowered, by replacing the request, to
-	// min(FeeRatio of the invoice, max(lockup surplus over the invoice and
-	// the claim, RoutingFloorSat)).
+	// RoutingCap (on by default, option A decided 25 Nov 2026): a submarine
+	// payment's routing fee limit is lowered, by replacing the request, to
+	// min(max(FeeRatio of the invoice, MinFeeSat), max(lockup surplus over
+	// the invoice and the claim, RoutingFloorSat)).
 	RoutingCap      bool
 	RoutingFloorSat int64
 	Net             *chaincfg.Params
@@ -419,6 +422,13 @@ func (p *Policy) cachedConfs(ctx context.Context, txid string, height int64, use
 // ClaimVbytes is what the guard's claim of a submarine lockup weighs at
 // most (one taproot script-path input with preimage, one output).
 const ClaimVbytes = 151
+
+// A submarine payment goes in at most MaxPayParts parts, with a cltv_limit of
+// at most MaxPayCltv blocks (two days): the guard lowers larger ones.
+const (
+	MaxPayParts = 4
+	MaxPayCltv  = 288
+)
 
 // What a reverse swap's hold invoice must pay over the lockup, at the
 // lockup's own fee rate: the lockup transaction (LockupVbytes), a refund if
@@ -1006,7 +1016,8 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 		return refuse("the swap's timeout is %d blocks away, at least %d needed", s.Timeout-height, p.MinSubTimeoutBlocks)
 	}
 	margin := max(p.SafetyBlocks, p.ClaimMarginBlocks)
-	if left := s.Timeout - height - margin; int64(r.CltvLimit) > left || left <= 0 {
+	left := s.Timeout - height - margin
+	if left <= 0 {
 		return refuse("cltv_limit %d leaves no time to claim before the timeout (%d blocks left, %d kept to claim)", r.CltvLimit, s.Timeout-height, margin)
 	}
 	feeMsat := r.FeeLimitMsat
@@ -1022,31 +1033,40 @@ func (p *Policy) sendPayment(ctx context.Context, requestID uint64, r *lnrpc.Sen
 	if p.MaxSubTimeoutBlocks > 0 && s.Timeout-height > p.MaxSubTimeoutBlocks {
 		return refuse("the swap's timeout is %d blocks away, at most %d", s.Timeout-height, p.MaxSubTimeoutBlocks)
 	}
+	// what lnd runs is the judged request with, at most, these lowered: the
+	// routing fee limit (option A: paid out of what the lockup brings over
+	// the invoice and the claim, never under the floor, never over
+	// FeeRatio), the parts (MaxPayParts) and cltv_limit (the blocks left to
+	// claim, at most MaxPayCltv). Never raised, never anything else
+	wantFee, wantParts, wantCltv := feeMsat, r.MaxParts, r.CltvLimit
 	if p.RoutingCap {
-		// routing paid out of what the lockup brings over the invoice and
-		// the claim (never under the floor, never over FeeRatio): the
-		// backend's request is rewritten to that limit (a larger one is
-		// lowered, never refused; lnd then finds a route within it or fails
-		// the payment, and the user refunds after the timeout)
-		capMsat := min(maxFeeMsat, max((o.Sat-cover)*1000, p.RoutingFloorSat*1000))
-		if feeMsat > capMsat || r.FeeLimitSat != 0 {
-			repl := proto.Clone(r).(*lnrpc.SendPaymentRequest)
-			repl.FeeLimitSat, repl.FeeLimitMsat = 0, min(feeMsat, capMsat)
-			b, err := proto.Marshal(repl)
-			if err != nil {
-				return refuse("the request cannot be rewritten safely: %v", err)
-			}
-			// what lnd will run must be exactly the judged request with
-			// only the fee limit lowered: checked before it is sent
-			var back lnrpc.SendPaymentRequest
-			if proto.Unmarshal(b, &back) != nil || back.FeeLimitMsat != repl.FeeLimitMsat || back.FeeLimitSat != 0 ||
-				back.PaymentRequest != r.PaymentRequest || back.CltvLimit != r.CltvLimit || back.TimeoutSeconds != r.TimeoutSeconds ||
-				back.MaxParts != r.MaxParts || back.Amt != 0 || back.AmtMsat != 0 || len(back.OutgoingChanIds) != 0 ||
-				len(back.LastHopPubkey) != 0 || len(back.RouteHints) != 0 || len(back.Dest) != 0 {
-				return refuse("the request cannot be rewritten safely")
-			}
-			p.setReplacement(requestID, b)
+		wantFee = min(feeMsat, min(maxFeeMsat, max((o.Sat-cover)*1000, p.RoutingFloorSat*1000)))
+	}
+	if wantParts == 0 || wantParts > MaxPayParts {
+		wantParts = MaxPayParts // lnd's default (16) when 0
+	}
+	if int64(wantCltv) > min(left, MaxPayCltv) {
+		wantCltv = int32(min(left, MaxPayCltv))
+	}
+	if wantFee != feeMsat || (p.RoutingCap && r.FeeLimitSat != 0) || wantParts != r.MaxParts || wantCltv != r.CltvLimit {
+		repl := proto.Clone(r).(*lnrpc.SendPaymentRequest)
+		repl.FeeLimitSat, repl.FeeLimitMsat = 0, wantFee
+		repl.MaxParts, repl.CltvLimit = wantParts, wantCltv
+		b, err := proto.Marshal(repl)
+		if err != nil {
+			return refuse("the request cannot be rewritten safely: %v", err)
 		}
+		// checked before it is sent: only those three fields changed
+		var back lnrpc.SendPaymentRequest
+		if proto.Unmarshal(b, &back) != nil || back.FeeLimitMsat != wantFee || back.FeeLimitSat != 0 ||
+			back.PaymentRequest != r.PaymentRequest || back.CltvLimit != wantCltv || back.TimeoutSeconds != r.TimeoutSeconds ||
+			back.MaxParts != wantParts || back.Amt != 0 || back.AmtMsat != 0 || len(back.OutgoingChanIds) != 0 ||
+			len(back.LastHopPubkey) != 0 || len(back.RouteHints) != 0 || len(back.Dest) != 0 || back.Amp ||
+			back.AllowSelfPayment || len(back.DestCustomRecords) != 0 || len(back.FirstHopCustomRecords) != 0 ||
+			len(back.PaymentAddr) != 0 || len(back.DestFeatures) != 0 || len(back.PaymentHash) != 0 {
+			return refuse("the request cannot be rewritten safely")
+		}
+		p.setReplacement(requestID, b)
 	}
 	return p.allowPay(ctx, o.Confirmations, &Payment{
 		SwapID: s.ID, Hash: hh, Sat: sat, Request: requestID, State: PayInflight,
@@ -1065,6 +1085,21 @@ func (p *Policy) allowPay(ctx context.Context, confs int64, pay *Payment) error 
 	shallow, inflight := p.shallowExposure(ctx)
 	if p.MaxInflightPayments > 0 && inflight >= p.MaxInflightPayments {
 		return refuse("%d payments not claimed yet, the limit is %d", inflight, p.MaxInflightPayments)
+	}
+	if p.MaxInflightSat > 0 {
+		// the value out and not claimed back yet, whatever the 24 h window
+		// says (a payment lnd has not finished counts until lnd says FAILED)
+		p.Ledger.Lock()
+		var out int64
+		for _, x := range p.Ledger.Payments {
+			if x.State == PayInflight || x.State == PayUnknown || x.State == PaySucceeded {
+				out += x.Sat
+			}
+		}
+		p.Ledger.Unlock()
+		if out+pay.Sat > p.MaxInflightSat {
+			return refuse("%d sat more in flight would pass %d sat (%d not claimed back yet)", pay.Sat, p.MaxInflightSat, out)
+		}
 	}
 	if need := p.confsFor(shallow + pay.LockupSat); confs < need {
 		return refuse("the lockup has %d confirmations, %d needed for %d sat not deep yet (this one and %d more)", confs, need, shallow+pay.LockupSat, shallow)
@@ -1539,6 +1574,23 @@ func (p *Policy) addInvoice(requestID uint64, m *lnrpc.RPCMessage) error {
 	if err := proto.Unmarshal(m.GetSerialized(), &r); err != nil {
 		return refuse("unreadable invoice: %v", err)
 	}
+	// only the fields the backend sets (lnrpc.Invoice numbers): no AMP
+	// (is_amp, 27), no private channels advertised (private, 15), no
+	// blinded paths or anything newer the guard does not read
+	if f, err := invoiceFields(m.GetSerialized()); err != nil {
+		return refuse("unreadable invoice: %v", err)
+	} else if f[27] {
+		return refuse("AMP invoices are not allowed")
+	} else {
+		for n := range f {
+			if !addInvoiceFields[n] {
+				return refuse("invoice field %d is not allowed", n)
+			}
+		}
+	}
+	if r.Private {
+		return refuse("private invoices (advertising private channels) are not allowed")
+	}
 	sat := r.Value
 	if r.ValueMsat != 0 {
 		sat = (r.ValueMsat + 999) / 1000
@@ -1558,6 +1610,30 @@ func (p *Policy) addInvoice(requestID uint64, m *lnrpc.RPCMessage) error {
 	}
 	p.track(requestID, pendingReq{method: "/lnrpc.Lightning/AddInvoice"})
 	return nil
+}
+
+// addInvoiceFields are the lnrpc.Invoice fields AddInvoice may carry: memo,
+// r_preimage (refused when set), value, description_hash, expiry,
+// route_hints, private (refused when true), value_msat.
+var addInvoiceFields = map[protowire.Number]bool{1: true, 3: true, 5: true, 10: true, 11: true, 14: true, 15: true, 23: true}
+
+// invoiceFields lists the top-level field numbers present in b.
+func invoiceFields(b []byte) (map[protowire.Number]bool, error) {
+	f := map[protowire.Number]bool{}
+	for len(b) > 0 {
+		num, typ, n := protowire.ConsumeTag(b)
+		if n < 0 {
+			return nil, protowire.ParseError(n)
+		}
+		b = b[n:]
+		m := protowire.ConsumeFieldValue(num, typ, b)
+		if m < 0 {
+			return nil, protowire.ParseError(m)
+		}
+		b = b[m:]
+		f[num] = true
+	}
+	return f, nil
 }
 
 // MaxTxPage is the most transactions one GetTransactions page may ask.

@@ -383,9 +383,14 @@ func TestPaymentChecks(t *testing.T) {
 	_, err := e.call(payURI, r)
 	mustRefuse(t, err, "cltv_limit")
 	r = payReq(inv)
-	r.CltvLimit = 95 // timeout 1100, height 1000, safety 6
-	_, err = e.call(payURI, r)
-	mustRefuse(t, err, "no time to claim")
+	r.CltvLimit = 95 // timeout 1100, height 1000, margin 40: lowered to 60
+	id, err := e.call(payURI, r)
+	mustAllow(t, err)
+	var q lnrpc.SendPaymentRequest
+	if proto.Unmarshal(e.p.Replacement(id), &q) != nil || q.CltvLimit != 60 || q.MaxParts != MaxPayParts {
+		t.Fatalf("cltv_limit 95 rewritten to %d (parts %d)", q.CltvLimit, q.MaxParts)
+	}
+	e.answer(id, &lnrpc.Payment{Status: paymentFailed}, false)
 	r = payReq(inv)
 	r.OutgoingChanIds = []uint64{1}
 	_, err = e.call(payURI, r)
@@ -997,8 +1002,13 @@ func TestSubmarineMinimumsAndMargins(t *testing.T) {
 	inv, _, _ = e.submarine(72, 100_000, 200_000, 72)
 	r := payReq(inv)
 	r.CltvLimit = 61 // timeout 1100, height 1000: 100 - 40 = 60 at most
-	_, err = e.call(payURI, r)
-	mustRefuse(t, err, "kept to claim")
+	id, err := e.call(payURI, r)
+	mustAllow(t, err) // lowered to 60 by the rewrite
+	var q lnrpc.SendPaymentRequest
+	if proto.Unmarshal(e.p.Replacement(id), &q) != nil || q.CltvLimit != 60 {
+		t.Fatalf("cltv_limit 61 rewritten to %d", q.CltvLimit)
+	}
+	e.answer(id, &lnrpc.Payment{Status: paymentFailed}, false)
 	r.CltvLimit = 60
 	r.TimeoutSeconds = 3600
 	_, err = e.call(payURI, r)

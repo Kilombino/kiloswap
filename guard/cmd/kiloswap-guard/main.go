@@ -167,6 +167,7 @@ func main() {
 	if env("LAUNCH_MODE", "1") == "0" {
 		perOp, daily = 100_000_000, 200_000_000
 	}
+	perOpEff := num("MAX_PER_OP_SAT", perOp) // in flight: twice one operation
 	p := &policy.Policy{
 		MaxPerOpSat:         num("MAX_PER_OP_SAT", perOp),
 		DailySat:            num("DAILY_SAT", daily),
@@ -201,6 +202,7 @@ func main() {
 		ApprovedExpireBlocks: num("APPROVED_EXPIRE_BLOCKS", 72),
 		MaxSubTimeoutBlocks:  num("MAX_SUB_TIMEOUT_BLOCKS", 1200),
 		MaxInflightPayments:  int(num("MAX_INFLIGHT_PAYMENTS", 10)),
+		MaxInflightSat:       num("MAX_INFLIGHT_SAT", 2*perOpEff),
 		HoldSlotTime:         time.Duration(num("HOLD_SLOT_MINUTES", 15)) * time.Minute,
 		Net:                  net,
 		Swaps:                db,
@@ -255,8 +257,8 @@ func main() {
 		default: // the queue is full: dropped, the log has it
 		}
 	}
-	logger.Printf("kiloswap-guard: per op %d sat, daily %d sat, LSP reserve %d sat, %d pending reverse swaps, %d unresolved lockups",
-		p.MaxPerOpSat, p.DailySat, p.ReserveSat, p.MaxPendingReverse, p.MaxUnresolved)
+	logger.Printf("kiloswap-guard: per op %d sat, daily %d sat, LSP reserve %d sat, %d pending reverse swaps, %d unresolved lockups, %d sat in flight, routing cap %v (floor %d sat)",
+		p.MaxPerOpSat, p.DailySat, p.ReserveSat, p.MaxPendingReverse, p.MaxUnresolved, p.MaxInflightSat, p.RoutingCap, p.RoutingFloorSat)
 	p.Lifecycle("guard_started")
 	p.ReportLimits() // the operator sees the limits in force on every start
 	// one full round of its own work (settle claims seen, claim paid

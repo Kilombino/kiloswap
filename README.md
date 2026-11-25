@@ -74,10 +74,13 @@ The threat it is built for is the backend and its database taken over.
   hash from the invoice, never from the database), for a submarine swap
   whose rebuilt output the node shows unspent with 3 confirmations, paying
   at least the invoice plus a claim margin; each lockup backs one payment;
-  `cltv_limit` leaves time to claim before the timeout; routing fee at most
-  0.01 % (121 sat floor); no AMP, keysend, custom records, route hints or
-  chosen channels.
-- At most **1 BTC per operation and 2 BTC per 24 hours**, sends and payments
+  `cltv_limit` leaves time to claim before the timeout (lowered to it, and
+  to 288 blocks at most); at most 4 parts; the routing fee limit rewritten
+  to what the lockup pays over the invoice and the claim (10 sat floor,
+  0.01 % at most); no AMP, keysend, custom records, route hints or chosen
+  channels; at most twice one operation's limit in flight at once.
+- At launch at most **0.1 BTC per operation and 0.25 BTC per 24 hours**
+  (later 1 and 2 BTC, set explicitly), sends and payments
   together, remembered across restarts. An amount comes back only when lnd
   itself reports the send refused or the payment FAILED (asked again if a
   stream ends early); a cancelled stream or "already paid" gives nothing
@@ -161,8 +164,8 @@ operation and 2 BTC a day.
 - Lockups lnd sent without telling the guard are found on chain; payments
   are always asked about after two minutes.
 - Submarine: invoices of 10,000 sat or more, a lockup that covers the
-  invoice plus our claim at the node's fee rate (routing, at most 0.01 % or
-  121 sat, is the operator's cost by design), a swap timeout at
+  invoice plus our claim at the node's fee rate (routing comes out of what
+  it pays over that, at least 10 sat), a swap timeout at
   least 144 blocks ahead, payments final 60 blocks before it, and the
   guard's claim replaced with higher fees (past `MAX_FEE_RATE`, up to 10 %
   of the lockup, in the last 24 blocks).

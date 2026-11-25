@@ -10,6 +10,7 @@ import (
 
 	"github.com/Kilombino/kiloswap/guard/internal/lnrpc"
 	"github.com/Kilombino/kiloswap/guard/internal/swapscript"
+	"google.golang.org/protobuf/encoding/protowire"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -158,14 +159,14 @@ func TestV8RoutingCapFlag(t *testing.T) {
 	inv, _, _ := e.submarine(224, 100_000, 100_400, 224) // surplus 400 - claim(302) = 98
 	id, err := e.call(payURI, payReq(inv))
 	mustAllow(t, err)
-	if b := e.p.Replacement(id); b != nil {
-		t.Fatal("the fee limit replaced with the cap off")
+	var q lnrpc.SendPaymentRequest
+	if err := proto.Unmarshal(e.p.Replacement(id), &q); err != nil || q.FeeLimitMsat != 121_000 || q.MaxParts != MaxPayParts {
+		t.Fatalf("cap off: fee limit changed (%d sat / %d msat) or parts not lowered (%d)", q.FeeLimitSat, q.FeeLimitMsat, q.MaxParts)
 	}
 	e.p.RoutingCap, e.p.RoutingFloorSat = true, 50
 	inv, _, _ = e.submarine(225, 100_000, 100_400, 225)
 	id, err = e.call(payURI, payReq(inv))
 	mustAllow(t, err)
-	var q lnrpc.SendPaymentRequest
 	if err := proto.Unmarshal(e.p.Replacement(id), &q); err != nil {
 		t.Fatal(err)
 	}
@@ -201,4 +202,65 @@ func TestV8RoutingCapFlag(t *testing.T) {
 	}
 	_ = time.Second
 	_ = swapscript.Reverse
+}
+
+// v9: at most MaxInflightSat out and not claimed back, whatever the day's
+// window; parts and cltv_limit lowered, never raised.
+func TestV9InflightValueAndRewrite(t *testing.T) {
+	e := newEnv(t)
+	e.p.MaxInflightSat = 250_000
+	e.p.DailySat = 10_000_000_000
+	inv, _, _ := e.submarine(230, 100_000, 200_000, 230)
+	id1, err := e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	inv, _, _ = e.submarine(231, 100_000, 200_000, 231)
+	_, err = e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	inv, _, _ = e.submarine(232, 100_000, 200_000, 232)
+	_, err = e.call(payURI, payReq(inv))
+	mustRefuse(t, err, "in flight")
+	e.answer(id1, &lnrpc.Payment{Status: paymentFailed}, false) // only lnd's FAILED frees it
+	_, err = e.call(payURI, payReq(inv))
+	mustAllow(t, err)
+	// parts: 2 kept, 16 lowered to 4; cltv 30 kept
+	inv, _, _ = e.submarine(233, 10_000, 20_000, 233)
+	e.p.MaxInflightSat = 0
+	r := payReq(inv)
+	r.MaxParts, r.CltvLimit = 2, 30
+	id, err := e.call(payURI, r)
+	mustAllow(t, err)
+	var q lnrpc.SendPaymentRequest
+	if b := e.p.Replacement(id); b != nil {
+		_ = proto.Unmarshal(b, &q)
+		if q.MaxParts != 2 || q.CltvLimit != 30 {
+			t.Fatalf("raised: parts %d cltv %d", q.MaxParts, q.CltvLimit)
+		}
+	}
+	inv, _, _ = e.submarine(234, 10_000, 20_000, 234)
+	r = payReq(inv)
+	r.MaxParts = 16
+	id, err = e.call(payURI, r)
+	mustAllow(t, err)
+	_ = proto.Unmarshal(e.p.Replacement(id), &q)
+	if q.MaxParts != 4 {
+		t.Fatalf("16 parts rewritten to %d", q.MaxParts)
+	}
+}
+
+// v9: AddInvoice without AMP, private channels or fields the guard does not
+// read.
+func TestV9AddInvoiceFields(t *testing.T) {
+	e := newEnv(t)
+	const uri = "/lnrpc.Lightning/AddInvoice"
+	_, err := e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1000, Expiry: 3600, Memo: "x"})
+	mustAllow(t, err)
+	_, err = e.call(uri, &lnrpc.AddInvoiceCheck{Value: 1000, Expiry: 3600, Private: true})
+	mustRefuse(t, err, "private")
+	b, _ := proto.Marshal(&lnrpc.AddInvoiceCheck{Value: 1000, Expiry: 3600})
+	amp := protowire.AppendVarint(protowire.AppendTag(append([]byte{}, b...), 27, protowire.VarintType), 1)
+	err = e.p.Intercept(context.Background(), CaveatCondition, 999001, &lnrpc.RPCMessage{MethodFullUri: uri, Serialized: amp})
+	mustRefuse(t, err, "AMP")
+	blind := protowire.AppendVarint(protowire.AppendTag(append([]byte{}, b...), 29, protowire.VarintType), 1)
+	err = e.p.Intercept(context.Background(), CaveatCondition, 999002, &lnrpc.RPCMessage{MethodFullUri: uri, Serialized: blind})
+	mustRefuse(t, err, "field 29")
 }
