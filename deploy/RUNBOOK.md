@@ -66,6 +66,11 @@ en los 15 minutos siguientes.
    # IMPRESCINDIBLE: sin esto, la lista blanca de arriba deja SIN PERMISOS
    # a todos los demás usuarios (LND, mempool, DATUM, Kilobot…)
    rpcwhitelistdefault=0
+   # the RPC work threads and queue the node serves everyone with (DATUM,
+   # LND, mempool, Kiloswap's shim with at most 8 calls at once): enough
+   # that the shim can never take them all
+   rpcthreads=16
+   rpcworkqueue=256
    ```
    - **ZMQ** escucha en la IP de la red local. El cortafuegos ya deja pasar
      a `172.16.0.0/12` (los contenedores) y a la red local, y solo publica
