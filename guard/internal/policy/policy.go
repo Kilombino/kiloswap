@@ -241,8 +241,8 @@ type Policy struct {
 	// made (for the operator's bot): event, then key/values.
 	Notify func(event string, kv map[string]any)
 
-	mu      sync.Mutex // judgments that touch the ledger, one at a time
-	pmu     sync.Mutex
+	mu       sync.Mutex // judgments that touch the ledger, one at a time
+	pmu      sync.Mutex
 	pending  map[uint64]pendingReq
 	claimErr map[string]string // last claim error per payment hash
 }

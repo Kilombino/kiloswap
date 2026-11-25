@@ -476,4 +476,3 @@ func (p *Policy) closeHolds(ctx context.Context) {
 		p.Ledger.Unlock()
 	}
 }
-
