@@ -325,7 +325,8 @@ func (p *Policy) watchLockups(ctx context.Context) {
 			todo = append(todo, l)
 		case LockSettled:
 			// paid but never claimed on chain: refunded after a long grace
-			if l.TxID != "" {
+			// (once the claim is buried there is nothing left to watch)
+			if l.TxID != "" && l.ClaimTx == "" {
 				todo = append(todo, l)
 			}
 		case LockApproved:
@@ -553,6 +554,11 @@ func (p *Policy) lockupOutput(ctx context.Context, l *Lockup) (*swapscript.Outpu
 	return out, o, uint32(l.Vout), nil
 }
 
+// claimDoneConfs: how deep the user's claim must be, after our invoice was
+// settled, before the lockup stops being watched (a reorg that shallow would
+// put the claim back in the mempool, and the coins are the user's anyway)
+const claimDoneConfs = 6
+
 func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error {
 	out, o, vout, err := p.lockupOutput(ctx, l)
 	if errors.Is(err, ErrNotYet) && height-l.SentAt > bumpEvery*2 {
@@ -583,7 +589,16 @@ func (p *Policy) watchLockup(ctx context.Context, l *Lockup, height int64) error
 		}
 		hash, _ := hex.DecodeString(l.Hash)
 		if pre, ok := out.PreimageFromClaim(sp.Witness, hash); ok {
-			return p.settleClaimed(ctx, l, pre, sp.TxID)
+			if err := p.settleClaimed(ctx, l, pre, sp.TxID); err != nil {
+				return err
+			}
+			p.Ledger.Lock()
+			if l.State == LockSettled && sp.Confirmations >= claimDoneConfs {
+				l.ClaimTx = sp.TxID
+				_ = p.Ledger.save()
+			}
+			p.Ledger.Unlock()
+			return nil
 		}
 		if (l.State == LockSent || l.State == LockRefunding) && !l.Bump.Ours(sp.TxID) && !strings.EqualFold(sp.TxID, l.RefundTx) &&
 			out.SpendsLeaf(sp.Witness, out.RefundLeaf) {

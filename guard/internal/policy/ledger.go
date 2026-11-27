@@ -49,6 +49,10 @@ type Lockup struct {
 	Note     string    `json:"note,omitempty"`
 	Bump     Bump      `json:"refundBump,omitempty"`
 	ScanFrom int64     `json:"scanFrom,omitempty"` // where the chain scan for it resumes
+	// the user's claim, once buried claimDoneConfs deep after our invoice was
+	// settled: nothing is left to do for this lockup, so it is no longer
+	// watched (every round would read blocks back to the claim)
+	ClaimTx string `json:"claimTx,omitempty"`
 	// StuckSince is the height a lockup was first seen stuck (not
 	// confirmed, or "not yet" again and again); alerted once
 	StuckSince   int64 `json:"stuckSince,omitempty"`

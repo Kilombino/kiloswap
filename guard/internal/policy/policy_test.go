@@ -1710,3 +1710,36 @@ func TestCreatingHoldNotConfusedWithForeignInvoice(t *testing.T) {
 		t.Fatal("another service's invoice taken for our hold")
 	}
 }
+
+// A settled lockup whose claim is buried stops being watched: every round
+// used to read blocks back to the claim, for nothing (27 Nov 2026: five old
+// swaps kept the guard and the node busy around the clock).
+func TestSettledClaimBuriedStopsWatching(t *testing.T) {
+	e := newEnv(t)
+	r, pre, user := e.reverse(158, 1_000_000, 158)
+	txid, _ := e.sent(r, 158)
+	e.p.Tick(context.Background())
+	_, hash := preimage(158)
+	server, _ := e.keys.Public(158)
+	out, _ := swapscript.Build(swapscript.Params{Kind: swapscript.Reverse, Server: server, User: user.PubKey(), PaymentHash: hash, Timeout: 1100})
+	cb, _ := out.ControlBlock(out.ClaimLeaf)
+	op := txid + ":1"
+	e.chain.spent[op] = true
+	e.chain.spenders[op] = &Spend{TxID: "claim", Witness: [][]byte{make([]byte, 64), pre, out.ClaimLeaf.Script, cb}, Confirmations: 1}
+	e.p.Tick(context.Background())
+	l := e.p.Ledger.Lockups[hex.EncodeToString(hash)]
+	if l.State != LockSettled || l.ClaimTx != "" {
+		t.Fatalf("after a shallow claim: state %s, claimTx %q", l.State, l.ClaimTx)
+	}
+	e.chain.spenders[op].Confirmations = claimDoneConfs
+	e.p.Tick(context.Background())
+	if l.ClaimTx != "claim" {
+		t.Fatal("a buried claim was not recorded")
+	}
+	delete(e.chain.spenders, op) // a lookup now would answer "not found yet"
+	e.chain.height = 1100 + settledGrace + 10
+	e.p.Tick(context.Background())
+	if l.Note != "" || len(e.chain.broadcast) != 0 || l.StuckSince != 0 {
+		t.Fatalf("still watched: note %q, broadcasts %d, stuck %d", l.Note, len(e.chain.broadcast), l.StuckSince)
+	}
+}
